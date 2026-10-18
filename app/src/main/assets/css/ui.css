@@ -1,0 +1,514 @@
+/* Vectura High-Performance Line UI Layout */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  position: fixed;
+  margin: 0;
+  padding: 0;
+  touch-action: none;
+  overscroll-behavior: none;
+  background-color: var(--bg-dark);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  color: var(--text-main);
+}
+
+#app-root {
+  width: 100%;
+  height: 100%;
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: hidden;
+}
+
+/* Fullscreen Canvas Viewport */
+#viewport-container {
+  width: 100%;
+  height: 100%;
+  position: absolute;
+  top: 0;
+  left: 0;
+  touch-action: none;
+  background-color: var(--bg-canvas);
+  background-image: 
+    linear-gradient(45deg, #151923 25%, transparent 25%), 
+    linear-gradient(-45deg, #151923 25%, transparent 25%), 
+    linear-gradient(45deg, transparent 75%, #151923 75%), 
+    linear-gradient(-45deg, transparent 75%, #151923 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0px;
+  cursor: crosshair;
+}
+
+body.theme-light #viewport-container {
+  background-color: #cbd5e1;
+  background-image: 
+    linear-gradient(45deg, #e2e8f0 25%, transparent 25%), 
+    linear-gradient(-45deg, #e2e8f0 25%, transparent 25%), 
+    linear-gradient(45deg, transparent 75%, #e2e8f0 75%), 
+    linear-gradient(-45deg, transparent 75%, #e2e8f0 75%);
+}
+
+#viewport-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* UI Overlay Layer */
+#ui-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 100;
+  transition: opacity var(--transition-fast);
+}
+
+#ui-overlay.hidden-ui {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.interactive {
+  pointer-events: auto;
+}
+
+/* Slim Minimalist Top Bar */
+#top-bar {
+  position: absolute;
+  top: max(6px, env(safe-area-inset-top));
+  left: max(6px, env(safe-area-inset-left));
+  right: max(6px, env(safe-area-inset-right));
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px;
+  border-radius: var(--radius-pill);
+  z-index: 110;
+  border: 1px solid var(--glass-border);
+  gap: 4px;
+}
+
+.top-bar-section {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+#project-title-display {
+  font-size: 11px;
+  font-weight: 600;
+  max-width: 65px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: var(--text-main);
+}
+
+/* Minimalist Floating Bottom Toolbar */
+#toolbar {
+  position: absolute;
+  bottom: max(10px, env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 5px;
+  height: 40px;
+  border-radius: var(--radius-pill);
+  z-index: 120;
+  border: 1px solid var(--glass-border);
+  max-width: calc(100% - 14px);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+#toolbar::-webkit-scrollbar {
+  display: none;
+}
+
+.toolbar-separator {
+  width: 1px;
+  height: 18px;
+  background: var(--glass-border);
+  margin: 0 1px;
+  flex-shrink: 0;
+}
+
+/* Minimalist Tools Popover Menu */
+#tools-popover {
+  position: absolute;
+  bottom: calc(max(10px, env(safe-area-inset-bottom)) + 46px);
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  display: none;
+  opacity: 0;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 6px;
+  border-radius: var(--radius-pill);
+  z-index: 130;
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+  transition: all var(--transition-fast);
+  pointer-events: none;
+}
+
+#tools-popover.open {
+  display: flex;
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* Minimalist Left Edge Sliders (Vertically Centered, Left Edge) */
+#edge-sliders {
+  position: absolute;
+  left: max(6px, env(safe-area-inset-left));
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  z-index: 110;
+}
+
+body.left-handed #edge-sliders {
+  left: auto;
+  right: max(6px, env(safe-area-inset-right));
+}
+
+.vertical-slider-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 4px 2px;
+  border-radius: var(--radius-pill);
+  width: 22px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border-subtle);
+}
+
+.vertical-slider {
+  writing-mode: bt-lr;
+  -webkit-appearance: slider-vertical;
+  appearance: slider-vertical;
+  width: 3px;
+  height: 55px;
+  padding: 0;
+  cursor: pointer;
+  accent-color: var(--accent-primary);
+}
+
+.slider-label {
+  font-size: 7.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.slider-preview-dot {
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.slider-preview-dot-inner {
+  border-radius: 50%;
+  background: var(--accent-primary);
+  transition: width 0.1s, height 0.1s, opacity 0.1s;
+}
+
+/* Bottom Sheets */
+.glass-sheet {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  max-height: 80vh;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  border-top-left-radius: var(--radius-lg);
+  border-top-right-radius: var(--radius-lg);
+  display: flex;
+  flex-direction: column;
+  z-index: 160;
+  transform: translateY(105%);
+  transition: transform var(--transition-smooth);
+  overflow: hidden;
+  box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.4);
+  pointer-events: none !important;
+  visibility: hidden;
+}
+
+.glass-sheet.open {
+  transform: translateY(0);
+  pointer-events: auto !important;
+  visibility: visible;
+}
+
+.sheet-handle-bar {
+  width: 100%;
+  padding: 6px 0 2px 0;
+  display: flex;
+  justify-content: center;
+  cursor: grab;
+}
+
+.sheet-handle {
+  width: 32px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.sheet-header {
+  padding: 4px 12px 6px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.sheet-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.sheet-content {
+  padding: 10px;
+  overflow-y: auto;
+  flex: 1;
+  max-height: 65vh;
+}
+
+/* Eyedropper Magnifier Ring */
+#eyedropper-loupe {
+  position: absolute;
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  pointer-events: none;
+  display: none;
+  z-index: 300;
+  transform: translate(-50%, -100%);
+  margin-top: -10px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+  border: 2px solid #ffffff;
+  overflow: hidden;
+}
+
+#eyedropper-ring-sample {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 50%;
+  height: 100%;
+}
+
+#eyedropper-ring-current {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 50%;
+  height: 100%;
+}
+
+#eyedropper-center-cross {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 6px;
+  height: 6px;
+  transform: translate(-50%, -50%);
+  border: 1px solid #ffffff;
+  border-radius: 50%;
+}
+
+/* Fill Ripple Animation */
+@keyframes fillRipple {
+  0% { transform: scale(0.01); opacity: 0.8; }
+  100% { transform: scale(1.0); opacity: 0; }
+}
+
+.fill-ripple-effect {
+  position: absolute;
+  border-radius: 50%;
+  pointer-events: none;
+  animation: fillRipple 280ms ease-out forwards;
+  z-index: 90;
+}
+
+/* Modals & Dialogs */
+.glass-modal-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.7);
+  display: none !important;
+  align-items: center;
+  justify-content: center;
+  z-index: 500;
+  opacity: 0;
+  pointer-events: none !important;
+  transition: opacity var(--transition-fast);
+}
+
+.glass-modal-backdrop.open {
+  display: flex !important;
+  opacity: 1;
+  pointer-events: auto !important;
+}
+
+.glass-modal {
+  width: calc(100% - 32px);
+  max-width: 360px;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Projects Screen (Home Gallery) */
+#home-screen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--bg-dark);
+  z-index: 600;
+  display: flex;
+  flex-direction: column;
+  transition: opacity var(--transition-fast);
+}
+
+#home-screen.hidden {
+  display: none !important;
+  pointer-events: none !important;
+}
+
+.home-header {
+  padding: max(10px, env(safe-area-inset-top)) 14px 10px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.home-presets-row {
+  display: flex;
+  gap: 6px;
+  padding: 8px 14px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  border-bottom: 1px solid var(--glass-border-subtle);
+}
+.home-presets-row::-webkit-scrollbar {
+  display: none;
+}
+
+.preset-chip {
+  padding: 4px 8px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  color: var(--text-muted);
+  white-space: nowrap;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.preset-chip:hover, .preset-chip:active {
+  background: var(--glass-bg-hover);
+  color: var(--text-main);
+  border-color: var(--accent-primary);
+}
+
+.home-gallery {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 10px;
+  align-content: start;
+}
+
+.project-card {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  display: flex;
+  flex-direction: column;
+}
+
+.project-card:hover {
+  border-color: var(--accent-primary);
+  transform: translateY(-2px);
+}
+
+.project-thumbnail {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  background-color: #0b0e16;
+  background-image: 
+    linear-gradient(45deg, #121622 25%, transparent 25%), 
+    linear-gradient(-45deg, #121622 25%, transparent 25%), 
+    linear-gradient(45deg, transparent 75%, #121622 75%), 
+    linear-gradient(-45deg, transparent 75%, #121622 75%);
+  background-size: 12px 12px;
+}
+
+.project-info {
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.project-name {
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-main);
+}
+
+.project-date {
+  font-size: 9px;
+  color: var(--text-muted);
+}

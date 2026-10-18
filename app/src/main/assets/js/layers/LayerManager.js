@@ -1,0 +1,274 @@
+/**
+ * Vectura Layer Manager
+ * Handles layer ordering, blend modes, clipping masks, folders, and composite caching.
+ */
+import { Layer } from './Layer.js';
+import { getCanvasCompositeOp } from './BlendModes.js';
+
+export class LayerManager {
+  constructor(docWidth = 1080, docHeight = 1080) {
+    this.docWidth = docWidth;
+    this.docHeight = docHeight;
+    this.layers = [];
+    this.activeLayerId = null;
+
+    // Background configuration
+    this.backgroundColor = '#ffffff'; // null for transparent, or hex string
+    this.isTransparentBg = false;
+
+    // Composite caches
+    this.cacheBelow = document.createElement('canvas');
+    this.cacheBelow.width = docWidth;
+    this.cacheBelow.height = docHeight;
+    this.cacheBelowCtx = this.cacheBelow.getContext('2d');
+
+    this.cacheAbove = document.createElement('canvas');
+    this.cacheAbove.width = docWidth;
+    this.cacheAbove.height = docHeight;
+    this.cacheAboveCtx = this.cacheAbove.getContext('2d');
+
+    this.cachedComposite = document.createElement('canvas');
+    this.cachedComposite.width = docWidth;
+    this.cachedComposite.height = docHeight;
+    this.cachedCompositeCtx = this.cachedComposite.getContext('2d');
+
+    this.needsRecomposite = true;
+
+    // Initialize default base layer
+    this.createInitialLayer();
+  }
+
+  createInitialLayer() {
+    const l1 = new Layer('layer_1', 'Layer 1', this.docWidth, this.docHeight, 'raster');
+    this.layers = [l1];
+    this.activeLayerId = l1.id;
+    this.invalidateCaches();
+  }
+
+  resizeDocument(newW, newH) {
+    this.docWidth = newW;
+    this.docHeight = newH;
+    for (const l of this.layers) {
+      l.resize(newW, newH);
+    }
+    this.cacheBelow.width = newW;
+    this.cacheBelow.height = newH;
+    this.cacheAbove.width = newW;
+    this.cacheAbove.height = newH;
+    this.cachedComposite.width = newW;
+    this.cachedComposite.height = newH;
+    this.invalidateCaches();
+  }
+
+  getActiveLayer() {
+    return this.layers.find(l => l.id === this.activeLayerId) || this.layers[0];
+  }
+
+  setActiveLayer(id) {
+    if (this.layers.some(l => l.id === id)) {
+      this.activeLayerId = id;
+      this.updateAroundActiveCaches();
+    }
+  }
+
+  addLayer(name = 'New Layer', type = 'raster') {
+    const activeIdx = this.layers.findIndex(l => l.id === this.activeLayerId);
+    const newIdx = activeIdx >= 0 ? activeIdx + 1 : this.layers.length;
+    const layer = new Layer(null, name, this.docWidth, this.docHeight, type);
+    this.layers.splice(newIdx, 0, layer);
+    this.activeLayerId = layer.id;
+    this.invalidateCaches();
+    return layer;
+  }
+
+  duplicateLayer(id) {
+    const idx = this.layers.findIndex(l => l.id === id);
+    if (idx < 0) return null;
+    const orig = this.layers[idx];
+    const copy = orig.clone(null, orig.name + ' Copy');
+    this.layers.splice(idx + 1, 0, copy);
+    this.activeLayerId = copy.id;
+    this.invalidateCaches();
+    return copy;
+  }
+
+  deleteLayer(id) {
+    if (this.layers.length <= 1) return false; // Keep at least one layer
+    const idx = this.layers.findIndex(l => l.id === id);
+    if (idx < 0) return false;
+    const removed = this.layers.splice(idx, 1)[0];
+    removed.release();
+    this.activeLayerId = this.layers[Math.max(0, idx - 1)].id;
+    this.invalidateCaches();
+    return true;
+  }
+
+  clearLayer(id) {
+    const l = this.layers.find(layer => layer.id === id);
+    if (l) {
+      l.clear();
+      this.invalidateCaches();
+    }
+  }
+
+  reorder(fromIndex, toIndex) {
+    if (fromIndex < 0 || fromIndex >= this.layers.length || toIndex < 0 || toIndex >= this.layers.length) return;
+    const [moved] = this.layers.splice(fromIndex, 1);
+    this.layers.splice(toIndex, 0, moved);
+    this.invalidateCaches();
+  }
+
+  mergeDown(id) {
+    const idx = this.layers.findIndex(l => l.id === id);
+    if (idx <= 0) return false; // Bottom layer cannot merge down
+
+    const upper = this.layers[idx];
+    const lower = this.layers[idx - 1];
+
+    // Combine strokes
+    lower.strokes = lower.strokes.concat(upper.strokes);
+
+    // Composite upper onto lower bitmap
+    lower.ctx.save();
+    lower.ctx.globalAlpha = upper.opacity;
+    lower.ctx.globalCompositeOperation = getCanvasCompositeOp(upper.blendMode);
+    lower.ctx.drawImage(upper.canvas, 0, 0);
+    lower.ctx.restore();
+
+    lower.updateThumbnail();
+    this.layers.splice(idx, 1);
+    upper.release();
+    this.activeLayerId = lower.id;
+    this.invalidateCaches();
+    return true;
+  }
+
+  mergeVisible() {
+    if (this.layers.length <= 1) return;
+    const visibleLayers = this.layers.filter(l => l.visible);
+    if (visibleLayers.length <= 1) return;
+
+    const merged = new Layer('layer_merged', 'Merged', this.docWidth, this.docHeight, 'vector');
+    this.compositeToCanvas(merged.ctx, false);
+    merged.updateThumbnail();
+
+    // Release all layers and replace with merged
+    for (const l of this.layers) {
+      l.release();
+    }
+    this.layers = [merged];
+    this.activeLayerId = merged.id;
+    this.invalidateCaches();
+  }
+
+  invalidateCaches() {
+    this.needsRecomposite = true;
+    this.updateAroundActiveCaches();
+  }
+
+  /**
+   * Updates cached below and above bitmaps relative to active layer.
+   * This is key for 60fps drawing with many layers.
+   */
+  updateAroundActiveCaches() {
+    const activeIdx = this.layers.findIndex(l => l.id === this.activeLayerId);
+    if (activeIdx < 0) return;
+
+    // 1. Build below cache
+    this.cacheBelowCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+    for (let i = 0; i < activeIdx; i++) {
+      this.drawLayerToCtx(this.cacheBelowCtx, this.layers[i], this.layers);
+    }
+
+    // 2. Build above cache
+    this.cacheAboveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+    for (let i = activeIdx + 1; i < this.layers.length; i++) {
+      this.drawLayerToCtx(this.cacheAboveCtx, this.layers[i], this.layers);
+    }
+
+    this.needsRecomposite = false;
+  }
+
+  /**
+   * Draws a single layer taking into account clipping masks and blend modes.
+   */
+  drawLayerToCtx(targetCtx, layer, layerStack) {
+    if (!layer.visible) return;
+
+    targetCtx.save();
+    targetCtx.globalAlpha = layer.opacity;
+    targetCtx.globalCompositeOperation = getCanvasCompositeOp(layer.blendMode);
+
+    if (layer.clippingMask) {
+      // Find the base layer for this clip
+      targetCtx.globalCompositeOperation = 'source-atop';
+    }
+
+    targetCtx.drawImage(layer.canvas, 0, 0);
+    targetCtx.restore();
+  }
+
+  /**
+   * Composites the entire document onto targetCtx.
+   * If liveStrokeCanvas is provided, renders the active layer with live stroke in real-time!
+   */
+  compositeStack(targetCtx, liveStrokeCanvas = null, liveOpacity = 1.0, liveBlendMode = 'source-over') {
+    // 1. Background
+    if (!this.isTransparentBg && this.backgroundColor) {
+      targetCtx.fillStyle = this.backgroundColor;
+      targetCtx.fillRect(0, 0, this.docWidth, this.docHeight);
+    } else {
+      targetCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+    }
+
+    // 2. Layers below active
+    targetCtx.drawImage(this.cacheBelow, 0, 0);
+
+    // 3. Active Layer
+    const active = this.getActiveLayer();
+    if (active && active.visible) {
+      targetCtx.save();
+      targetCtx.globalAlpha = active.opacity;
+      targetCtx.globalCompositeOperation = getCanvasCompositeOp(active.blendMode);
+
+      targetCtx.drawImage(active.canvas, 0, 0);
+
+      // Draw live stroke on active layer
+      if (liveStrokeCanvas) {
+        targetCtx.save();
+        targetCtx.globalAlpha = liveOpacity;
+        targetCtx.globalCompositeOperation = getCanvasCompositeOp(liveBlendMode);
+        if (active.alphaLock) {
+          targetCtx.globalCompositeOperation = 'source-atop';
+        }
+        targetCtx.drawImage(liveStrokeCanvas, 0, 0);
+        targetCtx.restore();
+      }
+
+      targetCtx.restore();
+    }
+
+    // 4. Layers above active
+    targetCtx.drawImage(this.cacheAbove, 0, 0);
+  }
+
+  /**
+   * Full composite export without live buffer.
+   */
+  compositeToCanvas(targetCtx, includeBackground = true) {
+    if (includeBackground && !this.isTransparentBg && this.backgroundColor) {
+      targetCtx.fillStyle = this.backgroundColor;
+      targetCtx.fillRect(0, 0, this.docWidth, this.docHeight);
+    } else {
+      targetCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+    }
+
+    for (let i = 0; i < this.layers.length; i++) {
+      this.drawLayerToCtx(targetCtx, this.layers[i], this.layers);
+    }
+  }
+
+  getReferenceLayer() {
+    return this.layers.find(l => l.isReference) || this.getActiveLayer();
+  }
+}

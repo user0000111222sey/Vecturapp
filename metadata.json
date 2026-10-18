@@ -1,0 +1,6 @@
+{
+  "name": "Vectura",
+  "description": "Professional vector drawing studio with infinite canvas zoom, Catmull-Rom splines, advanced brush engine, layers, pixel art mode, and editing tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
