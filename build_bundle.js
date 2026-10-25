@@ -21,6 +21,7 @@ const MODULE_FILES = [
   'tools/SelectionTool.js',
   'tools/TransformTool.js',
   'tools/VectorPointEditor.js',
+  'tools/SmudgeTool.js',
   'tools/ShapeTool.js',
   'tools/GradientTool.js',
   'tools/TextTool.js',

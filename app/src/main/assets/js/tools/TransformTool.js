@@ -1,69 +1,76 @@
 /**
- * Vectura Transform Engine
- * Move, uniform/free scale, rotate, flip H/V with interactive on-canvas handles.
+ * Vectura Transform & Translation Engine
+ * Translates (moves), scales, rotates, and flips raster layer content or selections.
+ * Interactive on-canvas handles with real-time hardware-accelerated preview and Undo/Redo.
  */
+import { RasterCommand } from '../history/Command.js';
+
+function cloneCanvas(sourceCanvas) {
+  if (!sourceCanvas) return null;
+  const clone = document.createElement('canvas');
+  clone.width = sourceCanvas.width;
+  clone.height = sourceCanvas.height;
+  clone.getContext('2d').drawImage(sourceCanvas, 0, 0);
+  return clone;
+}
+
 export class TransformTool {
   constructor() {
     this.active = false;
     this.targetLayer = null;
+    this.beforeStateCanvas = null; // For Undo
 
-    // Bounding box of content being transformed
-    this.bounds = { x: 0, y: 0, w: 100, h: 100 };
-    this.pivot = { x: 50, y: 50 };
+    // Floating patch canvas holding pixels being transformed
+    this.patchCanvas = null;
+    this.patchOrigin = { x: 0, y: 0 }; // Initial top-left in document coords
+    this.patchSize = { w: 100, h: 100 };
 
+    // Transformations
     this.translateX = 0;
     this.translateY = 0;
     this.scaleX = 1.0;
     this.scaleY = 1.0;
     this.rotation = 0; // radians
 
-    this.dragHandle = null; // 'move' | 'nw' | 'ne' | 'se' | 'sw' | 'rot' | 'pivot'
+    // Drag tracking
+    this.dragHandle = null; // 'move' | 'nw' | 'ne' | 'se' | 'sw' | 'rot'
     this.dragStart = { x: 0, y: 0 };
     this.initialTransform = null;
   }
 
-  activate(layer) {
-    this.active = true;
+  /**
+   * Activates transform on a layer, optionally using a cut selection patch.
+   */
+  activate(layer, selectionPatch = null) {
+    if (!layer) return;
     this.targetLayer = layer;
-    this.calculateBounds();
+    this.active = true;
+
     this.translateX = 0;
     this.translateY = 0;
     this.scaleX = 1.0;
     this.scaleY = 1.0;
     this.rotation = 0;
-  }
 
-  calculateBounds() {
-    if (!this.targetLayer || this.targetLayer.strokes.length === 0) {
-      this.bounds = { x: 100, y: 100, w: this.targetLayer.width - 200, h: this.targetLayer.height - 200 };
-      this.pivot = { x: this.bounds.x + this.bounds.w / 2, y: this.bounds.y + this.bounds.h / 2 };
-      return;
-    }
+    // Snapshot layer canvas before transformation for undo / cancel
+    this.beforeStateCanvas = cloneCanvas(layer.canvas);
 
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const s of this.targetLayer.strokes) {
-      if (s.points) {
-        for (const p of s.points) {
-          minX = Math.min(minX, p.x);
-          minY = Math.min(minY, p.y);
-          maxX = Math.max(maxX, p.x);
-          maxY = Math.max(maxY, p.y);
-        }
-      }
-    }
-
-    if (minX === Infinity) {
-      this.bounds = { x: 50, y: 50, w: 200, h: 200 };
+    if (selectionPatch && selectionPatch.canvas) {
+      // Transforming extracted selection box
+      this.isSelection = true;
+      this.patchCanvas = selectionPatch.canvas;
+      this.patchOrigin = { x: selectionPatch.x, y: selectionPatch.y };
+      this.patchSize = { w: selectionPatch.w, h: selectionPatch.h };
     } else {
-      const pad = 10;
-      this.bounds = {
-        x: Math.max(0, minX - pad),
-        y: Math.max(0, minY - pad),
-        w: Math.max(20, (maxX - minX) + pad * 2),
-        h: Math.max(20, (maxY - minY) + pad * 2)
-      };
+      // Transforming whole layer
+      this.isSelection = false;
+      this.patchCanvas = cloneCanvas(layer.canvas);
+      this.patchOrigin = { x: 0, y: 0 };
+      this.patchSize = { w: layer.width, h: layer.height };
+
+      // Temporarily clear layer while actively transforming so preview doesn't double-draw
+      layer.ctx.clearRect(0, 0, layer.width, layer.height);
     }
-    this.pivot = { x: this.bounds.x + this.bounds.w / 2, y: this.bounds.y + this.bounds.h / 2 };
   }
 
   flipHorizontal() {
@@ -74,10 +81,32 @@ export class TransformTool {
     this.scaleY *= -1;
   }
 
-  onPointerDown(worldX, worldY) {
+  flipH() {
+    this.flipHorizontal();
+  }
+
+  flipV() {
+    this.flipVertical();
+  }
+
+  resetTransform() {
+    this.translateX = 0;
+    this.translateY = 0;
+    this.scaleX = 1.0;
+    this.scaleY = 1.0;
+    this.rotation = 0;
+  }
+
+  getPivot() {
+    return {
+      x: this.patchOrigin.x + this.patchSize.w / 2,
+      y: this.patchOrigin.y + this.patchSize.h / 2
+    };
+  }
+
+  onPointerDown(worldX, worldY, zoom = 1.0) {
     if (!this.active) return false;
-    // Hit test handles
-    const handle = this.hitTestHandle(worldX, worldY);
+    const handle = this.hitTestHandle(worldX, worldY, zoom);
     if (handle) {
       this.dragHandle = handle;
       this.dragStart = { x: worldX, y: worldY };
@@ -97,20 +126,23 @@ export class TransformTool {
     if (!this.active || !this.dragHandle) return;
     const dx = worldX - this.dragStart.x;
     const dy = worldY - this.dragStart.y;
+    const pivot = this.getPivot();
 
     if (this.dragHandle === 'move') {
       this.translateX = this.initialTransform.tx + dx;
       this.translateY = this.initialTransform.ty + dy;
     } else if (this.dragHandle === 'rot') {
-      const angle = Math.atan2(worldY - this.pivot.y, worldX - this.pivot.x);
-      const startAngle = Math.atan2(this.dragStart.y - this.pivot.y, this.dragStart.x - this.pivot.x);
+      const angle = Math.atan2(worldY - (pivot.y + this.initialTransform.ty), worldX - (pivot.x + this.initialTransform.tx));
+      const startAngle = Math.atan2(this.dragStart.y - (pivot.y + this.initialTransform.ty), this.dragStart.x - (pivot.x + this.initialTransform.tx));
       this.rotation = this.initialTransform.rot + (angle - startAngle);
-    } else if (this.dragHandle === 'se') {
-      const origW = this.bounds.w;
-      const newW = origW + dx;
-      const factor = Math.max(0.1, newW / origW);
-      this.scaleX = this.initialTransform.sx * factor;
-      this.scaleY = this.initialTransform.sy * factor;
+    } else if (this.dragHandle === 'se' || this.dragHandle === 'nw' || this.dragHandle === 'ne' || this.dragHandle === 'sw') {
+      const origDist = Math.hypot(this.patchSize.w / 2, this.patchSize.h / 2);
+      const curDist = Math.hypot(worldX - (pivot.x + this.translateX), worldY - (pivot.y + this.translateY));
+      const factor = Math.max(0.05, curDist / Math.max(1, origDist));
+      const signX = Math.sign(this.initialTransform.sx) || 1;
+      const signY = Math.sign(this.initialTransform.sy) || 1;
+      this.scaleX = signX * factor;
+      this.scaleY = signY * factor;
     }
   }
 
@@ -118,108 +150,184 @@ export class TransformTool {
     this.dragHandle = null;
   }
 
-  hitTestHandle(wx, wy) {
-    const handleRadius = 24;
-    const cx = this.pivot.x + this.translateX;
-    const cy = this.pivot.y + this.translateY;
+  hitTestHandle(wx, wy, zoom = 1.0) {
+    const r = 38 / Math.max(0.1, zoom); // Generous touch target for mobile
+    const pivot = this.getPivot();
+    const cx = pivot.x + this.translateX;
+    const cy = pivot.y + this.translateY;
 
-    // Rotation lever: 40px above top edge
-    const rotY = (this.bounds.y + this.translateY) - 35;
-    if (Math.hypot(wx - cx, wy - rotY) <= handleRadius) return 'rot';
+    // Un-rotate world point around pivot to local transform space
+    let lx = wx;
+    let ly = wy;
+    if (this.rotation !== 0) {
+      const cos = Math.cos(-this.rotation);
+      const sin = Math.sin(-this.rotation);
+      const dx = wx - cx;
+      const dy = wy - cy;
+      lx = cx + (dx * cos - dy * sin);
+      ly = cy + (dx * sin + dy * cos);
+    }
 
-    // SE handle
-    const seX = this.bounds.x + this.bounds.w + this.translateX;
-    const seY = this.bounds.y + this.bounds.h + this.translateY;
-    if (Math.hypot(wx - seX, wy - seY) <= handleRadius) return 'se';
+    const wHalf = (this.patchSize.w * Math.abs(this.scaleX)) / 2;
+    const hHalf = (this.patchSize.h * Math.abs(this.scaleY)) / 2;
 
-    // Inside box = move
-    const bx = this.bounds.x + this.translateX;
-    const by = this.bounds.y + this.translateY;
-    if (wx >= bx && wx <= bx + this.bounds.w && wy >= by && wy <= by + this.bounds.h) {
+    // Test rotation handle (above top edge)
+    const rotY = cy - hHalf - 36 / Math.max(0.1, zoom);
+    if (Math.hypot(lx - cx, ly - rotY) <= r) return 'rot';
+
+    // Test 4 corner handles
+    const corners = [
+      { name: 'nw', x: cx - wHalf, y: cy - hHalf },
+      { name: 'ne', x: cx + wHalf, y: cy - hHalf },
+      { name: 'se', x: cx + wHalf, y: cy + hHalf },
+      { name: 'sw', x: cx - wHalf, y: cy + hHalf }
+    ];
+
+    for (const c of corners) {
+      if (Math.hypot(lx - c.x, ly - c.y) <= r) return c.name;
+    }
+
+    // Test inside bounding box = move
+    if (lx >= cx - wHalf && lx <= cx + wHalf && ly >= cy - hHalf && ly <= cy + hHalf) {
       return 'move';
     }
 
     return null;
   }
 
-  applyTransform(onComplete) {
-    if (!this.active || !this.targetLayer) return;
+  isInsideBox(wx, wy) {
+    if (!this.active || !this.patchCanvas) return false;
+    const pivot = this.getPivot();
+    const cx = pivot.x + this.translateX;
+    const cy = pivot.y + this.translateY;
 
-    // Apply matrix to all vector strokes losslessly
-    const cos = Math.cos(this.rotation);
-    const sin = Math.sin(this.rotation);
-    const cx = this.pivot.x;
-    const cy = this.pivot.y;
+    let lx = wx;
+    let ly = wy;
+    if (this.rotation !== 0) {
+      const cos = Math.cos(-this.rotation);
+      const sin = Math.sin(-this.rotation);
+      const dx = wx - cx;
+      const dy = wy - cy;
+      lx = cx + (dx * cos - dy * sin);
+      ly = cy + (dx * sin + dy * cos);
+    }
+    const wHalf = (this.patchSize.w * Math.abs(this.scaleX)) / 2;
+    const hHalf = (this.patchSize.h * Math.abs(this.scaleY)) / 2;
+    return lx >= cx - wHalf && lx <= cx + wHalf && ly >= cy - hHalf && ly <= cy + hHalf;
+  }
 
-    for (const stroke of this.targetLayer.strokes) {
-      if (stroke.points) {
-        for (const p of stroke.points) {
-          // 1. Shift to pivot
-          let x = (p.x - cx) * this.scaleX;
-          let y = (p.y - cy) * this.scaleY;
+  /**
+   * Commits the transformation to the target layer and pushes a RasterCommand to History.
+   */
+  applyTransform(history = null, onComplete = null, selectionTool = null) {
+    if (!this.active || !this.targetLayer || !this.patchCanvas) return;
 
-          // 2. Rotate
-          const rx = x * cos - y * sin;
-          const ry = x * sin + y * cos;
+    const layer = this.targetLayer;
+    const pivot = this.getPivot();
+    const cx = pivot.x + this.translateX;
+    const cy = pivot.y + this.translateY;
 
-          // 3. Translate + Pivot
-          p.x = rx + cx + this.translateX;
-          p.y = ry + cy + this.translateY;
-        }
-      }
+    // Bake transformed patch into layer canvas
+    layer.ctx.save();
+    layer.ctx.translate(cx, cy);
+    layer.ctx.rotate(this.rotation);
+    layer.ctx.scale(this.scaleX, this.scaleY);
+    layer.ctx.drawImage(this.patchCanvas, -this.patchSize.w / 2, -this.patchSize.h / 2);
+    layer.ctx.restore();
+
+    layer.updateThumbnail();
+
+    if (history && this.beforeStateCanvas) {
+      const afterStateCanvas = cloneCanvas(layer.canvas);
+      history.push(new RasterCommand('Transform', layer, this.beforeStateCanvas, afterStateCanvas));
+    }
+
+    // Preserve and update selection bounds if transforming a selection!
+    if (this.isSelection && selectionTool) {
+      const nw = Math.round(this.patchSize.w * Math.abs(this.scaleX));
+      const nh = Math.round(this.patchSize.h * Math.abs(this.scaleY));
+      selectionTool.setBox(Math.round(cx - nw / 2), Math.round(cy - nh / 2), nw, nh);
     }
 
     this.active = false;
+    this.patchCanvas = null;
+    this.beforeStateCanvas = null;
+    this.isSelection = false;
     onComplete?.();
   }
 
-  cancel() {
+  /**
+   * Cancels transform and restores original layer state.
+   */
+  cancel(onComplete = null) {
+    if (!this.active) return;
+    if (this.targetLayer && this.beforeStateCanvas) {
+      this.targetLayer.ctx.clearRect(0, 0, this.targetLayer.width, this.targetLayer.height);
+      this.targetLayer.ctx.drawImage(this.beforeStateCanvas, 0, 0);
+      this.targetLayer.updateThumbnail();
+    }
     this.active = false;
+    this.patchCanvas = null;
+    this.beforeStateCanvas = null;
+    onComplete?.();
   }
 
-  drawOverlay(ctx) {
-    if (!this.active) return;
+  /**
+   * Renders the transformed floating content and interactive handles in real-time.
+   */
+  drawOverlay(ctx, zoom = 1.0) {
+    if (!this.active || !this.patchCanvas) return;
+
+    const pivot = this.getPivot();
+    const cx = pivot.x + this.translateX;
+    const cy = pivot.y + this.translateY;
+    const w = this.patchSize.w;
+    const h = this.patchSize.h;
+
     ctx.save();
-    ctx.translate(this.translateX, this.translateY);
-    ctx.translate(this.pivot.x, this.pivot.y);
+    ctx.translate(cx, cy);
     ctx.rotate(this.rotation);
+
+    // 1. Draw floating raster content
+    ctx.save();
     ctx.scale(this.scaleX, this.scaleY);
-    ctx.translate(-this.pivot.x, -this.pivot.y);
+    ctx.drawImage(this.patchCanvas, -w / 2, -h / 2);
+    ctx.restore();
 
-    // Bounding Box
-    ctx.strokeStyle = '#06b6d4';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(this.bounds.x, this.bounds.y, this.bounds.w, this.bounds.h);
+    // 2. Bounding Box
+    const wHalf = (w * Math.abs(this.scaleX)) / 2;
+    const hHalf = (h * Math.abs(this.scaleY)) / 2;
+    ctx.strokeStyle = '#8B5CF6';
+    ctx.lineWidth = Math.max(1.5, 2.0 / zoom);
+    ctx.strokeRect(-wHalf, -hHalf, wHalf * 2, hHalf * 2);
 
-    // Handles
-    ctx.fillStyle = '#ffffff';
-    ctx.strokeStyle = '#8b5cf6';
-    ctx.lineWidth = 2;
+    // 3. Corner Handles (crisp square controls, high visibility)
+    const hs = Math.max(14, 16 / zoom);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.strokeStyle = '#8B5CF6';
+    ctx.lineWidth = Math.max(1.5, 2.0 / zoom);
 
     const corners = [
-      [this.bounds.x, this.bounds.y],
-      [this.bounds.x + this.bounds.w, this.bounds.y],
-      [this.bounds.x + this.bounds.w, this.bounds.y + this.bounds.h],
-      [this.bounds.x, this.bounds.y + this.bounds.h]
+      [-wHalf, -hHalf],
+      [wHalf, -hHalf],
+      [wHalf, hHalf],
+      [-wHalf, hHalf]
     ];
 
     for (const [hx, hy] of corners) {
-      ctx.beginPath();
-      ctx.arc(hx, hy, 7, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
+      ctx.fillRect(hx - hs / 2, hy - hs / 2, hs, hs);
+      ctx.strokeRect(hx - hs / 2, hy - hs / 2, hs, hs);
     }
 
-    // Rotation lever
-    const midTopX = this.bounds.x + this.bounds.w / 2;
-    const midTopY = this.bounds.y;
+    // 4. Rotation handle (stem and top circle)
+    const stemLen = 36 / Math.max(0.1, zoom);
     ctx.beginPath();
-    ctx.moveTo(midTopX, midTopY);
-    ctx.lineTo(midTopX, midTopY - 30);
+    ctx.moveTo(0, -hHalf);
+    ctx.lineTo(0, -hHalf - stemLen);
     ctx.stroke();
 
     ctx.beginPath();
-    ctx.arc(midTopX, midTopY - 30, 8, 0, Math.PI * 2);
+    ctx.arc(0, -hHalf - stemLen, Math.max(8, 9 / zoom), 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
 

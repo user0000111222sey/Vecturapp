@@ -104,4 +104,13 @@ export class LassoFill {
     this.points = [];
     return shape;
   }
+
+  cancel() {
+    this.active = false;
+    this.points = [];
+  }
+
+  renderOverlay(ctx, colorHex = '#8b5cf6') {
+    this.drawLive(ctx, colorHex);
+  }
 }

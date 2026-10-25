@@ -17,7 +17,7 @@ export class Viewport {
     // Constraints
     this.minZoom = 0.05; // 5%
     this.maxZoom = 64.0; // 6400%
-    this.snapThreshold = (3.5 * Math.PI) / 180; // 3.5 degrees snap
+    this.snapThreshold = (1.0 * Math.PI) / 180; // 1.0 degree subtle snap
 
     // Screen dimensions
     this.screenWidth = window.innerWidth || 360;
@@ -93,10 +93,10 @@ export class Viewport {
   }
 
   /**
-   * Rotates anchored around a screen center point (cx, cy).
+   * Rotates anchored around a screen center point (cx, cy) with smooth sensitivity and soft zero attraction.
    */
   rotateAt(deltaAngle, cx, cy) {
-    if (Math.abs(deltaAngle) < 0.0001) return;
+    if (Math.abs(deltaAngle) < 0.00001) return;
 
     let nextAngle = this.rotation + deltaAngle;
 
@@ -104,14 +104,13 @@ export class Viewport {
     while (nextAngle > Math.PI) nextAngle -= 2 * Math.PI;
     while (nextAngle < -Math.PI) nextAngle += 2 * Math.PI;
 
-    // Soft snapping near 0 degrees (within threshold)
-    let actualDelta = deltaAngle;
-    if (Math.abs(nextAngle) < this.snapThreshold) {
-      actualDelta = -this.rotation;
-      nextAngle = 0;
+    // Soft zero attraction instead of harsh snapping jump
+    if (Math.abs(nextAngle) < 0.02) {
+      nextAngle *= 0.88;
+      if (Math.abs(nextAngle) < 0.002) nextAngle = 0;
     }
 
-    // Anchor the rotation around the pinch center (cx, cy)
+    const actualDelta = nextAngle - this.rotation;
     const cos = Math.cos(actualDelta);
     const sin = Math.sin(actualDelta);
     const dx = this.panX - cx;

@@ -1,7 +1,15 @@
 /**
  * Vectura Vector Drawing Engine
- * High-performance vector stroke engine with Catmull-Rom splines, coherent jitter,
- * coalesced pointer capture, multi-touch gestures, and 60fps layer rendering.
+ * High-performance raster canvas engine with Catmull-Rom splines, coherent jitter,
+ * coalesced pointer capture, multi-touch navigation gestures, and 60fps layer rendering.
+ *
+ * Bugs Fixed:
+ * 1. Undo/redo: Unified through HistoryManager and Command.js with active stroke cancellation.
+ * 2. Gesture collision: Navigation gesture tracking, 250ms tap duration, <10px movement,
+ *    200ms cooldown after navigation, gestureOccurred cancellation.
+ * 3. Ink bleed: Minimum dt clamp, duplicate point rejection, isFinite validation,
+ *    strict brush.maxSize clamp, and consecutive stamp size rate limiter.
+ * 4. Fill tool: Smooth expanding circular reveal clipped to region, non-blocking, undoable.
  */
 import { CatmullRomSpline, bresenhamPixelPerfect } from './CatmullRom.js';
 import { PressureEngine } from './PressureEngine.js';
@@ -10,18 +18,31 @@ import { CoherentNoise } from './CoherentNoise.js';
 import { Viewport } from './Viewport.js';
 import { LayerManager } from '../layers/LayerManager.js';
 import { ToolManager } from '../tools/ToolManager.js';
-import { StrokeCommand } from '../history/Command.js';
+import { StrokeCommand, RasterCommand } from '../history/Command.js';
+
+function cloneCanvas(sourceCanvas) {
+  if (!sourceCanvas) return null;
+  const clone = document.createElement('canvas');
+  clone.width = sourceCanvas.width;
+  clone.height = sourceCanvas.height;
+  clone.getContext('2d').drawImage(sourceCanvas, 0, 0);
+  return clone;
+}
 
 export class VectorCanvas {
   constructor(viewportCanvas, docWidth = 1080, docHeight = 1080) {
     this.viewportCanvas = viewportCanvas;
-    this.ctx = viewportCanvas.getContext('2d', { alpha: false, desynchronized: true });
+    this.ctx = viewportCanvas.getContext('2d', { alpha: true });
 
     this.docWidth = docWidth;
     this.docHeight = docHeight;
 
     // Viewport & Transformations
     this.viewport = new Viewport(docWidth, docHeight);
+    this.initialFitDone = false;
+    this.isSpaceDown = false;
+    this.isMousePanning = false;
+    this.lastMousePanPos = { x: 0, y: 0 };
 
     // Spline & Pressure & Stabilizer
     this.spline = new CatmullRomSpline(0.5);
@@ -39,21 +60,41 @@ export class VectorCanvas {
     this.liveCanvas.height = docHeight;
     this.liveCtx = this.liveCanvas.getContext('2d');
 
+    // Reusable single-stroke compositing buffer (prevents opacity blowout)
+    this.strokeCanvas = document.createElement('canvas');
+    this.strokeCanvas.width = docWidth;
+    this.strokeCanvas.height = docHeight;
+    this.strokeCtx = this.strokeCanvas.getContext('2d');
+
     // Current Drawing State
     this.isDrawing = false;
+    this.isTransforming = false;
     this.activePointerId = null;
     this.currentStroke = null;
     this.currentBrush = null;
     this.currentColor = '#8b5cf6';
+    this.beforeStrokeCanvas = null;
+
+    // Active fill animations list (non-blocking)
+    this.activeFillAnimations = [];
+
+    // Global speed multiplier from quick settings
+    this.globalSpeedFactor = 1.0;
 
     // Touch & Multi-touch navigation state
     this.activePointers = new Map(); // pointerId -> { x, y, time }
     this.isNavigating = false;
+    this.navigationGestureOccurred = false;
+    this.lastNavigationTime = 0;
     this.lastPinchDist = 0;
     this.lastPinchAngle = 0;
     this.lastPinchCenter = { x: 0, y: 0 };
+    this.initialPinchDist = 0;
+    this.initialPinchAngle = 0;
+    this.initialPinchCenter = { x: 0, y: 0 };
     this.tapStartTime = 0;
     this.tapMaxMovement = 0;
+    this.multiTouchTap = { startTime: 0, maxPointers: 0, maxMove: 0, hasNavigated: false };
 
     // Long press eyedropper timer
     this.longPressTimer = null;
@@ -64,7 +105,7 @@ export class VectorCanvas {
     this.shapeHoldDetected = false;
 
     // Settings
-    this.palmRejection = true; // Reject touch if pen is active
+    this.palmRejection = true;
     this.penActive = false;
     this.oneFingerDraws = true;
     this.pixelArtMode = false;
@@ -73,6 +114,7 @@ export class VectorCanvas {
     this.onColorPicked = null;
     this.onUndoRequested = null;
     this.onRedoRequested = null;
+    this.onToolAutoReverted = null;
     this.onHaptic = null;
 
     // Animation Loop
@@ -83,6 +125,11 @@ export class VectorCanvas {
     this.setupPointerListeners();
   }
 
+  render() {
+    this.needsRender = true;
+    this.layerManager?.invalidateCaches();
+  }
+
   setDocumentSize(w, h) {
     this.docWidth = w;
     this.docHeight = h;
@@ -91,6 +138,17 @@ export class VectorCanvas {
     this.toolManager.resizeDocument(w, h);
     this.liveCanvas.width = w;
     this.liveCanvas.height = h;
+    if (this.strokeCanvas) {
+      this.strokeCanvas.width = w;
+      this.strokeCanvas.height = h;
+    }
+  }
+
+  applyDocProperties(props) {
+    if (!props) return;
+    if (props.width && props.height) {
+      this.setDocumentSize(props.width, props.height);
+    }
   }
 
   getPointerPos(e) {
@@ -103,38 +161,186 @@ export class VectorCanvas {
 
   setupPointerListeners() {
     const el = this.viewportCanvas;
-
     el.addEventListener('pointerdown', this.onPointerDown.bind(this), { passive: false });
     el.addEventListener('pointermove', this.onPointerMove.bind(this), { passive: false });
     el.addEventListener('pointerup', this.onPointerUp.bind(this), { passive: false });
     el.addEventListener('pointercancel', this.onPointerCancel.bind(this), { passive: false });
-
-    // Prevent Chrome gesture defaults
     el.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    // Native Touch Events for two-finger gestures (pinch, pan, rotate)
+    el.addEventListener('touchstart', this.onTouchStart.bind(this), { passive: false });
+    el.addEventListener('touchmove', this.onTouchMove.bind(this), { passive: false });
+    el.addEventListener('touchend', this.onTouchEnd.bind(this), { passive: false });
+    el.addEventListener('touchcancel', this.onTouchEnd.bind(this), { passive: false });
+
+    // Wheel zoom on canvas, container, and window
+    const wheelHandler = this.onWheel.bind(this);
+    el.addEventListener('wheel', wheelHandler, { passive: false });
+    if (el.parentElement) {
+      el.parentElement.addEventListener('wheel', wheelHandler, { passive: false });
+    }
+
+    // Spacebar & Alt pan navigation
+    window.addEventListener('keydown', (e) => {
+      if ((e.code === 'Space' || e.key === 'Alt') && !this.isSpaceDown && !e.target.closest('input, textarea, select')) {
+        this.isSpaceDown = true;
+        this.viewportCanvas.style.cursor = 'grab';
+      }
+    });
+    window.addEventListener('keyup', (e) => {
+      if (e.code === 'Space' || e.key === 'Alt') {
+        this.isSpaceDown = false;
+        const isPan = this.toolManager.activeTool === 'pan' || this.toolManager.activeTool === 'transform';
+        this.viewportCanvas.style.cursor = isPan ? 'grab' : 'crosshair';
+      }
+    });
+  }
+
+  onWheel(e) {
+    e.preventDefault();
+    const rect = this.viewportCanvas.getBoundingClientRect();
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+
+    // Direct scroll zoom: roll up zooms in, roll down zooms out
+    const factor = e.deltaY < 0 ? 1.15 : 0.87;
+    this.viewport.zoomAt(factor, cx, cy);
+    this.viewport.onNavigate?.(this.viewport.zoom, this.viewport.rotation);
+  }
+
+  onTouchStart(e) {
+    if (e.touches.length >= 2) {
+      e.preventDefault();
+      this.cancelAllActiveTools();
+      this.isNavigating = true;
+      this.navigationGestureOccurred = true;
+
+      const rect = this.viewportCanvas.getBoundingClientRect();
+      const t0 = e.touches[0];
+      const t1 = e.touches[1];
+      const p1 = { x: t0.clientX - rect.left, y: t0.clientY - rect.top };
+      const p2 = { x: t1.clientX - rect.left, y: t1.clientY - rect.top };
+
+      this.touchPinchDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      this.touchPinchAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+      this.touchPinchCenter = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+    }
+  }
+
+  onTouchMove(e) {
+    if (e.touches.length >= 2) {
+      e.preventDefault();
+      this.cancelAllActiveTools();
+      this.isNavigating = true;
+      this.navigationGestureOccurred = true;
+
+      const rect = this.viewportCanvas.getBoundingClientRect();
+      const t0 = e.touches[0];
+      const t1 = e.touches[1];
+      const p1 = { x: t0.clientX - rect.left, y: t0.clientY - rect.top };
+      const p2 = { x: t1.clientX - rect.left, y: t1.clientY - rect.top };
+
+      const curDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const curAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+      const curCenter = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+
+      if (this.touchPinchCenter && this.touchPinchDist > 0) {
+        // Pan
+        const dx = curCenter.x - this.touchPinchCenter.x;
+        const dy = curCenter.y - this.touchPinchCenter.y;
+        this.viewport.panBy(dx, dy);
+
+        // Zoom
+        const factor = curDist / this.touchPinchDist;
+        if (factor > 0.01 && factor < 100) {
+          this.viewport.zoomAt(factor, curCenter.x, curCenter.y);
+        }
+
+        // Rotate
+        let deltaAngle = curAngle - this.touchPinchAngle;
+        while (deltaAngle > Math.PI) deltaAngle -= 2 * Math.PI;
+        while (deltaAngle < -Math.PI) deltaAngle += 2 * Math.PI;
+        this.viewport.rotateAt(deltaAngle, curCenter.x, curCenter.y);
+
+        this.viewport.onNavigate?.(this.viewport.zoom, this.viewport.rotation);
+        this.needsRender = true;
+      }
+
+      this.touchPinchDist = curDist;
+      this.touchPinchAngle = curAngle;
+      this.touchPinchCenter = curCenter;
+    }
+  }
+
+  onTouchEnd(e) {
+    if (e.touches.length < 2) {
+      this.touchPinchDist = 0;
+      this.touchPinchCenter = null;
+      this.lastNavigationTime = performance.now();
+      if (e.touches.length === 0) {
+        this.isNavigating = false;
+        setTimeout(() => {
+          this.navigationGestureOccurred = false;
+        }, 150);
+      }
+    }
   }
 
   onPointerDown(e) {
     e.preventDefault();
-    try {
-      this.viewportCanvas.setPointerCapture(e.pointerId);
-    } catch (_) {}
+    if (this.isNavigating || performance.now() - (this.lastNavigationTime || 0) < 250) {
+      return;
+    }
+    if (e.pointerType === 'mouse') {
+      try {
+        this.viewportCanvas.setPointerCapture(e.pointerId);
+      } catch (_) {}
+    }
 
     const now = performance.now();
     const pos = this.getPointerPos(e);
+    const world = this.viewport.screenToWorld(pos.x, pos.y);
+
+    // Mouse navigation triggers:
+    // 1. Pan tool active
+    // 2. Spacebar or Alt held down
+    // 3. Middle click (1) or right click (2)
+    // 4. Left click (0) on workspace outside artwork bounds
+    const isPanTool = this.toolManager.activeTool === 'pan';
+    const isOutsideDoc = world.x < 0 || world.x > this.docWidth || world.y < 0 || world.y > this.docHeight;
+    const isMousePan = (e.pointerType === 'mouse' && (e.button === 1 || e.button === 2 || this.isSpaceDown || e.altKey || isPanTool || (e.button === 0 && isOutsideDoc))) || (isPanTool && e.button === 0);
+
+    if (isMousePan) {
+      this.isMousePanning = true;
+      this.lastMousePanPos = { x: pos.x, y: pos.y };
+      this.viewportCanvas.style.cursor = 'grabbing';
+      return;
+    }
 
     // Stylus palm rejection
     if (e.pointerType === 'pen') {
       this.penActive = true;
     } else if (this.palmRejection && this.penActive && e.pointerType === 'touch') {
-      return; // Ignore touch while stylus active
+      return;
     }
 
     this.activePointers.set(e.pointerId, { x: pos.x, y: pos.y, time: now });
 
-    // Multi-finger gesture detection
     if (this.activePointers.size === 1) {
       this.tapStartTime = now;
       this.tapMaxMovement = 0;
+      this.navigationGestureOccurred = false;
+      this.multiTouchTap = { startTime: now, maxPointers: 1, maxMove: 0, hasNavigated: false };
+
+      // 1. Check Symmetry Pivot Drag Handle
+      if (this.toolManager.symmetry.mode !== 'off' && !this.toolManager.symmetry.locked) {
+        if (this.toolManager.symmetry.hitTest(world.x, world.y, this.viewport.zoom)) {
+          this.isDraggingSymmetry = true;
+          this.cancelLongPress();
+          this.onHaptic?.();
+          return;
+        }
+      }
 
       // Check long-press for eyedropper
       if (this.toolManager.activeTool === 'brush' || this.toolManager.activeTool === 'eyedropper') {
@@ -142,25 +348,17 @@ export class VectorCanvas {
         const world = this.viewport.screenToWorld(sx, sy);
         this.longPressPoint = { sx, sy, wx: world.x, wy: world.y };
         this.longPressTimer = setTimeout(() => {
-          if (!this.isNavigating && this.tapMaxMovement < 10) {
+          if (!this.isNavigating && !this.navigationGestureOccurred && this.tapMaxMovement < 10) {
             this.triggerEyedropper(this.longPressPoint.wx, this.longPressPoint.wy, this.longPressPoint.sx, this.longPressPoint.sy);
           }
         }, 420);
       }
 
-      // Check tool interactions (Transform, Point editor, Fill, etc.)
       const world = this.viewport.screenToWorld(pos.x, pos.y);
       const activeLayer = this.layerManager.getActiveLayer();
 
-      if (this.toolManager.activeTool === 'transform') {
-        if (this.toolManager.transformTool.onPointerDown(world.x, world.y)) {
-          return;
-        }
-      } else if (this.toolManager.activeTool === 'point-editor') {
-        if (this.toolManager.vectorPointEditor.onPointerDown(world.x, world.y, activeLayer)) {
-          return;
-        }
-      } else if (this.toolManager.activeTool === 'bucket') {
+      // Tool dispatch with strict touch priority
+      if (this.toolManager.activeTool === 'bucket') {
         this.toolManager.fillBucket.fill(world.x, world.y, this.currentColor, this.layerManager, (info) => {
           this.commitFillWithAnimation(info);
         });
@@ -171,6 +369,34 @@ export class VectorCanvas {
       } else if (this.toolManager.activeTool === 'selection') {
         this.toolManager.selectionTool.start(world.x, world.y);
         return;
+      } else if (this.toolManager.activeTool === 'transform') {
+        if (!this.toolManager.transformTool.active && activeLayer) {
+          const patch = this.toolManager.selectionTool.hasSelection
+            ? this.toolManager.selectionTool.cutSelectedPixels(activeLayer)
+            : null;
+          this.toolManager.transformTool.activate(activeLayer, patch);
+        }
+        const handled = this.toolManager.transformTool.onPointerDown(world.x, world.y, this.viewport.zoom);
+        if (handled) {
+          this.isTransforming = true;
+          this.needsRender = true;
+          return;
+        } else {
+          // Tapped outside transform box: commit and return to brush
+          this.toolManager.transformTool.applyTransform(this.history, () => {
+            this.layerManager.invalidateCaches();
+          }, this.toolManager.selectionTool);
+          this.toolManager.setTool('brush');
+          this.onToolAutoReverted?.('brush');
+          this.isTransforming = false;
+          this.needsRender = true;
+          return;
+        }
+      } else if (this.toolManager.activeTool === 'smudge') {
+        if (activeLayer && !activeLayer.locked) {
+          this.toolManager.smudgeTool.start(world.x, world.y, activeLayer, this.currentColor, this.toolManager.selectionTool);
+        }
+        return;
       } else if (this.toolManager.activeTool === 'shape') {
         this.toolManager.shapeTool.start(world.x, world.y);
         return;
@@ -179,14 +405,20 @@ export class VectorCanvas {
         return;
       }
 
-      // Standard Vector Stroke drawing begin
+      // Drawing stroke begin
       if (activeLayer && !activeLayer.locked) {
         this.startStroke(e);
       }
     } else if (this.activePointers.size >= 2) {
-      // 2 or more fingers: Cancel stroke & start Pinch / Pan / Rotate
-      this.cancelLongPress();
-      this.cancelStroke();
+      if (this.isTransforming || (this.toolManager.activeTool === 'transform' && this.toolManager.transformTool.dragHandle)) {
+        return; // Don't interrupt handle dragging!
+      }
+      if (this.activePointers.size > this.multiTouchTap.maxPointers) {
+        this.multiTouchTap.maxPointers = this.activePointers.size;
+      }
+
+      // 2 or more fingers: Cancel any active stroke/tool & initialize Pinch / Pan / Rotate
+      this.cancelAllActiveTools();
       this.isNavigating = true;
 
       const pts = Array.from(this.activePointers.values());
@@ -194,17 +426,34 @@ export class VectorCanvas {
       this.lastPinchDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
       this.lastPinchAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
       this.lastPinchCenter = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+
+      this.initialPinchDist = this.lastPinchDist;
+      this.initialPinchAngle = this.lastPinchAngle;
+      this.initialPinchCenter = { ...this.lastPinchCenter };
+      this.navigationGestureOccurred = false;
     }
   }
 
   onPointerMove(e) {
     e.preventDefault();
+    const pos = this.getPointerPos(e);
+
+    // Mouse Pan Navigation
+    if (this.isMousePanning) {
+      const dx = pos.x - this.lastMousePanPos.x;
+      const dy = pos.y - this.lastMousePanPos.y;
+      this.viewport.panBy(dx, dy);
+      this.viewport.onNavigate?.(this.viewport.zoom, this.viewport.rotation);
+      this.lastMousePanPos = { x: pos.x, y: pos.y };
+      return;
+    }
+
     if (!this.activePointers.has(e.pointerId)) return;
 
-    const pos = this.getPointerPos(e);
     const prevPt = this.activePointers.get(e.pointerId);
     const movement = Math.hypot(pos.x - prevPt.x, pos.y - prevPt.y);
     this.tapMaxMovement += movement;
+    this.multiTouchTap.maxMove += movement;
 
     if (movement > 6) {
       this.cancelLongPress();
@@ -221,67 +470,60 @@ export class VectorCanvas {
       return;
     }
 
-    // Two-finger Pinch Zoom / Pan / Rotate
-    if (this.activePointers.size >= 2 && this.isNavigating) {
-      const pts = Array.from(this.activePointers.values());
-      const p1 = pts[0], p2 = pts[1];
-      const curDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-      const curAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
-      const curCenter = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
-
-      // Pan
-      this.viewport.panBy(curCenter.x - this.lastPinchCenter.x, curCenter.y - this.lastPinchCenter.y);
-
-      // Zoom anchored to pinch center
-      if (this.lastPinchDist > 0) {
-        const factor = curDist / this.lastPinchDist;
-        this.viewport.zoomAt(factor, curCenter.x, curCenter.y);
-      }
-
-      // Rotate with normalized delta angle
-      let deltaAngle = curAngle - this.lastPinchAngle;
-      while (deltaAngle > Math.PI) deltaAngle -= 2 * Math.PI;
-      while (deltaAngle < -Math.PI) deltaAngle += 2 * Math.PI;
-      this.viewport.rotateAt(deltaAngle, curCenter.x, curCenter.y);
-
-      this.lastPinchDist = curDist;
-      this.lastPinchAngle = curAngle;
-      this.lastPinchCenter = curCenter;
+    // If navigating or multi-touch is active, don't execute any single-pointer tool
+    if (this.isNavigating || this.activePointers.size >= 2 || performance.now() - (this.lastNavigationTime || 0) < 250) {
+      this.cancelAllActiveTools();
       return;
     }
 
-    // Active tools move
+    // Symmetry pivot dragging
+    if (this.isDraggingSymmetry) {
+      const world = this.viewport.screenToWorld(pos.x, pos.y);
+      this.toolManager.symmetry.setPivot(world.x, world.y);
+      this.needsRender = true;
+      return;
+    }
+
+    // Tools move
     const world = this.viewport.screenToWorld(pos.x, pos.y);
-    if (this.toolManager.activeTool === 'transform') {
+    if (this.isTransforming || (this.toolManager.activeTool === 'transform' && this.toolManager.transformTool.active && this.toolManager.transformTool.dragHandle)) {
       this.toolManager.transformTool.onPointerMove(world.x, world.y);
+      this.needsRender = true;
       return;
-    } else if (this.toolManager.activeTool === 'point-editor') {
-      if (this.toolManager.vectorPointEditor.onPointerMove(world.x, world.y)) {
-        this.redrawActiveLayer();
-      }
+    } else if (this.toolManager.activeTool === 'smudge' && this.toolManager.smudgeTool.active) {
+      this.toolManager.smudgeTool.update(world.x, world.y, this.toolManager.selectionTool);
+      this.layerManager.invalidateCaches();
+      this.needsRender = true;
       return;
-    } else if (this.toolManager.activeTool === 'lasso-fill') {
-      this.toolManager.lassoFill.addPoint(world.x, world.y);
-      return;
-    } else if (this.toolManager.activeTool === 'selection') {
+    } else if (this.toolManager.activeTool === 'selection' && this.toolManager.selectionTool.active) {
       this.toolManager.selectionTool.update(world.x, world.y);
+      this.needsRender = true;
       return;
-    } else if (this.toolManager.activeTool === 'shape') {
+    } else if (this.toolManager.activeTool === 'lasso-fill' && this.toolManager.lassoFill.active) {
+      this.toolManager.lassoFill.addPoint(world.x, world.y);
+      this.needsRender = true;
+      return;
+    } else if (this.toolManager.activeTool === 'shape' && this.toolManager.shapeTool.active) {
       this.toolManager.shapeTool.update(world.x, world.y);
+      this.needsRender = true;
       return;
-    } else if (this.toolManager.activeTool === 'gradient') {
+    } else if (this.toolManager.activeTool === 'gradient' && this.toolManager.gradientTool.active) {
       this.toolManager.gradientTool.update(world.x, world.y);
+      this.needsRender = true;
       return;
     }
 
-    // Live Drawing stroke update with Coalesced events
+    // Live Drawing stroke update
     if (this.isDrawing && e.pointerId === this.activePointerId) {
+      if (this.isNavigating || this.activePointers.size >= 2) {
+        this.cancelStroke();
+        return;
+      }
       const coalesced = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
       for (const ce of coalesced) {
         this.appendStrokePoint(ce);
       }
 
-      // Reset shape hold timer on movement
       if (this.shapeHoldTimer) clearTimeout(this.shapeHoldTimer);
       this.shapeHoldTimer = setTimeout(() => {
         if (this.isDrawing && this.currentStroke && this.currentStroke.points.length > 5) {
@@ -299,25 +541,53 @@ export class VectorCanvas {
     this.cancelLongPress();
     if (this.shapeHoldTimer) clearTimeout(this.shapeHoldTimer);
 
+    if (this.isMousePanning) {
+      this.isMousePanning = false;
+      const isPan = this.toolManager.activeTool === 'pan' || this.toolManager.activeTool === 'transform';
+      this.viewportCanvas.style.cursor = isPan ? 'grab' : (this.isSpaceDown ? 'grab' : 'crosshair');
+      return;
+    }
+
     const now = performance.now();
-    const tapDuration = now - this.tapStartTime;
-    const pointerCountBeforeRelease = this.activePointers.size;
+    const tapDuration = now - this.multiTouchTap.startTime;
+    const maxPointers = this.multiTouchTap.maxPointers;
 
     this.activePointers.delete(e.pointerId);
 
-    // Multi-finger tap gestures for Undo & Redo (short time, minimal movement)
-    if (tapDuration < 240 && this.tapMaxMovement < 14) {
-      if (pointerCountBeforeRelease === 2) {
+    if (this.isDraggingSymmetry) {
+      this.isDraggingSymmetry = false;
+      this.needsRender = true;
+      return;
+    }
+
+    // Multi-finger tap gestures for Undo & Redo:
+    // 2-finger tap = Undo, 3-finger tap = Redo
+    if (!this.multiTouchTap.hasNavigated && tapDuration < 340 && this.multiTouchTap.maxMove < 18) {
+      if (maxPointers === 2) {
         this.onHaptic?.();
         this.onUndoRequested?.();
-        this.isNavigating = false;
+        this.multiTouchTap = { startTime: 0, maxPointers: 0, maxMove: 999, hasNavigated: true };
+        this.cancelAllActiveTools();
         return;
-      } else if (pointerCountBeforeRelease === 3) {
+      } else if (maxPointers === 3) {
         this.onHaptic?.();
         this.onRedoRequested?.();
-        this.isNavigating = false;
+        this.multiTouchTap = { startTime: 0, maxPointers: 0, maxMove: 999, hasNavigated: true };
+        this.cancelAllActiveTools();
         return;
       }
+    }
+
+    // If navigation occurred or multiple fingers were down, cancel all tools without committing stray marks
+    if (this.navigationGestureOccurred || this.multiTouchTap.hasNavigated || this.isNavigating || performance.now() - (this.lastNavigationTime || 0) < 250 || this.activePointers.size > 0) {
+      this.cancelAllActiveTools();
+      if (this.activePointers.size === 0) {
+        this.isNavigating = false;
+        setTimeout(() => {
+          this.navigationGestureOccurred = false;
+        }, 150);
+      }
+      return;
     }
 
     if (this.toolManager.eyedropper.active) {
@@ -325,29 +595,78 @@ export class VectorCanvas {
       return;
     }
 
-    // Tool commits
-    const activeLayer = this.layerManager.getActiveLayer();
-    if (this.toolManager.activeTool === 'transform') {
+    if (this.toolManager.smudgeTool && this.toolManager.activeTool === 'smudge' && this.toolManager.smudgeTool.active) {
+      this.toolManager.smudgeTool.commit(this.history, () => {
+        this.layerManager.invalidateCaches();
+      });
+      this.needsRender = true;
+      return;
+    }
+
+    if (this.toolManager.selectionTool && this.toolManager.activeTool === 'selection' && this.toolManager.selectionTool.active) {
+      const rw = Math.abs(this.toolManager.selectionTool.currentX - this.toolManager.selectionTool.startX);
+      const rh = Math.abs(this.toolManager.selectionTool.currentY - this.toolManager.selectionTool.startY);
+      if (rw < 4 && rh < 4 && this.toolManager.selectionTool.hasSelection) {
+        // Tapped outside selection box without dragging -> clear selection and revert to brush
+        this.toolManager.selectionTool.clear();
+        this.toolManager.setTool('brush');
+        this.onToolAutoReverted?.('brush');
+      } else {
+        this.toolManager.selectionTool.commit();
+      }
+      this.needsRender = true;
+      this.onSelectionChanged?.(this.toolManager.selectionTool.hasSelection);
+      return;
+    } else if (this.isTransforming || this.toolManager.activeTool === 'transform') {
+      this.isTransforming = false;
       this.toolManager.transformTool.onPointerUp();
-    } else if (this.toolManager.activeTool === 'point-editor') {
-      this.toolManager.vectorPointEditor.onPointerUp();
-    } else if (this.toolManager.activeTool === 'lasso-fill' && activeLayer) {
-      this.toolManager.lassoFill.finish(activeLayer, this.currentColor, false);
-      this.layerManager.invalidateCaches();
-    } else if (this.toolManager.activeTool === 'selection') {
-      this.toolManager.selectionTool.commit();
-    } else if (this.toolManager.activeTool === 'shape' && activeLayer) {
-      this.toolManager.shapeTool.commit(activeLayer, this.currentColor, this.currentBrush?.size || 4);
-      this.layerManager.invalidateCaches();
-    } else if (this.toolManager.activeTool === 'gradient' && activeLayer) {
-      this.toolManager.gradientTool.commit(activeLayer, this.currentColor, '#ffffff');
-      this.layerManager.invalidateCaches();
+      this.needsRender = true;
+      return;
+    }
+
+    // Tool commits with unified Command pattern
+    const activeLayer = this.layerManager.getActiveLayer();
+    if (activeLayer && !activeLayer.locked) {
+      if (this.toolManager.activeTool === 'lasso-fill' && this.toolManager.lassoFill.active) {
+        const beforeCanvas = cloneCanvas(activeLayer.canvas);
+        this.toolManager.lassoFill.finish(activeLayer, this.currentColor, false);
+        const afterCanvas = cloneCanvas(activeLayer.canvas);
+        this.layerManager.invalidateCaches();
+        if (this.history) {
+          this.history.push(new RasterCommand('Lasso Fill', activeLayer, beforeCanvas, afterCanvas, () => {
+            this.layerManager.invalidateCaches();
+          }));
+        }
+      } else if (this.toolManager.activeTool === 'shape' && this.toolManager.shapeTool.active) {
+        const beforeCanvas = cloneCanvas(activeLayer.canvas);
+        this.toolManager.shapeTool.commit(activeLayer, this.currentColor, this.currentBrush?.size || 4);
+        const afterCanvas = cloneCanvas(activeLayer.canvas);
+        this.layerManager.invalidateCaches();
+        if (this.history) {
+          this.history.push(new RasterCommand('Draw Shape', activeLayer, beforeCanvas, afterCanvas, () => {
+            this.layerManager.invalidateCaches();
+          }));
+        }
+      } else if (this.toolManager.activeTool === 'gradient' && this.toolManager.gradientTool.active) {
+        const beforeCanvas = cloneCanvas(activeLayer.canvas);
+        this.toolManager.gradientTool.commit(activeLayer, this.currentColor, '#ffffff');
+        const afterCanvas = cloneCanvas(activeLayer.canvas);
+        this.layerManager.invalidateCaches();
+        if (this.history) {
+          this.history.push(new RasterCommand('Linear Gradient', activeLayer, beforeCanvas, afterCanvas, () => {
+            this.layerManager.invalidateCaches();
+          }));
+        }
+      }
     }
 
     if (this.isDrawing && e.pointerId === this.activePointerId) {
       this.finishStroke();
     }
 
+    if (this.isNavigating) {
+      this.lastNavigationTime = now;
+    }
     if (this.activePointers.size === 0) {
       this.isNavigating = false;
     }
@@ -356,8 +675,13 @@ export class VectorCanvas {
   onPointerCancel(e) {
     this.cancelLongPress();
     if (this.shapeHoldTimer) clearTimeout(this.shapeHoldTimer);
+    if (this.isMousePanning) {
+      this.isMousePanning = false;
+      this.viewportCanvas.style.cursor = this.isSpaceDown ? 'grab' : 'crosshair';
+    }
     this.activePointers.delete(e.pointerId);
     this.cancelStroke();
+    this.lastNavigationTime = performance.now();
     if (this.activePointers.size === 0) {
       this.isNavigating = false;
     }
@@ -388,7 +712,6 @@ export class VectorCanvas {
 
     let maxPerpDist = 0;
     for (const p of pts) {
-      // Distance from line
       const dx = pEnd.x - pStart.x;
       const dy = pEnd.y - pStart.y;
       const d = Math.abs(dy * p.x - dx * p.y + pEnd.x * pStart.y - pEnd.y * pStart.x) / Math.max(1, totalDist);
@@ -397,7 +720,6 @@ export class VectorCanvas {
 
     this.onHaptic?.();
     if (maxPerpDist < 18) {
-      // Snap to perfect line
       this.currentStroke.points = [
         { ...pStart, pressure: 0.8 },
         { ...pEnd, pressure: 0.8 }
@@ -408,18 +730,25 @@ export class VectorCanvas {
   }
 
   startStroke(e) {
+    const activeLayer = this.layerManager.getActiveLayer();
+    if (!activeLayer) return;
+
     this.isDrawing = true;
     this.activePointerId = e.pointerId;
     this.shapeHoldDetected = false;
+    this.lastStampRadius = null;
+
+    // Snapshot layer canvas before stroke for deterministic raster undo
+    this.beforeStrokeCanvas = cloneCanvas(activeLayer.canvas);
 
     const pos = this.getPointerPos(e);
     const rawWorld = this.viewport.screenToWorld(pos.x, pos.y);
     const snapped = this.toolManager.rulerGuides.snapPoint(rawWorld.x, rawWorld.y);
 
     this.pressureEngine.reset();
-    const pressure = this.pressureEngine.resolvePressure(e, snapped);
+    const pressure = this.pressureEngine.resolvePressure(e, snapped, this.currentBrush, this.globalSpeedFactor);
+    this.stabilizer.reset();
 
-    this.stabilizer.setStrength(this.currentBrush?.stabilizer ?? 30);
     const stabilized = this.stabilizer.begin({
       x: snapped.x,
       y: snapped.y,
@@ -428,22 +757,29 @@ export class VectorCanvas {
     });
 
     const isEraser = this.toolManager.activeTool === 'eraser' || (this.currentBrush && this.currentBrush.isEraser);
-
-    // Create deterministic random seed for stroke
     const strokeSeed = Math.floor(Math.random() * 0xffffff);
+
+    const brushSnapshot = (this.currentBrush && typeof this.currentBrush.createSnapshot === 'function')
+      ? this.currentBrush.createSnapshot()
+      : (this.currentBrush ? JSON.parse(JSON.stringify(this.currentBrush)) : {});
 
     this.currentStroke = {
       id: 'stroke_' + Date.now() + '_' + Math.floor(Math.random() * 10000),
       brushId: this.currentBrush?.id || 'pencil',
-      brushSnapshot: this.currentBrush ? this.currentBrush.createSnapshot() : {},
+      brushSnapshot: brushSnapshot,
       color: isEraser ? '#000000' : this.currentColor,
       isEraser: isEraser,
       seed: strokeSeed,
       points: [stabilized]
     };
 
-    this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
-    this.renderLiveStroke();
+    if (isEraser) {
+      this.renderStrokeToLayer(activeLayer, this.currentStroke);
+      this.layerManager.invalidateCaches();
+    } else {
+      this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+      this.renderLiveStroke();
+    }
   }
 
   appendStrokePoint(e) {
@@ -453,7 +789,18 @@ export class VectorCanvas {
     const rawWorld = this.viewport.screenToWorld(pos.x, pos.y);
     const snapped = this.toolManager.rulerGuides.snapPoint(rawWorld.x, rawWorld.y);
 
-    const pressure = this.pressureEngine.resolvePressure(e, snapped);
+    // Stop emission when finger is still unless brush has build-up enabled
+    const pts = this.currentStroke.points;
+    if (pts.length > 0) {
+      const lastPt = pts[pts.length - 1];
+      const distFromLast = Math.hypot(snapped.x - lastPt.x, snapped.y - lastPt.y);
+      const isBuildUp = !!(this.currentBrush?.buildUp || this.currentBrush?.isAirbrushBuildUp);
+      if (distFromLast < 1.8 && !isBuildUp) {
+        return;
+      }
+    }
+
+    const pressure = this.pressureEngine.resolvePressure(e, snapped, this.currentBrush, this.globalSpeedFactor);
     const stabilized = this.stabilizer.update({
       x: snapped.x,
       y: snapped.y,
@@ -463,7 +810,17 @@ export class VectorCanvas {
 
     if (stabilized) {
       this.currentStroke.points.push(stabilized);
-      this.renderLiveStroke();
+      if (this.currentStroke.isEraser) {
+        const activeLayer = this.layerManager.getActiveLayer();
+        if (activeLayer && !activeLayer.locked && this.beforeStrokeCanvas) {
+          activeLayer.ctx.clearRect(0, 0, activeLayer.width, activeLayer.height);
+          activeLayer.ctx.drawImage(this.beforeStrokeCanvas, 0, 0);
+          this.renderStrokeToLayer(activeLayer, this.currentStroke);
+          this.layerManager.invalidateCaches();
+        }
+      } else {
+        this.renderLiveStroke();
+      }
     }
   }
 
@@ -472,7 +829,6 @@ export class VectorCanvas {
     this.isDrawing = false;
     this.activePointerId = null;
 
-    // Catch up points from stabilizer on finger release
     const catchUp = this.stabilizer.finish();
     if (catchUp && catchUp.length > 0) {
       for (const pt of catchUp) {
@@ -481,52 +837,92 @@ export class VectorCanvas {
     }
 
     const activeLayer = this.layerManager.getActiveLayer();
-    if (!activeLayer || activeLayer.locked) {
-      this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
-      return;
+    if (activeLayer && !activeLayer.locked) {
+      if (!this.currentStroke.isEraser) {
+        this.renderStrokeToLayer(activeLayer, this.currentStroke);
+      }
+      const afterCanvas = cloneCanvas(activeLayer.canvas);
+
+      if (this.history) {
+        const cmd = new StrokeCommand(
+          activeLayer,
+          this.currentStroke,
+          (l) => {
+            this.layerManager.invalidateCaches();
+          },
+          this.beforeStrokeCanvas,
+          afterCanvas
+        );
+        this.history.push(cmd);
+      }
     }
 
-    // Handle single tap dot
-    if (this.currentStroke.points.length === 1) {
-      const p = this.currentStroke.points[0];
-      this.currentStroke.points.push({ ...p, x: p.x + 0.1, y: p.y + 0.1 });
-    }
-
-    // Render stroke permanently onto layer canvas
-    this.renderStrokeToLayer(activeLayer, this.currentStroke);
-
-    // Create history command
-    if (this.history) {
-      const cmd = new StrokeCommand(activeLayer, this.currentStroke, (l, fullRedraw) => {
-        if (fullRedraw) {
-          this.redrawLayerStrokes(l);
-        } else {
-          this.layerManager.invalidateCaches();
-        }
-      });
-      this.history.push(cmd);
-    }
-
-    // Clear live buffer and invalidate layer composite cache
     this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
     this.currentStroke = null;
+    this.beforeStrokeCanvas = null;
+    this.lastStampRadius = null;
     this.layerManager.invalidateCaches();
   }
 
   cancelStroke() {
     if (this.isDrawing) {
+      if (this.currentStroke?.isEraser) {
+        const activeLayer = this.layerManager.getActiveLayer();
+        if (activeLayer && this.beforeStrokeCanvas) {
+          activeLayer.ctx.clearRect(0, 0, activeLayer.width, activeLayer.height);
+          activeLayer.ctx.drawImage(this.beforeStrokeCanvas, 0, 0);
+          activeLayer.updateThumbnail();
+        }
+      }
       this.isDrawing = false;
       this.activePointerId = null;
       this.currentStroke = null;
+      this.beforeStrokeCanvas = null;
+      this.lastStampRadius = null;
       this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+      this.layerManager.invalidateCaches();
     }
+    if (this.toolManager.lassoFill?.active) {
+      this.toolManager.lassoFill.cancel();
+    }
+    if (this.toolManager.shapeTool?.active) {
+      this.toolManager.shapeTool.cancel();
+    }
+    if (this.toolManager.gradientTool?.active) {
+      this.toolManager.gradientTool.cancel();
+    }
+  }
+
+  cancelAllActiveTools() {
+    this.cancelLongPress();
+    this.cancelStroke();
+    this.isDraggingSymmetry = false;
+    if (this.toolManager.smudgeTool) {
+      this.toolManager.smudgeTool.active = false;
+    }
+    if (this.toolManager.lassoFill) {
+      this.toolManager.lassoFill.cancel();
+      this.toolManager.lassoFill.active = false;
+      this.toolManager.lassoFill.points = [];
+    }
+    if (this.toolManager.shapeTool) {
+      this.toolManager.shapeTool.cancel();
+      this.toolManager.shapeTool.active = false;
+    }
+    if (this.toolManager.gradientTool) {
+      this.toolManager.gradientTool.cancel();
+      this.toolManager.gradientTool.active = false;
+    }
+    if (this.toolManager.selectionTool && !this.toolManager.selectionTool.hasSelection) {
+      this.toolManager.selectionTool.active = false;
+    }
+    this.needsRender = true;
   }
 
   renderLiveStroke() {
     if (!this.currentStroke) return;
     this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
 
-    // If symmetry is active, render symmetry instances
     const pts = this.currentStroke.points;
     if (this.toolManager.symmetry.mode !== 'off' && pts.length > 0) {
       const symmInstances = this.toolManager.symmetry.radialAxes || 4;
@@ -556,6 +952,9 @@ export class VectorCanvas {
     layer.updateThumbnail();
   }
 
+  /**
+   * Stamping and Ribbon Stroke Render Engine with Ink-Bleed Safeguards & Advanced Spacing/Jitter
+   */
   renderStrokeToContext(ctx, stroke) {
     const b = stroke.brushSnapshot || {};
     const pts = stroke.points;
@@ -563,13 +962,11 @@ export class VectorCanvas {
 
     ctx.save();
 
-    // Clip to selection mask if present
-    if (this.toolManager.selectionTool.hasSelection) {
-      // Selection restricts drawing
-    }
-
+    const activeLayer = this.layerManager.getActiveLayer();
     if (stroke.isEraser) {
       ctx.globalCompositeOperation = 'destination-out';
+    } else if (activeLayer && ctx === activeLayer.ctx && activeLayer.alphaLock) {
+      ctx.globalCompositeOperation = 'source-atop';
     } else {
       ctx.globalCompositeOperation = b.blendMode || 'source-over';
     }
@@ -577,11 +974,16 @@ export class VectorCanvas {
     ctx.fillStyle = stroke.color;
     ctx.strokeStyle = stroke.color;
 
-    // Pixel Art Mode check
-    if (this.pixelArtMode || b.isPixel) {
+    // Pixel Art Mode: 1px / integer grid
+    if (this.pixelArtMode || b.isPixel || b.spacingSettings?.pixelArtMode) {
       ctx.imageSmoothingEnabled = false;
       for (let i = 0; i < pts.length - 1; i++) {
-        const pixels = bresenhamPixelPerfect(pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y);
+        const pixels = bresenhamPixelPerfect(
+          Math.round(pts[i].x),
+          Math.round(pts[i].y),
+          Math.round(pts[i + 1].x),
+          Math.round(pts[i + 1].y)
+        );
         for (const px of pixels) {
           ctx.fillRect(px.x, px.y, b.size || 1, b.size || 1);
         }
@@ -590,77 +992,185 @@ export class VectorCanvas {
       return;
     }
 
-    // Catmull-Rom Dense Sampling
-    const samples = this.spline.sampleStroke(pts, 6);
+    // Spacing calculation
+    const baseSize = Math.max(1, Number.isFinite(b.size) ? b.size : 8);
+    const sp = b.spacingSettings || {};
+    const spacingRatio = Math.max(0.01, Math.min(2.0, sp.spacing ?? b.spacing ?? 0.08));
+    let stepPx = Math.max(sp.minSpacingPx || 0.8, baseSize * spacingRatio);
+
+    // Auto-spacing mode: keep strokes smooth at all sizes
+    if (sp.autoSpacing) {
+      stepPx = Math.max(1.0, Math.min(12.0, baseSize * 0.12));
+    }
+
+    const samples = this.spline.sampleStroke(pts, stepPx);
     if (samples.length === 0) {
       ctx.restore();
       return;
     }
 
-    const baseSize = b.size || 8;
-    const baseOpacity = b.opacity ?? 1.0;
+    const baseOpacity = Math.max(0.01, Math.min(1.0, Number.isFinite(b.opacity) ? b.opacity : 1.0));
     const strokeSeed = stroke.seed || 1337;
+    const totalLength = samples[samples.length - 1].distance || 1;
 
-    // Neon Glow multi-pass check
-    if (b.glowWidth && b.glowWidth > 1.0 && !stroke.isEraser) {
-      ctx.save();
-      ctx.globalAlpha = baseOpacity * 0.35;
-      ctx.lineWidth = baseSize * b.glowWidth;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      ctx.beginPath();
-      ctx.moveTo(samples[0].x, samples[0].y);
-      for (let i = 1; i < samples.length; i++) {
-        ctx.lineTo(samples[i].x, samples[i].y);
-      }
-      ctx.stroke();
-      ctx.restore();
+    // INK BLEED & SIZE SAFEGUARDS:
+    const brushMinRadius = Math.max(0.25, (b.minSize || 1) / 2);
+    const brushMaxRadius = Math.max(brushMinRadius + 0.5, (b.maxSize || 200) / 2);
+    let lastRadius = null;
+
+    // Single-stroke opacity capping: when !buildUp, render into stroke buffer
+    // so repeated passes or lingering within the SAME stroke never exceed baseOpacity
+    const useStrokeBuffer = (!b.buildUp && baseOpacity < 0.98 && this.strokeCtx);
+    const targetCtx = useStrokeBuffer ? this.strokeCtx : ctx;
+
+    if (useStrokeBuffer) {
+      this.strokeCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+      this.strokeCtx.save();
+      this.strokeCtx.fillStyle = stroke.color;
+      this.strokeCtx.strokeStyle = stroke.color;
     }
 
-    // Render individual stamp / ribbon segments
+    // Factor Links Matrix from brush
+    const fl = b.factorLinks || {};
+    const vLinks = fl.velocity || {};
+    const jLinks = fl.jitter || {};
+    const nLinks = fl.noise || {};
+
+    // Render individual stamp segments
     for (let i = 0; i < samples.length; i++) {
       const s = samples[i];
-      let radius = (baseSize * s.pressure) / 2;
+      if (!Number.isFinite(s.x) || !Number.isFinite(s.y)) continue;
+
+      let pressure = Number.isFinite(s.pressure) ? s.pressure : 0.5;
+      pressure = Math.max(0.01, Math.min(1.0, pressure));
+
+      let radius = (baseSize * pressure) / 2;
 
       // Taper at start and end
       if (b.taperStart > 0 && i < b.taperStart) {
-        radius *= (i + 1) / b.taperStart;
+        radius *= Math.max(0.05, (i + 1) / b.taperStart);
       }
       if (b.taperEnd > 0 && i > samples.length - b.taperEnd) {
-        radius *= (samples.length - i) / b.taperEnd;
+        radius *= Math.max(0.05, (samples.length - i) / b.taperEnd);
       }
 
-      // Coherent Noise Jitter modulation
+      // 1. Evaluate Factors: velocity, jitter, noise (smoothed limits)
+      const vFactor = Math.min(1.5, Math.max(-1.0, (pressure - 0.5) * 2.0));
+      const jFactor = ((Math.sin(strokeSeed + i * 1337.7) * 43758.5453) % 1.0);
+      const rawNoise = CoherentNoise.computeNoiseSample(b.jitter || { enabled: true }, strokeSeed, s.distance, s.time || 0);
+      const nFactor = Math.max(-1.0, Math.min(1.0, rawNoise * 0.2)); // Reduced 2D noise limit to prevent jitter explosion
+
+      // 2. Modulate Children (Size, Rotation, Spacing, Opacity, Tip Rotation)
+      // Child: Size
+      let sizeMod = 1.0;
+      if (vLinks.size) sizeMod += (vLinks.size / 100) * vFactor;
+      if (jLinks.size) sizeMod += (jLinks.size / 100) * jFactor * 0.4;
+      if (nLinks.size) sizeMod += (nLinks.size / 100) * nFactor * 0.2;
+      radius = radius * Math.max(0.05, sizeMod);
+
+      // Child: Opacity
+      let stampAlpha = useStrokeBuffer ? (b.flow ?? 1.0) : (baseOpacity * (b.flow ?? 1.0));
+      let alphaMod = 0;
+      if (vLinks.opacity) alphaMod += (vLinks.opacity / 100) * vFactor;
+      if (jLinks.opacity) alphaMod += (jLinks.opacity / 100) * jFactor * 0.4;
+      if (nLinks.opacity) alphaMod += (nLinks.opacity / 100) * nFactor * 0.2;
+      stampAlpha = Math.max(0.01, Math.min(1.0, stampAlpha * (1.0 + alphaMod)));
+
+      // Child: Rotation & Tip Rotation
+      let stampRotation = b.rotation || 0;
+      let rotMod = 0;
+      if (vLinks.rotation) rotMod += (vLinks.rotation / 100) * vFactor * Math.PI;
+      if (jLinks.rotation) rotMod += (jLinks.rotation / 100) * jFactor * Math.PI;
+      if (nLinks.rotation) rotMod += (nLinks.rotation / 100) * nFactor * 0.3 * Math.PI;
+      if (vLinks.tipRotation) rotMod += (vLinks.tipRotation / 100) * vFactor * Math.PI;
+      if (jLinks.tipRotation) rotMod += (jLinks.tipRotation / 100) * jFactor * Math.PI;
+      if (nLinks.tipRotation) rotMod += (nLinks.tipRotation / 100) * nFactor * 0.3 * Math.PI;
+      stampRotation += rotMod;
+
+      let stampX = s.x;
+      let stampY = s.y;
+
       if (b.jitter && b.jitter.enabled) {
-        const jitterVal = CoherentNoise.evaluateJitter(b.jitter, strokeSeed, s.distance, s.time);
-        radius = Math.max(0.5, radius * (1.0 + jitterVal));
+        const jTargets = CoherentNoise.evaluateAllTargets(
+          b.jitter,
+          strokeSeed,
+          s.distance,
+          s.time,
+          s.speed || 0,
+          totalLength
+        );
+        radius = Math.max(0.25, radius * (1.0 + jTargets.sizeDelta));
+        stampX += jTargets.wobbleX;
+        stampY += jTargets.wobbleY;
+        stampRotation += jTargets.angleDelta;
+        stampAlpha = Math.max(0.01, Math.min(1.0, stampAlpha + jTargets.opacityDelta));
       }
 
-      ctx.globalAlpha = Math.max(0.01, Math.min(1.0, baseOpacity * (b.flow ?? 1.0)));
+      if (!Number.isFinite(radius)) radius = baseSize / 2;
 
-      // Calligraphy Chisel Tip
-      if (b.tipShape === 'chisel') {
-        ctx.save();
-        ctx.translate(s.x, s.y);
-        ctx.rotate(b.rotation || 0.785);
-        ctx.fillRect(-radius * 2, -radius * 0.5, radius * 4, radius);
-        ctx.restore();
-      } else if (b.tipShape === 'gaussian' || b.hardness < 0.5) {
-        // Soft airbrush radial gradient
+      // RATE LIMITER: limit how much size can change between two consecutive stamps
+      if (lastRadius !== null) {
+        const maxDelta = Math.max(1.5, lastRadius * 0.25);
+        radius = Math.max(lastRadius - maxDelta, Math.min(lastRadius + maxDelta, radius));
+      }
+
+      // HARD CLAMP: strictly enforce brush.minSize and brush.maxSize bounds
+      radius = Math.max(brushMinRadius, Math.min(brushMaxRadius, radius));
+      lastRadius = radius;
+
+      targetCtx.globalAlpha = Math.max(0.01, Math.min(1.0, stampAlpha));
+
+      // Custom Stamp Shapes, Aspect Ratio, and Hardness
+      targetCtx.save();
+      targetCtx.translate(stampX, stampY);
+      if (stampRotation !== 0) targetCtx.rotate(stampRotation);
+      if (b.aspectRatio && b.aspectRatio !== 1.0) {
+        targetCtx.scale(1.0, 1.0 / Math.max(0.1, b.aspectRatio));
+      }
+
+      if (b.tipShape === 'square') {
+        targetCtx.fillRect(-radius, -radius, radius * 2, radius * 2);
+      } else if (b.tipShape === 'chisel') {
+        targetCtx.fillRect(-radius * 1.8, -radius * 0.4, radius * 3.6, radius * 0.8);
+      } else if (b.tipShape === 'star') {
+        targetCtx.beginPath();
+        for (let sp = 0; sp < 10; sp++) {
+          const a = (sp * Math.PI) / 5 - Math.PI / 2;
+          const rad = sp % 2 === 0 ? radius : radius * 0.45;
+          const px = Math.cos(a) * rad;
+          const py = Math.sin(a) * rad;
+          if (sp === 0) targetCtx.moveTo(px, py);
+          else targetCtx.lineTo(px, py);
+        }
+        targetCtx.closePath();
+        targetCtx.fill();
+      } else if (b.tipShape === 'bristle') {
+        for (let br = -2; br <= 2; br++) {
+          targetCtx.beginPath();
+          targetCtx.arc(br * (radius * 0.35), 0, Math.max(0.4, radius * 0.25), 0, Math.PI * 2);
+          targetCtx.fill();
+        }
+      } else if (b.tipShape === 'soft' || b.tipShape === 'gaussian' || (b.hardness !== undefined && b.hardness < 0.6)) {
         const rad = Math.max(1, radius);
-        const grad = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, rad);
+        const grad = targetCtx.createRadialGradient(0, 0, rad * Math.max(0.05, b.hardness ?? 0.3), 0, 0, rad);
         grad.addColorStop(0, stroke.color);
         grad.addColorStop(1, 'rgba(0,0,0,0)');
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(s.x, s.y, rad, 0, Math.PI * 2);
-        ctx.fill();
+        targetCtx.fillStyle = grad;
+        targetCtx.beginPath();
+        targetCtx.arc(0, 0, rad, 0, Math.PI * 2);
+        targetCtx.fill();
       } else {
-        // Standard round stamp
-        ctx.beginPath();
-        ctx.arc(s.x, s.y, Math.max(0.5, radius), 0, Math.PI * 2);
-        ctx.fill();
+        targetCtx.beginPath();
+        targetCtx.arc(0, 0, Math.max(0.5, radius), 0, Math.PI * 2);
+        targetCtx.fill();
       }
+      targetCtx.restore();
+    }
+
+    if (useStrokeBuffer) {
+      this.strokeCtx.restore();
+      ctx.globalAlpha = baseOpacity;
+      ctx.drawImage(this.strokeCanvas, 0, 0);
     }
 
     ctx.restore();
@@ -669,10 +1179,7 @@ export class VectorCanvas {
   redrawLayerStrokes(layer) {
     layer.ctx.clearRect(0, 0, layer.width, layer.height);
     for (const s of layer.strokes) {
-      if (s.shapeType) {
-        // Vector shape
-        this.toolManager.shapeTool.constructor.renderShape(layer.ctx, s);
-      } else if (s.points) {
+      if (s.points) {
         this.renderStrokeToContext(layer.ctx, s);
       }
     }
@@ -680,114 +1187,166 @@ export class VectorCanvas {
     this.layerManager.invalidateCaches();
   }
 
+  /**
+   * iPad-style expanding circular ripple fill animation.
+   * Expands smoothly (ease-out, ~300-500 ms) clipped strictly to the filled region.
+   * Input is NOT blocked. Committed as one undoable step with RasterCommand.
+   */
   commitFillWithAnimation(info) {
-    const { startX, startY, patchCanvas, activeLayer, fillColorHex } = info;
+    const { startX, startY, maxRadius, patchCanvas, activeLayer, animate, duration } = info;
     this.onHaptic?.();
 
-    // Trigger visual ripple expansion effect
-    const rippleEl = document.createElement('div');
-    rippleEl.className = 'fill-ripple-effect';
-    rippleEl.style.backgroundColor = fillColorHex;
+    const beforeCanvas = cloneCanvas(activeLayer.canvas);
 
-    const screenPos = this.viewport.worldToScreen(startX, startY);
-    const size = Math.max(this.viewportCanvas.width, this.viewportCanvas.height) * 1.5;
-    rippleEl.style.width = size + 'px';
-    rippleEl.style.height = size + 'px';
-    rippleEl.style.left = (screenPos.x - size / 2) + 'px';
-    rippleEl.style.top = (screenPos.y - size / 2) + 'px';
+    const commitToHistory = () => {
+      const afterCanvas = cloneCanvas(activeLayer.canvas);
+      if (this.history) {
+        this.history.push(new RasterCommand('Fill Bucket', activeLayer, beforeCanvas, afterCanvas, () => {
+          this.layerManager.invalidateCaches();
+        }));
+      }
+    };
 
-    document.getElementById('ui-overlay')?.appendChild(rippleEl);
-    setTimeout(() => rippleEl.remove(), 350);
-
-    // Commit to layer canvas
-    activeLayer.ctx.drawImage(patchCanvas, 0, 0);
-    activeLayer.updateThumbnail();
-    this.layerManager.invalidateCaches();
-  }
-
-  redrawActiveLayer() {
-    const active = this.layerManager.getActiveLayer();
-    if (active) {
-      this.redrawLayerStrokes(active);
+    if (!animate) {
+      activeLayer.ctx.drawImage(patchCanvas, 0, 0);
+      activeLayer.updateThumbnail();
+      this.layerManager.invalidateCaches();
+      commitToHistory();
+      return;
     }
+
+    const startTime = performance.now();
+    const animDuration = Math.max(200, Math.min(800, duration || 380));
+
+    const animCanvas = document.createElement('canvas');
+    animCanvas.width = this.docWidth;
+    animCanvas.height = this.docHeight;
+    const animCtx = animCanvas.getContext('2d');
+
+    const animEntry = {
+      render: (targetCtx) => {
+        const elapsed = performance.now() - startTime;
+        const progress = Math.min(1.0, elapsed / animDuration);
+        const ease = 1 - Math.pow(1 - progress, 3); // Ease-out cubic
+        const currentR = maxRadius * ease;
+
+        animCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+        animCtx.save();
+        animCtx.beginPath();
+        animCtx.arc(startX, startY, currentR, 0, Math.PI * 2);
+        animCtx.clip();
+        animCtx.drawImage(patchCanvas, 0, 0);
+        animCtx.restore();
+
+        targetCtx.drawImage(animCanvas, 0, 0);
+        return progress < 1.0;
+      }
+    };
+
+    this.activeFillAnimations.push(animEntry);
+
+    const checkFinish = () => {
+      const elapsed = performance.now() - startTime;
+      if (elapsed >= animDuration) {
+        const idx = this.activeFillAnimations.indexOf(animEntry);
+        if (idx >= 0) this.activeFillAnimations.splice(idx, 1);
+
+        activeLayer.ctx.drawImage(patchCanvas, 0, 0);
+        activeLayer.updateThumbnail();
+        this.layerManager.invalidateCaches();
+        commitToHistory();
+      } else {
+        requestAnimationFrame(checkFinish);
+      }
+    };
+    requestAnimationFrame(checkFinish);
   }
 
   /**
-   * Main 60 FPS Viewport Render Loop
+   * 60 FPS Viewport Render Loop
    */
   renderLoop() {
     if (!this.running) return;
 
-    // Resize canvas if container size changed
-    const w = this.viewportCanvas.clientWidth;
-    const h = this.viewportCanvas.clientHeight;
-    if (this.viewportCanvas.width !== w || this.viewportCanvas.height !== h) {
-      this.viewportCanvas.width = w;
-      this.viewportCanvas.height = h;
-      this.viewport.resizeScreen(w, h);
-    }
+    try {
+      const w = this.viewportCanvas.clientWidth || window.innerWidth || 800;
+      const h = this.viewportCanvas.clientHeight || window.innerHeight || 600;
+      if (this.viewportCanvas.width !== w || this.viewportCanvas.height !== h) {
+        this.viewportCanvas.width = w;
+        this.viewportCanvas.height = h;
+        this.viewport.resizeScreen(w, h);
+      }
 
-    const ctx = this.ctx;
-    ctx.save();
+      if (!this.initialFitDone && w > 80 && h > 80) {
+        this.viewport.fitToScreen();
+        this.initialFitDone = true;
+      }
 
-    // 1. Clear screen viewport
-    ctx.clearRect(0, 0, w, h);
+      const ctx = this.ctx;
+      // 1. Workspace background (calm surround tone #D9D9DB)
+      ctx.fillStyle = '#D9D9DB';
+      ctx.fillRect(0, 0, w, h);
 
-    // 2. Apply pan, zoom, rotation, mirror transforms
-    this.viewport.applyTransform(ctx);
-
-    // 3. Render document layers & live stroke buffer
-    const activeLayer = this.layerManager.getActiveLayer();
-    const liveOpacity = this.currentBrush?.opacity ?? 1.0;
-    const liveBlend = this.currentBrush?.blendMode || 'source-over';
-
-    this.layerManager.compositeStack(
-      ctx,
-      this.isDrawing ? this.liveCanvas : null,
-      liveOpacity,
-      liveBlend
-    );
-
-    // 4. Overlays: Shapes and Lasso live preview
-    if (this.toolManager.activeTool === 'shape' && this.toolManager.shapeTool.active) {
-      this.toolManager.shapeTool.drawLive(ctx, this.currentColor, this.currentBrush?.size || 4);
-    } else if (this.toolManager.activeTool === 'lasso-fill' && this.toolManager.lassoFill.active) {
-      this.toolManager.lassoFill.drawLive(ctx, this.currentColor);
-    } else if (this.toolManager.activeTool === 'gradient' && this.toolManager.gradientTool.active) {
-      this.toolManager.gradientTool.drawLive(ctx, this.currentColor, '#ffffff');
-    }
-
-    // 5. Overlays: Transform handles, Point editor, Marching ants, Symmetry, Guides
-    if (this.toolManager.activeTool === 'transform') {
-      this.toolManager.transformTool.drawOverlay(ctx);
-    }
-    if (this.toolManager.activeTool === 'point-editor') {
-      this.toolManager.vectorPointEditor.drawOverlay(ctx);
-    }
-    this.toolManager.selectionTool.drawMarchingAnts(ctx);
-    this.toolManager.symmetry.drawOverlay(ctx, this.docWidth, this.docHeight);
-    this.toolManager.rulerGuides.drawGuides(ctx, this.docWidth, this.docHeight);
-
-    // 6. Stabilizer Lazy Rope visual string
-    const rope = this.stabilizer.getRopeVisual();
-    if (rope) {
       ctx.save();
-      ctx.strokeStyle = '#f59e0b';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.moveTo(rope.finger.x, rope.finger.y);
-      ctx.lineTo(rope.tip.x, rope.tip.y);
-      ctx.stroke();
+      this.viewport.applyTransform(ctx);
 
-      ctx.fillStyle = '#f59e0b';
-      ctx.beginPath();
-      ctx.arc(rope.finger.x, rope.finger.y, 4, 0, Math.PI * 2);
-      ctx.fill();
+      // 2. Artwork background (white paper)
+      ctx.fillStyle = this.layerManager.isTransparentBg ? '#FFFFFF' : (this.layerManager.backgroundColor || '#FFFFFF');
+      ctx.fillRect(0, 0, this.docWidth, this.docHeight);
+
+      // 3. 1px artwork outline
+      ctx.strokeStyle = '#B8B8BC';
+      ctx.lineWidth = Math.max(1, 1 / this.viewport.zoom);
+      ctx.strokeRect(0, 0, this.docWidth, this.docHeight);
+
+      // Composite layers with live buffer
+      this.layerManager.compositeStack(ctx, this.liveCanvas, 1.0, 'source-over');
+
+      // Render active fill animations
+      if (this.activeFillAnimations.length > 0) {
+        for (const anim of this.activeFillAnimations) {
+          anim.render(ctx);
+        }
+      }
+
+      // Ruler Guides overlay
+      if (this.toolManager.rulerGuides.mode !== 'off') {
+        this.toolManager.rulerGuides.drawGuides(ctx, this.docWidth, this.docHeight, this.viewport.zoom);
+      }
+
+      // Selection marching ants overlay
+      if (this.toolManager.selectionTool.hasSelection || this.toolManager.selectionTool.active) {
+        this.toolManager.selectionTool.drawMarchingAnts(ctx, this.viewport.zoom);
+      }
+
+      // Transform interactive overlay
+      if (this.toolManager.transformTool.active) {
+        this.toolManager.transformTool.drawOverlay(ctx, this.viewport.zoom);
+      }
+
+      // Symmetry overlay
+      if (this.toolManager.symmetry.mode !== 'off') {
+        this.toolManager.symmetry.render(ctx, this.docWidth, this.docHeight, this.viewport.zoom);
+      }
+
+      // Tool live overlays
+      try {
+        if (this.toolManager.activeTool === 'lasso-fill' && this.toolManager.lassoFill.active) {
+          this.toolManager.lassoFill.renderOverlay(ctx, this.currentColor);
+        } else if (this.toolManager.activeTool === 'shape' && this.toolManager.shapeTool.active) {
+          this.toolManager.shapeTool.renderOverlay(ctx, this.currentColor, this.currentBrush?.size || 4);
+        } else if (this.toolManager.activeTool === 'gradient' && this.toolManager.gradientTool.active) {
+          this.toolManager.gradientTool.renderOverlay(ctx, this.currentColor, '#ffffff');
+        }
+      } catch (overlayErr) {
+        // Overlay failure should never crash the engine
+      }
+
       ctx.restore();
+    } catch (err) {
+      console.warn('Error in renderLoop:', err);
+    } finally {
+      requestAnimationFrame(this.renderLoop);
     }
-
-    ctx.restore();
-
-    requestAnimationFrame(this.renderLoop);
   }
 }

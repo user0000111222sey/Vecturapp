@@ -65,36 +65,20 @@ export class CatmullRomSpline {
   }
 
   /**
-   * Generates smooth dense polyline samples from control points.
+   * Generates smooth dense polyline samples strictly spaced by stepPx arc-length distance.
+   * Completely eliminates stamp piling and unpredictable opacity clustering.
    */
-  sampleStroke(controlPoints, adaptiveSteps = 8) {
+  sampleStroke(controlPoints, stepPx = 4) {
     if (!controlPoints || controlPoints.length === 0) return [];
     if (controlPoints.length === 1) {
       const p = controlPoints[0];
       return [{ x: p.x, y: p.y, pressure: p.pressure || 0.5, time: p.time || 0, distance: 0 }];
     }
-    if (controlPoints.length === 2) {
-      const p0 = controlPoints[0];
-      const p1 = controlPoints[1];
-      const dist = Math.hypot(p1.x - p0.x, p1.y - p0.y);
-      const steps = Math.max(4, Math.ceil(dist / 2));
-      const samples = [];
-      for (let i = 0; i <= steps; i++) {
-        const u = i / steps;
-        samples.push({
-          x: p0.x + u * (p1.x - p0.x),
-          y: p0.y + u * (p1.y - p0.y),
-          pressure: p0.pressure + u * (p1.pressure - p0.pressure),
-          time: p0.time + u * (p1.time - p0.time),
-          distance: u * dist
-        });
-      }
-      return samples;
-    }
 
+    // 1. Generate dense polyline along spline
+    const dense = [];
     const n = controlPoints.length;
-    const samples = [];
-    let accumulatedDist = 0;
+    let totalDist = 0;
 
     for (let i = 0; i < n - 1; i++) {
       const p0 = i === 0 ? controlPoints[0] : controlPoints[i - 1];
@@ -102,18 +86,54 @@ export class CatmullRomSpline {
       const p2 = controlPoints[i + 1];
       const p3 = i + 2 < n ? controlPoints[i + 2] : p2;
 
-      const seg = this.interpolateSegment(p0, p1, p2, p3, adaptiveSteps);
-      // Avoid duplicate boundary point between segments
+      const segDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const subSteps = Math.max(2, Math.min(16, Math.ceil(segDist / 2)));
+      const seg = this.interpolateSegment(p0, p1, p2, p3, subSteps);
       const startIdx = i === 0 ? 0 : 1;
       for (let j = startIdx; j < seg.length; j++) {
         const pt = seg[j];
-        if (samples.length > 0) {
-          const prev = samples[samples.length - 1];
-          accumulatedDist += Math.hypot(pt.x - prev.x, pt.y - prev.y);
+        if (dense.length > 0) {
+          const prev = dense[dense.length - 1];
+          totalDist += Math.hypot(pt.x - prev.x, pt.y - prev.y);
         }
-        pt.distance = accumulatedDist;
-        samples.push(pt);
+        pt.distance = totalDist;
+        dense.push(pt);
       }
+    }
+
+    if (dense.length <= 1) return dense;
+
+    // 2. Uniform Arc-Length Resampling strictly by stepPx
+    const step = Math.max(0.5, stepPx || 4);
+    const samples = [dense[0]];
+    let nextDist = step;
+    let dIdx = 0;
+
+    while (nextDist <= totalDist && dIdx < dense.length - 1) {
+      while (dIdx < dense.length - 1 && dense[dIdx + 1].distance < nextDist) {
+        dIdx++;
+      }
+      if (dIdx >= dense.length - 1) break;
+
+      const pA = dense[dIdx];
+      const pB = dense[dIdx + 1];
+      const span = pB.distance - pA.distance;
+      const u = span > 0.0001 ? (nextDist - pA.distance) / span : 0;
+
+      samples.push({
+        x: pA.x + u * (pB.x - pA.x),
+        y: pA.y + u * (pB.y - pA.y),
+        pressure: pA.pressure + u * (pB.pressure - pA.pressure),
+        time: pA.time + u * (pB.time - pA.time),
+        distance: nextDist
+      });
+
+      nextDist += step;
+    }
+
+    const lastDense = dense[dense.length - 1];
+    if (samples.length === 1 || Math.hypot(lastDense.x - samples[samples.length - 1].x, lastDense.y - samples[samples.length - 1].y) > step * 0.4) {
+      samples.push(lastDense);
     }
 
     return samples;

@@ -13,6 +13,10 @@ export class ShapeTool {
     this.sides = 5; // polygon/star points
   }
 
+  setShape(type) {
+    this.type = type;
+  }
+
   start(x, y) {
     this.active = true;
     this.startX = x;
@@ -66,6 +70,37 @@ export class ShapeTool {
       ctx.moveTo(x0, y0);
       ctx.lineTo(x1, y1);
       ctx.stroke();
+    } else if (shapeType === 'arrow') {
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const len = Math.hypot(dx, dy);
+      if (len > 1) {
+        const angle = Math.atan2(dy, dx);
+        const headLen = Math.min(32, Math.max(12, len * 0.3));
+        const headAngle = Math.PI / 6;
+
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(
+          x1 - headLen * Math.cos(angle - headAngle),
+          y1 - headLen * Math.sin(angle - headAngle)
+        );
+        ctx.lineTo(
+          x1 - (headLen * 0.7) * Math.cos(angle),
+          y1 - (headLen * 0.7) * Math.sin(angle)
+        );
+        ctx.lineTo(
+          x1 - headLen * Math.cos(angle + headAngle),
+          y1 - headLen * Math.sin(angle + headAngle)
+        );
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      }
     } else if (shapeType === 'rect') {
       const rx = Math.min(x0, x1);
       const ry = Math.min(y0, y1);
@@ -116,5 +151,17 @@ export class ShapeTool {
       fill: false,
       sides: this.sides
     });
+  }
+
+  cancel() {
+    this.active = false;
+    this.startX = 0;
+    this.startY = 0;
+    this.currentX = 0;
+    this.currentY = 0;
+  }
+
+  renderOverlay(ctx, colorHex = '#8b5cf6', strokeWidth = 4) {
+    this.drawLive(ctx, colorHex, strokeWidth);
   }
 }

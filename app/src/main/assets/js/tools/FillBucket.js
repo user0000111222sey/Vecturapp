@@ -1,14 +1,16 @@
 /**
  * Vectura Flood Fill Engine
- * Fast scanline fill on Uint32Array with tolerance, gap closing, sample sources,
- * and satisfying 300ms expanding ripple animation.
+ * Fast Uint32Array scanline flood fill with tolerance, sample sources, and iPad-style
+ * expanding circular ripple animation clipped strictly to the filled region.
+ * Committed as a single undoable step via the central Command system.
  */
 export class FillBucket {
   constructor() {
     this.tolerance = 25;       // 0 to 100
     this.expand = 1;           // -10 to +10 px
     this.sampleSource = 'all'; // 'current' | 'reference' | 'all'
-    this.animating = false;
+    this.animateFill = true;   // Animation on/off
+    this.animationDuration = 380; // ms (300 to 500 ms)
   }
 
   hexToRgba(hex) {
@@ -24,9 +26,10 @@ export class FillBucket {
   }
 
   /**
-   * Performs scanline flood fill on target layer.
+   * Performs fast scanline flood fill on target layer.
+   * Can run asynchronously so input is never blocked.
    */
-  fill(startX, startY, fillColorHex, layerManager, onAnimatedCommit) {
+  async fill(startX, startY, fillColorHex, layerManager, onAnimatedCommit) {
     const activeLayer = layerManager.getActiveLayer();
     if (!activeLayer || activeLayer.locked) return false;
 
@@ -44,7 +47,6 @@ export class FillBucket {
     } else if (this.sampleSource === 'reference') {
       sampleCanvas = layerManager.getReferenceLayer().canvas;
     } else {
-      // 'all': render composite
       layerManager.compositeToCanvas(layerManager.cachedCompositeCtx, true);
       sampleCanvas = layerManager.cachedComposite;
     }
@@ -57,7 +59,7 @@ export class FillBucket {
     const targetColor = data32[startIndex];
 
     const fillRgba = this.hexToRgba(fillColorHex);
-    // Little-endian RGBA in 32-bit: (A << 24) | (B << 16) | (G << 8) | R
+    // 32-bit little-endian: (A << 24) | (B << 16) | (G << 8) | R
     const fillColor32 = ((fillRgba.a << 24) | (fillRgba.b << 16) | (fillRgba.g << 8) | fillRgba.r) >>> 0;
 
     if (targetColor === fillColor32) return false;
@@ -86,18 +88,18 @@ export class FillBucket {
 
     let minX = startX, maxX = startX, minY = startY, maxY = startY;
 
+    // Fast loop with micro-task yielding for 2048px+ canvases if needed
+    let iterations = 0;
     while (queue.length > 0) {
       const [curX, curY] = queue.pop();
       let left = curX;
       let right = curX;
 
-      // Scan left
       while (left > 0 && !visited[curY * w + (left - 1)] && colorMatch(curY * w + (left - 1))) {
         left--;
         visited[curY * w + left] = 1;
       }
 
-      // Scan right
       while (right < w - 1 && !visited[curY * w + (right + 1)] && colorMatch(curY * w + (right + 1))) {
         right++;
         visited[curY * w + right] = 1;
@@ -111,7 +113,6 @@ export class FillBucket {
       for (let x = left; x <= right; x++) {
         filledMask[curY * w + x] = 1;
 
-        // Check top neighbor
         if (curY > 0) {
           const topIdx = (curY - 1) * w + x;
           if (!visited[topIdx] && colorMatch(topIdx)) {
@@ -120,7 +121,6 @@ export class FillBucket {
           }
         }
 
-        // Check bottom neighbor
         if (curY < h - 1) {
           const botIdx = (curY + 1) * w + x;
           if (!visited[botIdx] && colorMatch(botIdx)) {
@@ -129,12 +129,17 @@ export class FillBucket {
           }
         }
       }
+
+      iterations++;
+      if (iterations % 4000 === 0 && w * h > 1000000) {
+        // Yield to allow user touch responsiveness
+        await new Promise(r => setTimeout(r, 0));
+      }
     }
 
-    // Apply expand/contract if requested
     const finalMask = this.expandMask(filledMask, w, h, this.expand);
 
-    // Create fill patch canvas
+    // Create fill patch canvas containing the filled pixels
     const patchCanvas = document.createElement('canvas');
     patchCanvas.width = w;
     patchCanvas.height = h;
@@ -149,13 +154,22 @@ export class FillBucket {
     }
     patchCtx.putImageData(patchImg, 0, 0);
 
-    // Trigger expanding ripple animation on screen, then commit
+    // Calculate maximum distance from start point to bounding box corners for ripple
+    const d1 = Math.hypot(startX - minX, startY - minY);
+    const d2 = Math.hypot(startX - maxX, startY - minY);
+    const d3 = Math.hypot(startX - minX, startY - maxY);
+    const d4 = Math.hypot(startX - maxX, startY - maxY);
+    const maxRadius = Math.max(d1, d2, d3, d4, 30);
+
     onAnimatedCommit?.({
       startX,
       startY,
+      maxRadius,
       patchCanvas,
       activeLayer,
-      fillColorHex
+      fillColorHex,
+      animate: this.animateFill,
+      duration: this.animationDuration
     });
 
     return true;
@@ -167,7 +181,6 @@ export class FillBucket {
     const radius = Math.abs(amount);
 
     if (amount > 0) {
-      // Dilate
       for (let y = 0; y < h; y++) {
         for (let x = 0; x < w; x++) {
           if (mask[y * w + x]) {

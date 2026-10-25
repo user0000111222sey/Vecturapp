@@ -32,10 +32,21 @@ export class LayerManager {
     this.cachedComposite.height = docHeight;
     this.cachedCompositeCtx = this.cachedComposite.getContext('2d');
 
+    // Clipping group offscreen buffer
+    this.clipGroupCanvas = document.createElement('canvas');
+    this.clipGroupCanvas.width = docWidth;
+    this.clipGroupCanvas.height = docHeight;
+    this.clipGroupCtx = this.clipGroupCanvas.getContext('2d');
+
     this.needsRecomposite = true;
 
     // Initialize default base layer
     this.createInitialLayer();
+  }
+
+  get activeLayerIndex() {
+    const idx = this.layers.findIndex(l => l.id === this.activeLayerId);
+    return idx >= 0 ? idx : 0;
   }
 
   createInitialLayer() {
@@ -60,6 +71,10 @@ export class LayerManager {
     this.invalidateCaches();
   }
 
+  getLayer(id) {
+    return this.layers.find(l => l.id === id) || null;
+  }
+
   getActiveLayer() {
     return this.layers.find(l => l.id === this.activeLayerId) || this.layers[0];
   }
@@ -69,6 +84,96 @@ export class LayerManager {
       this.activeLayerId = id;
       this.updateAroundActiveCaches();
     }
+  }
+
+  /**
+   * Deep or lightweight snapshot of layer manager state for undo/redo.
+   * If includePixels is false, avoids heavy full-resolution canvas copying.
+   */
+  createSnapshot(includePixels = true) {
+    return {
+      activeLayerId: this.activeLayerId,
+      backgroundColor: this.backgroundColor,
+      isTransparentBg: this.isTransparentBg,
+      isMetadataOnly: !includePixels,
+      layers: this.layers.map(l => {
+        let copyCanvas = null;
+        if (includePixels) {
+          copyCanvas = document.createElement('canvas');
+          copyCanvas.width = l.width;
+          copyCanvas.height = l.height;
+          copyCanvas.getContext('2d').drawImage(l.canvas, 0, 0);
+        }
+
+        return {
+          id: l.id,
+          name: l.name,
+          type: l.type,
+          width: l.width,
+          height: l.height,
+          visible: l.visible,
+          locked: l.locked,
+          opacity: l.opacity,
+          blendMode: l.blendMode,
+          clippingMask: l.clippingMask,
+          alphaLock: l.alphaLock,
+          isReference: l.isReference,
+          strokes: [...l.strokes],
+          canvasClone: copyCanvas
+        };
+      })
+    };
+  }
+
+  /**
+   * Restores complete layer manager state from snapshot.
+   */
+  restoreSnapshot(snapshot) {
+    if (!snapshot || !Array.isArray(snapshot.layers)) return;
+
+    this.activeLayerId = snapshot.activeLayerId;
+    this.backgroundColor = snapshot.backgroundColor;
+    this.isTransparentBg = snapshot.isTransparentBg;
+
+    const existingMap = new Map();
+    for (const l of this.layers) {
+      existingMap.set(l.id, l);
+    }
+
+    this.layers = snapshot.layers.map(s => {
+      let layer = existingMap.get(s.id);
+      if (layer && !s.canvasClone) {
+        // Reuse existing layer instance and update metadata instantly
+        layer.name = s.name;
+        layer.visible = s.visible;
+        layer.locked = s.locked;
+        layer.opacity = s.opacity;
+        layer.blendMode = s.blendMode;
+        layer.clippingMask = s.clippingMask;
+        layer.alphaLock = s.alphaLock;
+        layer.isReference = s.isReference;
+        return layer;
+      }
+
+      layer = new Layer(s.id, s.name, s.width, s.height, s.type);
+      layer.visible = s.visible;
+      layer.locked = s.locked;
+      layer.opacity = s.opacity;
+      layer.blendMode = s.blendMode;
+      layer.clippingMask = s.clippingMask;
+      layer.alphaLock = s.alphaLock;
+      layer.isReference = s.isReference;
+      layer.strokes = [...s.strokes];
+
+      layer.ctx.clearRect(0, 0, layer.width, layer.height);
+      if (s.canvasClone) {
+        layer.ctx.drawImage(s.canvasClone, 0, 0);
+      }
+      layer.updateThumbnail();
+      return layer;
+    });
+
+    this.invalidateCaches();
   }
 
   addLayer(name = 'New Layer', type = 'raster') {
@@ -161,6 +266,15 @@ export class LayerManager {
     this.invalidateCaches();
   }
 
+  drawLayerToCtx(targetCtx, layer) {
+    if (!layer || !layer.visible) return;
+    targetCtx.save();
+    targetCtx.globalAlpha = layer.opacity;
+    targetCtx.globalCompositeOperation = getCanvasCompositeOp(layer.blendMode);
+    targetCtx.drawImage(layer.canvas, 0, 0);
+    targetCtx.restore();
+  }
+
   invalidateCaches() {
     this.needsRecomposite = true;
     this.updateAroundActiveCaches();
@@ -177,42 +291,120 @@ export class LayerManager {
     // 1. Build below cache
     this.cacheBelowCtx.clearRect(0, 0, this.docWidth, this.docHeight);
     for (let i = 0; i < activeIdx; i++) {
-      this.drawLayerToCtx(this.cacheBelowCtx, this.layers[i], this.layers);
+      this.drawLayerToCtx(this.cacheBelowCtx, this.layers[i]);
     }
 
     // 2. Build above cache
     this.cacheAboveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
     for (let i = activeIdx + 1; i < this.layers.length; i++) {
-      this.drawLayerToCtx(this.cacheAboveCtx, this.layers[i], this.layers);
+      this.drawLayerToCtx(this.cacheAboveCtx, this.layers[i]);
     }
 
-    this.needsRecomposite = false;
+    this.rebuildFullComposite();
   }
 
   /**
-   * Draws a single layer taking into account clipping masks and blend modes.
+   * Renders the complete layer stack respecting clipping masks, alpha lock, and live stroke.
    */
-  drawLayerToCtx(targetCtx, layer, layerStack) {
-    if (!layer.visible) return;
+  renderLayerStack(targetCtx, liveStrokeCanvas = null, liveOpacity = 1.0, liveBlendMode = 'source-over') {
+    let i = 0;
+    const n = this.layers.length;
+    const active = this.getActiveLayer();
 
-    targetCtx.save();
-    targetCtx.globalAlpha = layer.opacity;
-    targetCtx.globalCompositeOperation = getCanvasCompositeOp(layer.blendMode);
+    while (i < n) {
+      const layer = this.layers[i];
+      if (!layer.visible) {
+        i++;
+        continue;
+      }
 
-    if (layer.clippingMask) {
-      // Find the base layer for this clip
-      targetCtx.globalCompositeOperation = 'source-atop';
+      // Check if following layers are clipped to this layer
+      let hasClipped = false;
+      let j = i + 1;
+      while (j < n && this.layers[j].clippingMask) {
+        if (this.layers[j].visible) hasClipped = true;
+        j++;
+      }
+
+      if (hasClipped) {
+        // Render isolated clipping group
+        this.clipGroupCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+
+        // 1. Draw base layer into group buffer
+        this.clipGroupCtx.save();
+        this.clipGroupCtx.globalAlpha = 1.0;
+        this.clipGroupCtx.globalCompositeOperation = 'source-over';
+        this.clipGroupCtx.drawImage(layer.canvas, 0, 0);
+
+        if (layer === active && liveStrokeCanvas) {
+          this.clipGroupCtx.save();
+          this.clipGroupCtx.globalAlpha = liveOpacity;
+          this.clipGroupCtx.globalCompositeOperation = layer.alphaLock ? 'source-atop' : getCanvasCompositeOp(liveBlendMode);
+          this.clipGroupCtx.drawImage(liveStrokeCanvas, 0, 0);
+          this.clipGroupCtx.restore();
+        }
+        this.clipGroupCtx.restore();
+
+        // 2. Draw each clipped layer above it with source-atop
+        for (let k = i + 1; k < j; k++) {
+          const clipL = this.layers[k];
+          if (!clipL.visible) continue;
+
+          this.clipGroupCtx.save();
+          this.clipGroupCtx.globalCompositeOperation = 'source-atop';
+          this.clipGroupCtx.globalAlpha = clipL.opacity;
+          this.clipGroupCtx.drawImage(clipL.canvas, 0, 0);
+
+          if (clipL === active && liveStrokeCanvas) {
+            this.clipGroupCtx.save();
+            this.clipGroupCtx.globalAlpha = liveOpacity;
+            this.clipGroupCtx.drawImage(liveStrokeCanvas, 0, 0);
+            this.clipGroupCtx.restore();
+          }
+          this.clipGroupCtx.restore();
+        }
+
+        // 3. Draw merged clipping group onto targetCtx
+        targetCtx.save();
+        targetCtx.globalAlpha = layer.opacity;
+        targetCtx.globalCompositeOperation = getCanvasCompositeOp(layer.blendMode);
+        targetCtx.drawImage(this.clipGroupCanvas, 0, 0);
+        targetCtx.restore();
+
+        i = j;
+      } else {
+        // Normal unclipped layer
+        targetCtx.save();
+        targetCtx.globalAlpha = layer.opacity;
+        targetCtx.globalCompositeOperation = getCanvasCompositeOp(layer.blendMode);
+        targetCtx.drawImage(layer.canvas, 0, 0);
+
+        if (layer === active && liveStrokeCanvas) {
+          targetCtx.save();
+          targetCtx.globalAlpha = liveOpacity;
+          targetCtx.globalCompositeOperation = layer.alphaLock ? 'source-atop' : getCanvasCompositeOp(liveBlendMode);
+          targetCtx.drawImage(liveStrokeCanvas, 0, 0);
+          targetCtx.restore();
+        }
+
+        targetCtx.restore();
+        i++;
+      }
     }
-
-    targetCtx.drawImage(layer.canvas, 0, 0);
-    targetCtx.restore();
   }
 
   /**
    * Composites the entire document onto targetCtx.
-   * If liveStrokeCanvas is provided, renders the active layer with live stroke in real-time!
    */
   compositeStack(targetCtx, liveStrokeCanvas = null, liveOpacity = 1.0, liveBlendMode = 'source-over') {
+    if (!liveStrokeCanvas) {
+      if (this.needsRecomposite) {
+        this.rebuildFullComposite();
+      }
+      targetCtx.drawImage(this.cachedComposite, 0, 0);
+      return;
+    }
+
     // 1. Background
     if (!this.isTransparentBg && this.backgroundColor) {
       targetCtx.fillStyle = this.backgroundColor;
@@ -221,35 +413,18 @@ export class LayerManager {
       targetCtx.clearRect(0, 0, this.docWidth, this.docHeight);
     }
 
-    // 2. Layers below active
-    targetCtx.drawImage(this.cacheBelow, 0, 0);
+    // 2. Render layer stack with live stroke and clipping masks
+    this.renderLayerStack(targetCtx, liveStrokeCanvas, liveOpacity, liveBlendMode);
+  }
 
-    // 3. Active Layer
-    const active = this.getActiveLayer();
-    if (active && active.visible) {
-      targetCtx.save();
-      targetCtx.globalAlpha = active.opacity;
-      targetCtx.globalCompositeOperation = getCanvasCompositeOp(active.blendMode);
-
-      targetCtx.drawImage(active.canvas, 0, 0);
-
-      // Draw live stroke on active layer
-      if (liveStrokeCanvas) {
-        targetCtx.save();
-        targetCtx.globalAlpha = liveOpacity;
-        targetCtx.globalCompositeOperation = getCanvasCompositeOp(liveBlendMode);
-        if (active.alphaLock) {
-          targetCtx.globalCompositeOperation = 'source-atop';
-        }
-        targetCtx.drawImage(liveStrokeCanvas, 0, 0);
-        targetCtx.restore();
-      }
-
-      targetCtx.restore();
+  rebuildFullComposite() {
+    this.cachedCompositeCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+    if (!this.isTransparentBg && this.backgroundColor) {
+      this.cachedCompositeCtx.fillStyle = this.backgroundColor;
+      this.cachedCompositeCtx.fillRect(0, 0, this.docWidth, this.docHeight);
     }
-
-    // 4. Layers above active
-    targetCtx.drawImage(this.cacheAbove, 0, 0);
+    this.renderLayerStack(this.cachedCompositeCtx, null);
+    this.needsRecomposite = false;
   }
 
   /**
@@ -263,9 +438,7 @@ export class LayerManager {
       targetCtx.clearRect(0, 0, this.docWidth, this.docHeight);
     }
 
-    for (let i = 0; i < this.layers.length; i++) {
-      this.drawLayerToCtx(targetCtx, this.layers[i], this.layers);
-    }
+    this.renderLayerStack(targetCtx, null);
   }
 
   getReferenceLayer() {

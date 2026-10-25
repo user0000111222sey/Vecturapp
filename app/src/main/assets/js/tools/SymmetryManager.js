@@ -1,6 +1,7 @@
 /**
  * Vectura Symmetry Drawing Engine
  * Vertical, Horizontal, and Radial (2-12 axes) symmetry mirroring around a movable center pivot.
+ * Features: Draggable pivot handle, Lock toggle to prevent accidental dragging while drawing, and Reset option.
  */
 export class SymmetryManager {
   constructor(docWidth = 1080, docHeight = 1080) {
@@ -8,11 +9,43 @@ export class SymmetryManager {
     this.radialAxes = 4; // 2 to 12
     this.centerX = docWidth / 2;
     this.centerY = docHeight / 2;
+    this.locked = false; // Prevents dragging pivot when drawing
   }
 
   setPivot(x, y) {
+    if (this.locked) return;
     this.centerX = x;
     this.centerY = y;
+  }
+
+  reset(docW = 1080, docH = 1080) {
+    this.centerX = docW / 2;
+    this.centerY = docH / 2;
+  }
+
+  toggleLock() {
+    this.locked = !this.locked;
+    return this.locked;
+  }
+
+  toggle() {
+    const modes = ['off', 'vertical', 'horizontal', 'radial'];
+    const idx = modes.indexOf(this.mode);
+    this.mode = modes[(idx + 1) % modes.length];
+    return this.mode;
+  }
+
+  hitTest(wx, wy, zoom = 1.0) {
+    if (this.mode === 'off' || this.locked) return false;
+    const hitRadius = 28 / Math.max(0.1, zoom);
+    const dist = Math.hypot(wx - this.centerX, wy - this.centerY);
+    return dist <= hitRadius;
+  }
+
+  render(ctx, docW = null, docH = null, zoom = 1.0) {
+    const w = docW || this.centerX * 2;
+    const h = docH || this.centerY * 2;
+    this.drawOverlay(ctx, w, h, zoom);
   }
 
   /**
@@ -58,14 +91,19 @@ export class SymmetryManager {
     return results;
   }
 
-  drawOverlay(ctx, docW, docH) {
+  drawOverlay(ctx, docW, docH, zoom = 1.0) {
     if (this.mode === 'off') return;
 
     ctx.save();
-    ctx.strokeStyle = 'rgba(139, 92, 246, 0.45)';
-    ctx.lineWidth = 1.5;
-    ctx.setLineDash([6, 6]);
+    const isLocked = this.locked;
+    const guideColor = isLocked ? 'rgba(245, 158, 11, 0.4)' : 'rgba(99, 102, 241, 0.45)';
+    const handleColor = isLocked ? '#f59e0b' : '#6366f1';
 
+    ctx.strokeStyle = guideColor;
+    ctx.lineWidth = Math.max(1.5, 2.0 / zoom);
+    ctx.setLineDash([6 / zoom, 6 / zoom]);
+
+    // Draw symmetry guide lines
     if (this.mode === 'vertical') {
       ctx.beginPath();
       ctx.moveTo(this.centerX, 0);
@@ -88,12 +126,52 @@ export class SymmetryManager {
       }
     }
 
-    // Pivot center dot
+    // Modern Cohesive Circular Handle
     ctx.setLineDash([]);
-    ctx.fillStyle = '#8b5cf6';
+    const rOuter = Math.max(14, 18 / zoom);
+    const rInner = Math.max(4, 5 / zoom);
+    const tickLen = Math.max(5, 7 / zoom);
+
+    // Crosshair ticks
+    ctx.strokeStyle = handleColor;
+    ctx.lineWidth = Math.max(1.5, 2.0 / zoom);
     ctx.beginPath();
-    ctx.arc(this.centerX, this.centerY, 6, 0, Math.PI * 2);
+    ctx.moveTo(this.centerX - rOuter - tickLen, this.centerY);
+    ctx.lineTo(this.centerX - rOuter + 2 / zoom, this.centerY);
+    ctx.moveTo(this.centerX + rOuter - 2 / zoom, this.centerY);
+    ctx.lineTo(this.centerX + rOuter + tickLen, this.centerY);
+    ctx.moveTo(this.centerX, this.centerY - rOuter - tickLen);
+    ctx.lineTo(this.centerX, this.centerY - rOuter + 2 / zoom);
+    ctx.moveTo(this.centerX, this.centerY + rOuter - 2 / zoom);
+    ctx.lineTo(this.centerX, this.centerY + rOuter + tickLen);
+    ctx.stroke();
+
+    // Outer Target Ring
+    ctx.fillStyle = isLocked ? 'rgba(245, 158, 11, 0.15)' : 'rgba(99, 102, 241, 0.18)';
+    ctx.beginPath();
+    ctx.arc(this.centerX, this.centerY, rOuter, 0, Math.PI * 2);
     ctx.fill();
+    ctx.stroke();
+
+    // Center Core
+    ctx.fillStyle = handleColor;
+    ctx.beginPath();
+    ctx.arc(this.centerX, this.centerY, rInner, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Lock Indicator Badge if locked
+    if (isLocked) {
+      const badgeR = Math.max(6, 8 / zoom);
+      const bx = this.centerX + rOuter * 0.7;
+      const by = this.centerY - rOuter * 0.7;
+      ctx.fillStyle = '#f59e0b';
+      ctx.beginPath();
+      ctx.arc(bx, by, badgeR, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = Math.max(1.0, 1.5 / zoom);
+      ctx.stroke();
+    }
 
     ctx.restore();
   }

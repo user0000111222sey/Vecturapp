@@ -13,10 +13,11 @@ import { TextTool } from './TextTool.js';
 import { RulerGuides } from './RulerGuides.js';
 import { Eyedropper } from './Eyedropper.js';
 import { SymmetryManager } from './SymmetryManager.js';
+import { SmudgeTool } from './SmudgeTool.js';
 
 export class ToolManager {
   constructor(docWidth, docHeight) {
-    this.activeTool = 'brush'; // 'brush' | 'eraser' | 'bucket' | 'lasso-fill' | 'shape' | 'gradient' | 'text' | 'eyedropper'
+    this.activeTool = 'brush'; // 'brush' | 'eraser' | 'smudge' | 'bucket' | 'lasso-fill' | 'shape' | 'gradient' | 'text' | 'eyedropper'
 
     this.fillBucket = new FillBucket();
     this.lassoFill = new LassoFill();
@@ -29,14 +30,10 @@ export class ToolManager {
     this.rulerGuides = new RulerGuides(docWidth, docHeight);
     this.eyedropper = new Eyedropper();
     this.symmetry = new SymmetryManager(docWidth, docHeight);
+    this.smudgeTool = new SmudgeTool();
   }
 
   setTool(toolName, layer = null) {
-    // Selection and transform removed for raster stability
-    if (toolName === 'selection' || toolName === 'transform' || toolName === 'point-editor') {
-      toolName = 'brush';
-    }
-
     if (this.activeTool === 'transform' && toolName !== 'transform') {
       this.transformTool.cancel();
     }

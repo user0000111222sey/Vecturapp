@@ -1,0 +1,151 @@
+/* Vectura Design Tokens
+   Calm, dense, professional tool surfaces and metrics.
+   Complete multi-theme engine: Dark OLED, Grey, Blue Grey, White, Sepia.
+*/
+:root,
+body.theme-dark-oled,
+body[data-theme="dark-oled"],
+body.theme-dark {
+  --surround:      #000000;   /* pitch black workspace */
+  --chrome:        #08080a;   /* top bar, bottom toolbar */
+  --panel:         #111114;   /* sheets, dialogs, side panels */
+  --card:          #18181d;   /* cards, grouped blocks */
+  --control:       #212228;   /* buttons, inputs, tracks */
+  --control-press: #2c2d36;
+  --selected:      #262835;   /* selected rows/tabs */
+  --border:        #282932;
+  --border-strong: #3e404f;
+  --divider:       #1e1f26;
+  --text:          #f8fafc;
+  --text-2:        #94a3b8;
+  --text-3:        #64748b;   /* disabled, placeholders */
+  --accent:        #6366f1;   /* indigo accent */
+  --accent-press:  #4f46e5;
+  --danger:        #ef4444;
+  --checker-a:     #121318;
+  --checker-b:     #1a1b22;
+
+  /* Spacing Grid (4px base) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+
+  /* Corner Radii */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-none: 0px;
+
+  /* Shadows */
+  --shadow-floating: 0 2px 8px rgba(0, 0, 0, 0.45);
+
+  /* Typography */
+  --font-family: system-ui, -apple-system, BlinkMacSystemFont, "Roboto", "Segoe UI", sans-serif;
+  --text-caption: 11px;
+  --text-secondary: 12px;
+  --text-body: 14px;
+  --text-title: 16px;
+  --text-screen-title: 18px;
+
+  /* Heights & Insets */
+  --top-bar-height: 48px;
+  --tool-strip-height: 44px;
+  --bottom-bar-height: 56px;
+  --bottom-bar-margin: 12px;
+  --touch-min: 44px;
+}
+
+/* GREY THEME */
+body.theme-grey,
+body[data-theme="grey"] {
+  --surround:      #17181b;
+  --chrome:        #1f2125;
+  --panel:         #27292f;
+  --card:          #2f3138;
+  --control:       #393c44;
+  --control-press: #454954;
+  --selected:      #3d424e;
+  --border:        #3a3d46;
+  --border-strong: #505461;
+  --divider:       #2d3037;
+  --text:          #f3f4f6;
+  --text-2:        #9ca3af;
+  --text-3:        #6b7280;
+  --accent:        #3b82f6;   /* crisp electric blue */
+  --accent-press:  #2563eb;
+  --danger:        #ef4444;
+  --checker-a:     #1e2025;
+  --checker-b:     #282a31;
+}
+
+/* BLUE GREY THEME */
+body.theme-blue-grey,
+body[data-theme="blue-grey"] {
+  --surround:      #0b0f19;
+  --chrome:        #111827;
+  --panel:         #182234;
+  --card:          #1f2d42;
+  --control:       #27364f;
+  --control-press: #324463;
+  --selected:      #263854;
+  --border:        #2d3e5a;
+  --border-strong: #3e547a;
+  --divider:       #233147;
+  --text:          #f0f6fc;
+  --text-2:        #8ba2c4;
+  --text-3:        #587196;
+  --accent:        #38bdf8;   /* cyan sky blue */
+  --accent-press:  #0284c7;
+  --danger:        #f43f5e;
+  --checker-a:     #141c2c;
+  --checker-b:     #1c283f;
+}
+
+/* WHITE / LIGHT THEME */
+body.theme-white,
+body[data-theme="white"],
+body.theme-light {
+  --surround:      #e9ecef;
+  --chrome:        #f8f9fa;
+  --panel:         #ffffff;
+  --card:          #f1f3f5;
+  --control:       #e9ecef;
+  --control-press: #dee2e6;
+  --selected:      #e2e6ea;
+  --border:        #ced4da;
+  --border-strong: #adb5bd;
+  --divider:       #e3e6e8;
+  --text:          #111827;
+  --text-2:        #4b5563;
+  --text-3:        #9ca3af;
+  --accent:        #2563eb;   /* cobalt blue */
+  --accent-press:  #1d4ed8;
+  --danger:        #dc2626;
+  --checker-a:     #ffffff;
+  --checker-b:     #e5e7eb;
+}
+
+/* SEPIA THEME */
+body.theme-sepia,
+body[data-theme="sepia"] {
+  --surround:      #ebdcc0;
+  --chrome:        #f5edd8;
+  --panel:         #fcf8ee;
+  --card:          #f2e7ce;
+  --control:       #e6dac0;
+  --control-press: #d9ccb0;
+  --selected:      #dfd0b0;
+  --border:        #d4c5a5;
+  --border-strong: #b8a682;
+  --divider:       #dfd0b2;
+  --text:          #3d2c1d;
+  --text-2:        #6b553e;
+  --text-3:        #998066;
+  --accent:        #a36128;   /* warm amber sepia */
+  --accent-press:  #844c1d;
+  --danger:        #b91c1c;
+  --checker-a:     #f8f2e4;
+  --checker-b:     #ebdcc2;
+}

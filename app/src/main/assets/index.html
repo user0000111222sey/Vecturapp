@@ -3,202 +3,337 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <meta name="theme-color" content="#0a0d14">
+  <meta name="theme-color" content="#F3F3F4">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <title>Vectura - Raster Studio</title>
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <title>Vectura</title>
 
   <link rel="manifest" href="manifest.json">
-  <link rel="stylesheet" href="css/glass.css">
+  <link rel="stylesheet" href="css/tokens.css">
   <link rel="stylesheet" href="css/ui.css">
 </head>
 <body>
-  <div id="app-root">
-    <!-- Viewport Canvas Container -->
-    <div id="viewport-container">
-      <canvas id="viewport-canvas"></canvas>
+  <!-- App Loading Splash Screen -->
+  <div id="app-splash-screen">
+    <div class="splash-content">
+      <div class="splash-logo">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="12 2 2 7 12 12 22 7 12 2"/>
+          <polyline points="2 17 12 22 22 17"/>
+          <polyline points="2 12 12 17 22 12"/>
+        </svg>
+      </div>
+      <div class="splash-title">Vectura</div>
+      <div class="splash-loader-bar">
+        <div class="splash-loader-fill"></div>
+      </div>
     </div>
+  </div>
+  <script>
+    // Safeguard: Ensure splash screen never hangs
+    setTimeout(function() {
+      var s = document.getElementById('app-splash-screen');
+      if (s && !s.classList.contains('fade-out')) {
+        s.classList.add('fade-out');
+        setTimeout(function() { s.style.display = 'none'; }, 350);
+      }
+    }, 1200);
+  </script>
 
-    <!-- UI Overlay Layer -->
-    <div id="ui-overlay">
-      <!-- Minimalist Slim Top Navigation Bar -->
-      <header id="top-bar" class="glass-panel interactive">
-        <div class="top-bar-section">
-          <button id="btn-home" class="glass-btn glass-btn-icon" title="Projects Gallery">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="14" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect></svg>
-          </button>
-          <button id="btn-undo" class="glass-btn glass-btn-icon disabled" title="Undo (2-Finger Tap)">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7v6h6"></path><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"></path></svg>
-          </button>
-          <button id="btn-redo" class="glass-btn glass-btn-icon disabled" title="Redo (3-Finger Tap)">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M21 7v6h-6"></path><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"></path></svg>
-          </button>
-          <div id="project-title-display">Artwork 1</div>
-        </div>
-
-        <div class="top-bar-section">
-          <button id="btn-fit-view" class="glass-btn glass-btn-icon" title="Fit to Screen">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"></path></svg>
-          </button>
-          <button id="btn-mirror-view" class="glass-btn glass-btn-icon" title="Mirror View">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 2v20M20 7l-4 4 4 4M4 7l4 4-4 4"></path></svg>
-          </button>
-          <button id="btn-export" class="glass-btn glass-btn-icon" title="Export">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"></path><polyline points="16 6 12 2 8 6"></polyline><line x1="12" y1="2" x2="12" y2="15"></line></svg>
-          </button>
-          <button id="btn-settings" class="glass-btn glass-btn-icon" title="Settings">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
-          </button>
-          <button id="btn-toggle-ui" class="glass-btn glass-btn-icon" title="Hide UI">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
-          </button>
-        </div>
-      </header>
-
-      <!-- Minimalist Vertical Edge Sliders (Vertically Centered, Left Edge) -->
-      <aside id="edge-sliders" class="interactive">
-        <div class="vertical-slider-container">
-          <div id="edge-size-dot" class="slider-preview-dot">
-            <div class="slider-preview-dot-inner" style="width: 6px; height: 6px;"></div>
-          </div>
-          <input type="range" id="edge-size-slider" class="vertical-slider" min="1" max="150" value="8" />
-          <span id="edge-size-label" class="slider-label">8px</span>
-        </div>
-
-        <div class="vertical-slider-container">
-          <div id="edge-opacity-dot" class="slider-preview-dot">
-            <div class="slider-preview-dot-inner" style="width: 12px; height: 12px; opacity: 1.0;"></div>
-          </div>
-          <input type="range" id="edge-opacity-slider" class="vertical-slider" min="1" max="100" value="100" />
-          <span id="edge-opacity-label" class="slider-label">100%</span>
-        </div>
-      </aside>
-
-      <!-- Minimalist Bottom Floating Pill Toolbar -->
-      <nav id="toolbar" class="glass-panel interactive">
-        <button id="tool-btn-brush" class="glass-btn glass-btn-icon active" title="Brush">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 19l7-7 3 3-7 7-3-3z"></path><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"></path><path d="M2 2l7.586 7.586"></path></svg>
+  <div id="app-root">
+    <!-- 1. TOP BAR (48px, --chrome, 1px --divider underneath) -->
+    <header id="top-bar">
+      <!-- Left: Projects button (grid icon), Undo, Redo (44px targets) -->
+      <div class="top-bar-group">
+        <button id="btn-home" class="btn-icon" title="Artworks (Projects)">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>
         </button>
-        <button id="tool-btn-eraser" class="glass-btn glass-btn-icon" title="Eraser">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M20 20H7L2 15a2 2 0 0 1 0-2.83L13.17 1a2 2 0 0 1 2.83 0l6 6a2 2 0 0 1 0 2.83L14 17"></path><path d="M11 5l7 7"></path></svg>
+        <button id="btn-undo" class="btn-icon" title="Undo" disabled>
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>
         </button>
-        <button id="tool-btn-bucket" class="glass-btn glass-btn-icon" title="Flood Fill">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M19 11l-8-8-8.5 8.5a2.12 2.12 0 0 0 0 3l5 5a2.12 2.12 0 0 0 3 0L19 11z"></path><path d="M22 20a2 2 0 1 1-4 0c0-1.6 2-4 2-4s2 2.4 2 4z"></path></svg>
-        </button>
-        <button id="tool-btn-lasso" class="glass-btn glass-btn-icon" title="Lasso Fill">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M7 22a5 5 0 0 1-2-4c0-3.5 3-6 7-6s7 2.5 7 6a5 5 0 0 1-2 4"></path><path d="M12 2v10"></path></svg>
-        </button>
-        <button id="tool-btn-more-tools" class="glass-btn glass-btn-icon" title="More Tools">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle><circle cx="5" cy="12" r="1"></circle></svg>
-        </button>
-
-        <div class="toolbar-separator"></div>
-
-        <!-- Color Button -->
-        <button id="tool-btn-color" class="glass-btn glass-btn-icon" title="Color Studio">
-          <div id="tool-btn-color-dot" style="width: 22px; height: 22px; border-radius: 50%; background: #8b5cf6; border: 2px solid #ffffff; box-shadow: 0 0 4px rgba(0,0,0,0.5);"></div>
-        </button>
-
-        <!-- Layers Button with Badge -->
-        <button id="tool-btn-layers" class="glass-btn glass-btn-icon" title="Layers Stack" style="position: relative;">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
-          <span id="tool-layers-badge" style="position: absolute; top: 4px; right: 4px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent-primary);"></span>
-        </button>
-      </nav>
-
-      <!-- Minimalist Tools Popover Menu -->
-      <div id="tools-popover" class="glass-panel interactive">
-        <button id="tool-btn-shape" class="glass-btn glass-btn-icon" title="Shapes">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"></circle><polygon points="12 8 8 16 16 16"></polygon></svg>
-        </button>
-        <button id="tool-btn-gradient" class="glass-btn glass-btn-icon" title="Gradient">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="3" width="18" height="18" rx="2"></rect><line x1="3" y1="21" x2="21" y2="3"></line></svg>
-        </button>
-        <button id="tool-btn-text" class="glass-btn glass-btn-icon" title="Text">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><polyline points="4 7 4 4 20 4 20 7"></polyline><line x1="9" y1="20" x2="15" y2="20"></line><line x1="12" y1="4" x2="12" y2="20"></line></svg>
-        </button>
-        <button id="tool-btn-symmetry" class="glass-btn glass-btn-icon" title="Symmetry">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><line x1="12" y1="2" x2="12" y2="22"></line><path d="M4 6h8M4 12h8M4 18h8"></path><path d="M20 6h-8M20 12h-8M20 18h-8"></path></svg>
+        <button id="btn-redo" class="btn-icon" title="Redo" disabled>
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"/></svg>
         </button>
       </div>
 
-      <!-- Floating Show UI Button (Visible when UI is hidden) -->
-      <button id="btn-show-ui-floating" class="glass-btn glass-btn-icon interactive" style="position: absolute; top: 12px; right: 12px; display: none; z-index: 200;">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+      <!-- Centre: Project Name (14px weight 500, tap to rename) -->
+      <div id="project-title-display">Untitled Artwork</div>
+
+      <!-- Right: Export, More (3 dots menu) -->
+      <div class="top-bar-group">
+        <button id="btn-export" class="btn-icon" title="Export">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+        </button>
+        <button id="btn-more-menu" class="btn-icon" title="More">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/><circle cx="5" cy="12" r="1.5"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- TOP TOOL PANEL (Secondary action bar: Box Selection, Translation/Transform, Shapes, Guides, Symmetry - Icon only) -->
+    <div id="top-tool-panel">
+      <!-- 1. Box Selection Tool -->
+      <button id="top-btn-box-select" class="top-panel-btn icon-only" title="Box Selection (Marquee)" aria-label="Box select">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" stroke-dasharray="3 3"/></svg>
       </button>
 
-      <!-- Eyedropper Magnifier Ring -->
-      <div id="eyedropper-loupe">
-        <div id="eyedropper-ring-sample"></div>
-        <div id="eyedropper-ring-current"></div>
-        <div id="eyedropper-center-cross"></div>
-      </div>
+      <!-- 2. Translation / Transform Tool -->
+      <button id="top-btn-transform" class="top-panel-btn icon-only" title="Transform / Move / Scale" aria-label="Transform">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 17l10-10"/><path d="M17 17V7H7"/></svg>
+      </button>
 
-      <!-- Bottom Sheets: Layers, Brushes, Color, Tools -->
-      <div id="sheet-layers" class="glass-panel glass-sheet interactive">
-        <div class="sheet-handle-bar"><div class="sheet-handle"></div></div>
-        <div class="sheet-header">
-          <span class="sheet-title">Layers Stack</span>
-          <button class="glass-btn glass-btn-icon sheet-close-btn" style="width: 30px; height: 30px;">✕</button>
-        </div>
-        <div id="sheet-layers-content" class="sheet-content"></div>
-      </div>
+      <!-- 3. Shapes Tool -->
+      <button id="top-btn-shapes" class="top-panel-btn icon-only" title="Shapes (Rectangle, Circle, Line, Arrow)" aria-label="Shapes">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5"/><rect x="11" y="11" width="10" height="10" rx="1.5"/></svg>
+      </button>
 
-      <div id="sheet-brushes" class="glass-panel glass-sheet interactive">
-        <div class="sheet-handle-bar"><div class="sheet-handle"></div></div>
-        <div class="sheet-header">
-          <span class="sheet-title">Brush Studio</span>
-          <button class="glass-btn glass-btn-icon sheet-close-btn" style="width: 30px; height: 30px;">✕</button>
-        </div>
-        <div id="sheet-brushes-content" class="sheet-content"></div>
-      </div>
+      <!-- 4. Guides Tool (Grid, Ruler, Snapping) -->
+      <button id="top-btn-guides" class="top-panel-btn icon-only" title="Guides (Grid & Ruler)" aria-label="Guides">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+      </button>
 
-      <div id="sheet-color" class="glass-panel glass-sheet interactive">
-        <div class="sheet-handle-bar"><div class="sheet-handle"></div></div>
-        <div class="sheet-header">
-          <span class="sheet-title">Color Studio</span>
-          <button class="glass-btn glass-btn-icon sheet-close-btn" style="width: 30px; height: 30px;">✕</button>
-        </div>
-        <div id="sheet-color-content" class="sheet-content"></div>
-      </div>
+      <!-- 5. Symmetry Tool -->
+      <button id="top-btn-symmetry" class="top-panel-btn icon-only" title="Mirror Symmetry" aria-label="Symmetry">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="2" x2="12" y2="22"/><path d="M19 7l-5 5 5 5"/><path d="M5 7l5 5-5 5"/></svg>
+      </button>
 
-      <div id="sheet-tools" class="glass-panel glass-sheet interactive">
-        <div class="sheet-handle-bar"><div class="sheet-handle"></div></div>
-        <div class="sheet-header">
-          <span class="sheet-title">Tool Options</span>
-          <button class="glass-btn glass-btn-icon sheet-close-btn" style="width: 30px; height: 30px;">✕</button>
-        </div>
-        <div id="sheet-tools-content" class="sheet-content"></div>
-      </div>
-
-      <!-- Export Modal -->
-      <div id="export-modal" class="glass-modal-backdrop">
-        <div class="glass-panel glass-modal" style="padding: 18px;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
-            <span style="font-size: 15px; font-weight: 700;">Export Artwork</span>
-            <button id="exp-close-btn" class="glass-btn glass-btn-icon" style="width: 30px; height: 30px;">✕</button>
-          </div>
-          <div style="display: flex; flex-direction: column; gap: 10px;">
-            <div>
-              <button id="exp-btn-png" class="glass-btn glass-btn-cta" style="width: 100%;">PNG Image</button>
-              <label style="display: flex; align-items: center; gap: 6px; font-size: 11px; margin-top: 4px; color: var(--text-muted);">
-                <input type="checkbox" id="exp-png-trans" /> Transparent Background
-              </label>
-            </div>
-            <button id="exp-btn-jpg" class="glass-btn" style="width: 100%; border: 1px solid var(--glass-border);">JPEG Photo</button>
-            <button id="exp-btn-svg" class="glass-btn active" style="width: 100%;">True Vector SVG</button>
-            <button id="exp-btn-json" class="glass-btn" style="width: 100%; border: 1px solid var(--glass-border);">Project Backup (.vectura)</button>
-          </div>
-        </div>
-      </div>
-
-      <!-- Settings Modal -->
-      <div id="settings-modal" class="glass-modal-backdrop"></div>
-
-      <!-- Tutorial Modal -->
-      <div id="tutorial-modal" class="glass-modal-backdrop"></div>
+      <!-- Context Sub-actions container (appears dynamically when Box select or Transform is active) -->
+      <div id="top-panel-context" class="hidden"></div>
     </div>
+
+    <!-- Shapes Popover Menu -->
+    <div id="shapes-popover-menu" class="hidden">
+      <button class="shapes-menu-item" data-shape="rect">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+        <span>Rectangle</span>
+      </button>
+      <button class="shapes-menu-item" data-shape="ellipse">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"/></svg>
+        <span>Circle</span>
+      </button>
+      <button class="shapes-menu-item" data-shape="line">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="3" y1="21" x2="21" y2="3"/></svg>
+        <span>Line</span>
+      </button>
+      <button class="shapes-menu-item" data-shape="arrow">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="4" y1="12" x2="20" y2="12"/><polyline points="14 6 20 12 14 18"/></svg>
+        <span>Arrow</span>
+      </button>
+      <button class="shapes-menu-item" data-shape="star">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+        <span>Star</span>
+      </button>
+    </div>
+
+    <!-- More Menu Popover (3 dots: Settings, Canvas info, Flip view, Clear canvas, New artwork) -->
+    <div id="more-menu-popover">
+      <button id="menu-btn-settings" class="popover-menu-item">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span>Settings</span>
+      </button>
+      <button id="menu-btn-canvas-info" class="popover-menu-item">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+        <span>Canvas info</span>
+      </button>
+      <button id="menu-btn-flip-view" class="popover-menu-item">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3m8-18h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3M12 2v20"/></svg>
+        <span>Flip view</span>
+      </button>
+      <button id="menu-btn-reset-view" class="popover-menu-item">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+        <span>Reset view</span>
+      </button>
+      <button id="menu-btn-clear-canvas" class="popover-menu-item">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+        <span>Clear layer</span>
+      </button>
+      <button id="menu-btn-new-artwork" class="popover-menu-item">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        <span>New canvas</span>
+      </button>
+    </div>
+
+    <!-- 2. CANVAS WORKSPACE (fills space between bars, background --surround) -->
+    <main id="viewport-container">
+      <canvas id="viewport-canvas"></canvas>
+
+      <!-- 3. EDGE SLIDERS (Size & Opacity - Sticking to vertical center, square handles, fading value bubbles) -->
+      <div id="edge-sliders-cluster">
+        <!-- Grip handle to switch slider side (left/right) -->
+        <div id="sliders-grip" class="slider-grip-handle" title="Switch side">
+          <svg width="18" height="12" viewBox="0 0 24 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="4" r="1.5"/><circle cx="12" cy="4" r="1.5"/><circle cx="18" cy="4" r="1.5"/><circle cx="6" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="18" cy="12" r="1.5"/></svg>
+        </div>
+
+        <div class="edge-sliders-stack">
+          <!-- Size Slider (Top) -->
+          <div id="slider-col-size" class="edge-slider-column">
+            <div id="track-wrap-size" class="vertical-track-wrap">
+              <div class="vertical-track-bg">
+                <div id="track-fill-size" class="vertical-track-fill" style="height: 12%;"></div>
+              </div>
+              <!-- Square Thumb Handle -->
+              <div id="thumb-size" class="vertical-slider-thumb square" style="bottom: 12%;"></div>
+            </div>
+            <!-- Value Bubble (shows only while adjusting, then fades away) -->
+            <div id="bubble-size" class="slider-popup-bubble">8 px</div>
+          </div>
+
+          <!-- Opacity Slider (Under Size Slider) -->
+          <div id="slider-col-opacity" class="edge-slider-column">
+            <div id="track-wrap-opacity" class="vertical-track-wrap">
+              <div class="vertical-track-bg">
+                <div id="track-fill-opacity" class="vertical-track-fill" style="height: 100%;"></div>
+              </div>
+              <!-- Square Thumb Handle -->
+              <div id="thumb-opacity" class="vertical-slider-thumb square" style="bottom: 100%;"></div>
+            </div>
+            <!-- Value Bubble (shows only while adjusting, then fades away) -->
+            <div id="bubble-opacity" class="slider-popup-bubble">100%</div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- 4. BOTTOM TOOLBAR (Elevated floating bar with generous margin above navigation pill) -->
+    <!-- 6 tools: Pen, Eraser, Fill, Lasso, Colour, Layers -->
+    <nav id="bottom-toolbar">
+      <!-- 1. Pen / Brush -->
+      <button id="bar-btn-brush" class="toolbar-btn active" title="Pen / Brush">
+        <div class="toolbar-btn-inner">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/></svg>
+        </div>
+      </button>
+
+      <!-- 2. Eraser -->
+      <button id="bar-btn-eraser" class="toolbar-btn" title="Eraser">
+        <div class="toolbar-btn-inner">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20H7L2 15a2 2 0 0 1 0-2.83L13.17 1a2 2 0 0 1 2.83 0l6 6a2 2 0 0 1 0 2.83L14 17"/><path d="M11 5l7 7"/></svg>
+        </div>
+      </button>
+
+      <!-- 2b. Smudge -->
+      <button id="bar-btn-smudge" class="toolbar-btn" title="Smudge">
+        <div class="toolbar-btn-inner">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 11V6a2 2 0 0 0-4 0v4"/><path d="M14 10V4a2 2 0 0 0-4 0v7"/><path d="M10 10.5V6a2 2 0 0 0-4 0v8"/><path d="M6 14a6 6 0 0 0 12 0v-3a2 2 0 0 0-4 0"/></svg>
+        </div>
+      </button>
+
+      <!-- 3. Fill Tool -->
+      <button id="bar-btn-fill" class="toolbar-btn" title="Fill Bucket">
+        <div class="toolbar-btn-inner">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 11l-8-8-8.5 8.5a2.12 2.12 0 0 0 0 3l5 5a2.12 2.12 0 0 0 3 0L19 11z"/><path d="M22 20a2 2 0 1 1-4 0c0-1.6 2-4 2-4s2 2.4 2 4z"/></svg>
+        </div>
+      </button>
+
+      <!-- 4. Lasso Tool -->
+      <button id="bar-btn-lasso" class="toolbar-btn" title="Lasso Tool">
+        <div class="toolbar-btn-inner">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 22a5 5 0 0 1-2-4c0-3.5 3-6 7-6s7 2.5 7 6a5 5 0 0 1-2 4"/><path d="M12 2v10"/></svg>
+        </div>
+      </button>
+
+      <!-- 5. Colour Swatches -->
+      <button id="bar-btn-color" class="toolbar-btn" title="Colour Studio">
+        <div class="toolbar-color-swatch-wrap">
+          <div id="swatch-secondary" class="toolbar-color-swatch-secondary"></div>
+          <div id="swatch-primary" class="toolbar-color-swatch-primary"></div>
+        </div>
+      </button>
+
+      <!-- 6. Layers -->
+      <button id="bar-btn-layers" class="toolbar-btn" title="Layers">
+        <div class="toolbar-btn-inner">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+        </div>
+      </button>
+    </nav>
+
+    <!-- PANELS (Brush, Colour, Layers) are bottom sheets on phones -->
+    <!-- 1. Brush Studio Bottom Sheet -->
+    <div id="sheet-brushes" class="bottom-sheet">
+      <div class="sheet-drag-handle-zone"><div class="sheet-drag-bar"></div></div>
+      <div class="sheet-header">
+        <span class="sheet-title">Brush Studio</span>
+        <button class="btn-icon sheet-close-btn" title="Close">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="sheet-tabs">
+        <button id="bp-tab-library" class="sheet-tab active">Library</button>
+        <button id="bp-tab-settings" class="sheet-tab">Settings</button>
+      </div>
+      <div id="sheet-brushes-content" class="sheet-body" style="padding: 0;"></div>
+    </div>
+
+    <!-- 2. Colour Studio Bottom Sheet -->
+    <div id="sheet-color" class="bottom-sheet">
+      <div class="sheet-drag-handle-zone"><div class="sheet-drag-bar"></div></div>
+      <div class="sheet-header">
+        <span class="sheet-title">Colour Studio</span>
+        <button class="btn-icon sheet-close-btn" title="Close">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="sheet-tabs">
+        <button id="cp-tab-disc" class="sheet-tab active">Disc</button>
+        <button id="cp-tab-classic" class="sheet-tab">Classic</button>
+        <button id="cp-tab-sliders" class="sheet-tab">Sliders</button>
+        <button id="cp-tab-palettes" class="sheet-tab">Palettes</button>
+      </div>
+      <div id="sheet-color-content" class="sheet-body"></div>
+    </div>
+
+    <!-- 3. Layers Studio Bottom Sheet -->
+    <div id="sheet-layers" class="bottom-sheet">
+      <div class="sheet-drag-handle-zone"><div class="sheet-drag-bar"></div></div>
+      <div class="sheet-header">
+        <span class="sheet-title">Layers</span>
+        <button class="btn-icon sheet-close-btn" title="Close">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div id="sheet-layers-content" class="sheet-body" style="padding: 0; display: flex; flex-direction: column;"></div>
+    </div>
+
+    <!-- Export Modal -->
+    <div id="export-modal" class="dialog-overlay">
+      <div class="dialog-card">
+        <div class="dialog-header">
+          <span style="font-size: var(--text-title); font-weight: 500;">Export Artwork</span>
+          <button id="exp-close-btn" class="btn-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div class="dialog-body">
+          <button id="exp-btn-png-1x" class="btn-text accent" style="width: 100%;">PNG (Standard)</button>
+          <button id="exp-btn-png-4x" class="btn-text" style="width: 100%;">PNG (4× High Resolution)</button>
+          <button id="exp-btn-svg" class="btn-text" style="width: 100%;">Vector SVG</button>
+          <button id="exp-btn-json" class="btn-text" style="width: 100%;">Project Backup (.vectura)</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Canvas Info Modal -->
+    <div id="canvas-info-modal" class="dialog-overlay">
+      <div class="dialog-card">
+        <div class="dialog-header">
+          <span style="font-size: var(--text-title); font-weight: 500;">Canvas info</span>
+          <button id="info-close-btn" class="btn-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div class="dialog-body" id="canvas-info-body">
+          <div style="display: flex; justify-content: space-between;"><span style="color: var(--text-2);">Dimensions</span><span id="info-dims" class="tabular">1080 × 1080 px</span></div>
+          <div style="display: flex; justify-content: space-between;"><span style="color: var(--text-2);">Color Space</span><span>sRGB 8-bit</span></div>
+          <div style="display: flex; justify-content: space-between;"><span style="color: var(--text-2);">Layers</span><span id="info-layers-count" class="tabular">1</span></div>
+          <div style="display: flex; justify-content: space-between;"><span style="color: var(--text-2);">Resolution</span><span class="tabular">300 DPI</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="dialog-overlay"></div>
 
     <!-- Home Screen (Projects Gallery) -->
     <div id="home-screen" class="hidden"></div>

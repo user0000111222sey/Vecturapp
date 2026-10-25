@@ -24,6 +24,13 @@ export class Stabilizer {
     this.ropeLength = 5 + (this.strength / 100) * 75;
   }
 
+  reset() {
+    this.active = false;
+    this.targetPos = null;
+    this.currentPos = null;
+    this.lastEmitted = null;
+  }
+
   begin(point) {
     this.active = true;
     this.targetPos = { ...point };

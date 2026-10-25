@@ -88,4 +88,16 @@ export class GradientTool {
 
     ctx.restore();
   }
+
+  cancel() {
+    this.active = false;
+    this.startX = 0;
+    this.startY = 0;
+    this.currentX = 0;
+    this.currentY = 0;
+  }
+
+  renderOverlay(ctx, color1 = '#8b5cf6', color2 = '#ffffff') {
+    this.drawLive(ctx, color1, color2);
+  }
 }
