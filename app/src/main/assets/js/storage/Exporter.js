@@ -12,13 +12,29 @@ export class Exporter {
 
   /**
    * Exports document composite as a raster Blob (PNG, JPEG, WebP).
+   * Optional scale parameter renders at larger resolution (capped so longest side <= 4096).
    */
-  async exportRaster(format = 'image/png', quality = 0.92, transparent = false) {
+  async exportRaster(format = 'image/png', quality = 0.92, transparent = false, scale = 1) {
     const vc = this.vectorCanvas;
+    let targetW = Math.round(vc.docWidth * Math.max(0.1, scale));
+    let targetH = Math.round(vc.docHeight * Math.max(0.1, scale));
+
+    // Cap so the longest side <= 4096
+    const maxDim = Math.max(targetW, targetH);
+    if (maxDim > 4096) {
+      const factor = 4096 / maxDim;
+      targetW = Math.max(1, Math.round(targetW * factor));
+      targetH = Math.max(1, Math.round(targetH * factor));
+    }
+
     const exportCanvas = document.createElement('canvas');
-    exportCanvas.width = vc.docWidth;
-    exportCanvas.height = vc.docHeight;
+    exportCanvas.width = targetW;
+    exportCanvas.height = targetH;
     const ctx = exportCanvas.getContext('2d');
+
+    if (scale !== 1 || targetW !== vc.docWidth || targetH !== vc.docHeight) {
+      ctx.scale(targetW / vc.docWidth, targetH / vc.docHeight);
+    }
 
     vc.layerManager.compositeToCanvas(ctx, !transparent);
 
@@ -102,16 +118,54 @@ export class Exporter {
   }
 
   /**
-   * Triggers download or native Android sharing sheet.
+   * Converts a Blob, File, or DataURL to raw Base64 string.
+   */
+  async blobOrDataUrlToBase64(data) {
+    if (typeof data === 'string') {
+      return data.includes(',') ? data.substring(data.indexOf(',') + 1) : data;
+    }
+    if (data instanceof Blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const res = reader.result;
+          const b64 = typeof res === 'string' && res.includes(',') ? res.substring(res.indexOf(',') + 1) : res;
+          resolve(b64);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(data);
+      });
+    }
+    return '';
+  }
+
+  /**
+   * Triggers native Android export/share in chunks or web download.
    */
   async shareOrDownload(dataUrlOrBlob, filename, mimeType) {
-    // If AndroidBridge is available in native app, use it for Android share intent
-    if (window.AndroidBridge && typeof dataUrlOrBlob === 'string') {
-      window.AndroidBridge.shareFile(dataUrlOrBlob, mimeType, filename);
-      return;
+    // 1. AndroidBridge: stream chunks of ~512KB base64
+    if (window.AndroidBridge && (window.AndroidBridge.beginFile || window.AndroidBridge.shareFile)) {
+      try {
+        const b64 = await this.blobOrDataUrlToBase64(dataUrlOrBlob);
+        if (window.AndroidBridge.beginFile && window.AndroidBridge.appendChunk && window.AndroidBridge.finishFile) {
+          window.AndroidBridge.beginFile(filename, mimeType);
+          const chunkSize = 512 * 1024; // 512KB chunk
+          for (let i = 0; i < b64.length; i += chunkSize) {
+            window.AndroidBridge.appendChunk(b64.slice(i, i + chunkSize));
+          }
+          window.AndroidBridge.finishFile(filename, mimeType);
+          return;
+        } else if (window.AndroidBridge.shareFile) {
+          window.AndroidBridge.shareFile(b64, mimeType, filename);
+          return;
+        }
+      } catch (err) {
+        console.error('AndroidBridge chunked export failed:', err);
+        window.AndroidBridge.showToast?.('Export failed: ' + err.message);
+      }
     }
 
-    // Web Share API fallback for modern mobile browsers
+    // 2. Web Share API fallback for modern mobile browsers
     if (navigator.canShare && navigator.share && dataUrlOrBlob instanceof Blob) {
       try {
         const file = new File([dataUrlOrBlob], filename, { type: mimeType });
@@ -127,7 +181,7 @@ export class Exporter {
       }
     }
 
-    // Fallback: standard file download trigger
+    // 3. Fallback: standard file download trigger
     const link = document.createElement('a');
     link.download = filename;
     if (typeof dataUrlOrBlob === 'string') {

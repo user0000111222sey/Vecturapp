@@ -200,11 +200,20 @@ export class LayerPanel {
       ctx.fillRect(0, 0, 20, 20);
       ctx.fillRect(20, 20, 20, 20);
 
-      // Draw layer thumbnail scaled
+      // Draw layer thumbnail scaled preserving aspect ratio
+      const maxDim = 40;
+      const lw = layer.width || 1;
+      const lh = layer.height || 1;
+      const scale = Math.min(maxDim / lw, maxDim / lh);
+      const dw = Math.max(1, Math.round(lw * scale));
+      const dh = Math.max(1, Math.round(lh * scale));
+      const dx = Math.round((maxDim - dw) / 2);
+      const dy = Math.round((maxDim - dh) / 2);
+
       if (layer.thumbCanvas) {
-        ctx.drawImage(layer.thumbCanvas, 0, 0, 40, 40);
+        ctx.drawImage(layer.thumbCanvas, 0, 0, layer.thumbCanvas.width, layer.thumbCanvas.height, dx, dy, dw, dh);
       } else {
-        ctx.drawImage(layer.canvas, 0, 0, 40, 40);
+        ctx.drawImage(layer.canvas, 0, 0, lw, lh, dx, dy, dw, dh);
       }
     });
   }

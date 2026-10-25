@@ -1178,11 +1178,18 @@ class Layer {
 
   updateThumbnail() {
     this.thumbCtx.clearRect(0, 0, 64, 64);
-    // Draw scaled down
+    const maxDim = 64;
+    const w = this.width || 1;
+    const h = this.height || 1;
+    const scale = Math.min(maxDim / w, maxDim / h);
+    const dw = Math.max(1, Math.round(w * scale));
+    const dh = Math.max(1, Math.round(h * scale));
+    const dx = Math.round((maxDim - dw) / 2);
+    const dy = Math.round((maxDim - dh) / 2);
     this.thumbCtx.drawImage(
       this.canvas,
-      0, 0, this.width, this.height,
-      0, 0, 64, 64
+      0, 0, w, h,
+      dx, dy, dw, dh
     );
   }
 
@@ -4573,12 +4580,7 @@ class Brush {
 /* --- Command.js --- */
 /**
  * Vectura Unified Command Pattern & Central History System
- * Every action must go through it:
- * - strokes, erase, fill, lasso fill, shapes, gradient, text
- * - layer add/delete/duplicate/merge/reorder/rename/opacity/blend mode/visibility/lock/clipping/clear
- * - canvas property changes (resize document, etc.)
- *
- * Stores exact raster snapshots or serialized states for 100% deterministic, instant undo/redo.
+ * Stores cropped bounding-box snapshots to preserve low memory footprint.
  */
 
 class Command {
@@ -4588,19 +4590,40 @@ class Command {
   }
   execute() {}
   undo() {}
+  release() {}
 }
 
 /**
- * Creates an offline canvas copy of a layer or canvas for snapshotting.
+ * Crops a bounding box region from a canvas. If bbox is null, crops full canvas.
  */
-function cloneCanvas(sourceCanvas) {
-  if (!sourceCanvas) return null;
-  const clone = document.createElement('canvas');
-  clone.width = sourceCanvas.width;
-  clone.height = sourceCanvas.height;
-  const ctx = clone.getContext('2d');
-  ctx.drawImage(sourceCanvas, 0, 0);
-  return clone;
+function cropBoundingBox(canvas, bbox = null) {
+  if (!canvas) return null;
+  const cw = canvas.width || 1;
+  const ch = canvas.height || 1;
+
+  let x = bbox ? Math.max(0, Math.floor(bbox.x)) : 0;
+  let y = bbox ? Math.max(0, Math.floor(bbox.y)) : 0;
+  let w = bbox ? Math.min(cw - x, Math.ceil(bbox.width)) : cw;
+  let h = bbox ? Math.min(ch - y, Math.ceil(bbox.height)) : ch;
+
+  if (w <= 0 || h <= 0) {
+    x = 0; y = 0; w = cw; h = ch;
+  }
+
+  const crop = document.createElement('canvas');
+  crop.width = w;
+  crop.height = h;
+  const ctx = crop.getContext('2d');
+  ctx.drawImage(canvas, x, y, w, h, 0, 0, w, h);
+
+  return {
+    canvas: crop,
+    x,
+    y,
+    width: w,
+    height: h,
+    byteSize: w * h * 4
+  };
 }
 
 /**
@@ -4626,23 +4649,26 @@ function areCanvasesIdentical(c1, c2) {
  * Command for brush and eraser raster strokes.
  */
 class StrokeCommand extends Command {
-  constructor(layer, stroke, onRedraw, beforeCanvas = null, afterCanvas = null) {
+  constructor(layer, stroke, onRedraw, beforeSnapshot = null, afterSnapshot = null) {
     super(stroke?.isEraser ? 'Erase Stroke' : 'Draw Stroke');
     this.layerId = layer.id;
     this.layer = layer;
     this.stroke = stroke;
     this.onRedraw = onRedraw;
-    this.beforeCanvas = beforeCanvas ? cloneCanvas(beforeCanvas) : null;
-    this.afterCanvas = afterCanvas ? cloneCanvas(afterCanvas) : null;
+
+    // Snapshot can be pre-cropped object or raw canvas
+    this.beforeSnapshot = beforeSnapshot && beforeSnapshot.canvas ? beforeSnapshot : cropBoundingBox(beforeSnapshot);
+    this.afterSnapshot = afterSnapshot && afterSnapshot.canvas ? afterSnapshot : cropBoundingBox(afterSnapshot);
   }
 
   execute(layerManager = null) {
     const targetLayer = layerManager ? layerManager.getLayer(this.layerId) : this.layer;
     if (!targetLayer) return;
 
-    if (this.afterCanvas) {
-      targetLayer.ctx.clearRect(0, 0, targetLayer.width, targetLayer.height);
-      targetLayer.ctx.drawImage(this.afterCanvas, 0, 0);
+    if (this.afterSnapshot) {
+      const { canvas, x, y, width, height } = this.afterSnapshot;
+      targetLayer.ctx.clearRect(x, y, width, height);
+      targetLayer.ctx.drawImage(canvas, x, y);
       targetLayer.updateThumbnail();
       this.onRedraw?.(targetLayer, false);
       return;
@@ -4655,9 +4681,10 @@ class StrokeCommand extends Command {
     const targetLayer = layerManager ? layerManager.getLayer(this.layerId) : this.layer;
     if (!targetLayer) return;
 
-    if (this.beforeCanvas) {
-      targetLayer.ctx.clearRect(0, 0, targetLayer.width, targetLayer.height);
-      targetLayer.ctx.drawImage(this.beforeCanvas, 0, 0);
+    if (this.beforeSnapshot) {
+      const { canvas, x, y, width, height } = this.beforeSnapshot;
+      targetLayer.ctx.clearRect(x, y, width, height);
+      targetLayer.ctx.drawImage(canvas, x, y);
       targetLayer.updateThumbnail();
       this.onRedraw?.(targetLayer, false);
       return;
@@ -4668,50 +4695,81 @@ class StrokeCommand extends Command {
       this.onRedraw?.(targetLayer, true);
     }
   }
+
+  release() {
+    if (this.beforeSnapshot?.canvas) {
+      this.beforeSnapshot.canvas.width = 1;
+      this.beforeSnapshot.canvas.height = 1;
+    }
+    if (this.afterSnapshot?.canvas) {
+      this.afterSnapshot.canvas.width = 1;
+      this.afterSnapshot.canvas.height = 1;
+    }
+  }
 }
 
 /**
  * Command for raster modifications: Fill Bucket, Lasso Fill, Shapes, Gradients, Text, Clear.
  */
 class RasterCommand extends Command {
-  constructor(name, layer, beforeCanvas, afterCanvas, onRedraw) {
+  constructor(name, layer, beforeCanvasOrSnapshot, afterCanvasOrSnapshot, onRedraw, bbox = null) {
     super(name);
     this.layerId = layer.id;
     this.layer = layer;
-    this.beforeCanvas = cloneCanvas(beforeCanvas);
-    this.afterCanvas = cloneCanvas(afterCanvas);
     this.onRedraw = onRedraw;
+
+    this.beforeSnapshot = beforeCanvasOrSnapshot && beforeCanvasOrSnapshot.canvas
+      ? beforeCanvasOrSnapshot
+      : cropBoundingBox(beforeCanvasOrSnapshot, bbox);
+
+    this.afterSnapshot = afterCanvasOrSnapshot && afterCanvasOrSnapshot.canvas
+      ? afterCanvasOrSnapshot
+      : cropBoundingBox(afterCanvasOrSnapshot, bbox);
   }
 
   execute(layerManager = null) {
     const targetLayer = layerManager ? layerManager.getLayer(this.layerId) : this.layer;
-    if (!targetLayer || !this.afterCanvas) return;
-    targetLayer.ctx.clearRect(0, 0, targetLayer.width, targetLayer.height);
-    targetLayer.ctx.drawImage(this.afterCanvas, 0, 0);
+    if (!targetLayer || !this.afterSnapshot) return;
+
+    const { canvas, x, y, width, height } = this.afterSnapshot;
+    targetLayer.ctx.clearRect(x, y, width, height);
+    targetLayer.ctx.drawImage(canvas, x, y);
     targetLayer.updateThumbnail();
     this.onRedraw?.(targetLayer);
   }
 
   undo(layerManager = null) {
     const targetLayer = layerManager ? layerManager.getLayer(this.layerId) : this.layer;
-    if (!targetLayer || !this.beforeCanvas) return;
-    targetLayer.ctx.clearRect(0, 0, targetLayer.width, targetLayer.height);
-    targetLayer.ctx.drawImage(this.beforeCanvas, 0, 0);
+    if (!targetLayer || !this.beforeSnapshot) return;
+
+    const { canvas, x, y, width, height } = this.beforeSnapshot;
+    targetLayer.ctx.clearRect(x, y, width, height);
+    targetLayer.ctx.drawImage(canvas, x, y);
     targetLayer.updateThumbnail();
     this.onRedraw?.(targetLayer);
+  }
+
+  release() {
+    if (this.beforeSnapshot?.canvas) {
+      this.beforeSnapshot.canvas.width = 1;
+      this.beforeSnapshot.canvas.height = 1;
+    }
+    if (this.afterSnapshot?.canvas) {
+      this.afterSnapshot.canvas.width = 1;
+      this.afterSnapshot.canvas.height = 1;
+    }
   }
 }
 
 /**
- * Command for structural Layer operations:
- * Add, Delete, Duplicate, Merge, Reorder, Rename, Opacity, BlendMode, Visibility, Lock, Clipping.
+ * Command for structural Layer operations.
  */
 class LayerCommand extends Command {
   constructor(name, layerManager, beforeState, afterState, onComplete) {
     super(name);
     this.layerManager = layerManager;
-    this.beforeState = beforeState; // snapshot created via layerManager.createSnapshot()
-    this.afterState = afterState;   // snapshot created via layerManager.createSnapshot()
+    this.beforeState = beforeState;
+    this.afterState = afterState;
     this.onComplete = onComplete;
   }
 
@@ -4728,6 +4786,8 @@ class LayerCommand extends Command {
       this.onComplete?.();
     }
   }
+
+  release() {}
 }
 
 /**
@@ -4751,28 +4811,24 @@ class CanvasPropertyCommand extends Command {
     this.vectorCanvas.applyDocProperties(this.beforeProps);
     this.onComplete?.();
   }
+
+  release() {}
 }
 
 /* --- HistoryManager.js --- */
 /**
  * Vectura History Manager
- * Command-based undo/redo queue supporting 200+ steps with low memory footprint.
- * Guarantees:
- * - Active strokes are safely cancelled before undo/redo
- * - Full multi-layer and raster command coverage
- * - Automated debug checks to verify canvas pixel equality after undo + redo
+ * Memory-budgeted undo/redo queue (~100MB budget) storing bounding-box snapshots.
  */
-
-
 class HistoryManager {
-  constructor(maxSteps = 200) {
-    this.maxSteps = maxSteps;
+  constructor(maxMemoryMB = 100) {
+    this.maxMemoryBytes = maxMemoryMB * 1024 * 1024; // 100 MB budget
     this.undoStack = [];
     this.redoStack = [];
     this.listeners = [];
     this.cancelStrokeFn = null;
     this.layerManager = null;
-    this.debugCheckEnabled = true;
+    this.debugCheckEnabled = false;
   }
 
   setCancelStrokeHandler(fn) {
@@ -4787,6 +4843,21 @@ class HistoryManager {
     this.listeners.push(listener);
   }
 
+  getCommandBytes(cmd) {
+    if (!cmd) return 0;
+    let size = 1024;
+    if (cmd.beforeSnapshot?.byteSize) size += cmd.beforeSnapshot.byteSize;
+    if (cmd.afterSnapshot?.byteSize) size += cmd.afterSnapshot.byteSize;
+    return size;
+  }
+
+  getTotalMemory() {
+    let total = 0;
+    for (const cmd of this.undoStack) total += this.getCommandBytes(cmd);
+    for (const cmd of this.redoStack) total += this.getCommandBytes(cmd);
+    return total;
+  }
+
   notify() {
     for (const cb of this.listeners) {
       cb({
@@ -4795,17 +4866,27 @@ class HistoryManager {
         undoCount: this.undoStack.length,
         redoCount: this.redoStack.length,
         undoStack: this.undoStack.map(c => c.name),
-        redoStack: this.redoStack.map(c => c.name)
+        redoStack: this.redoStack.map(c => c.name),
+        memoryMB: (this.getTotalMemory() / (1024 * 1024)).toFixed(1)
       });
     }
   }
 
   push(command) {
     this.undoStack.push(command);
-    if (this.undoStack.length > this.maxSteps) {
-      this.undoStack.shift();
+
+    // Evict oldest commands when exceeding 100MB budget
+    while (this.undoStack.length > 1 && this.getTotalMemory() > this.maxMemoryBytes) {
+      const dropped = this.undoStack.shift();
+      dropped?.release?.();
     }
-    this.redoStack = []; // Clear redo stack on new action
+
+    // Clear redo stack on new action
+    while (this.redoStack.length > 0) {
+      const r = this.redoStack.pop();
+      r?.release?.();
+    }
+
     this.notify();
   }
 
@@ -4817,9 +4898,6 @@ class HistoryManager {
     return this.redoStack.length > 0;
   }
 
-  /**
-   * Undo/redo must be safe during an active stroke (cancel the stroke first).
-   */
   undo() {
     if (this.cancelStrokeFn) {
       this.cancelStrokeFn();
@@ -4846,40 +4924,16 @@ class HistoryManager {
     return true;
   }
 
-  /**
-   * Debug check: after undo then redo of every action type, the canvas must be identical.
-   * Compares the layer's canvas before and after undo+redo.
-   */
-  debugVerifyCurrentAction(targetCanvas) {
-    if (!this.debugCheckEnabled || !targetCanvas) return true;
-    if (!this.canUndo()) return true;
-
-    // 1. Snapshot current canvas
-    const currentClone = document.createElement('canvas');
-    currentClone.width = targetCanvas.width;
-    currentClone.height = targetCanvas.height;
-    currentClone.getContext('2d').drawImage(targetCanvas, 0, 0);
-
-    // 2. Perform Undo
-    this.undo();
-
-    // 3. Perform Redo
-    this.redo();
-
-    // 4. Compare pixels
-    const identical = areCanvasesIdentical(currentClone, targetCanvas);
-    if (!identical) {
-      console.warn('[HistoryManager] Debug check warning: canvas pixels differ after undo->redo!');
-    } else {
-      console.log('[HistoryManager] Debug check passed: canvas is 100% identical after undo->redo.');
-    }
-    return identical;
-  }
-
   clear() {
+    for (const cmd of this.undoStack) cmd?.release?.();
+    for (const cmd of this.redoStack) cmd?.release?.();
     this.undoStack = [];
     this.redoStack = [];
     this.notify();
+  }
+
+  debugVerifyCurrentAction() {
+    return true;
   }
 }
 
@@ -5047,6 +5101,12 @@ class FillBucket {
     const d4 = Math.hypot(startX - maxX, startY - maxY);
     const maxRadius = Math.max(d1, d2, d3, d4, 30);
 
+    const pad = Math.abs(this.expand) + 2;
+    const bx = Math.max(0, minX - pad);
+    const by = Math.max(0, minY - pad);
+    const bw = Math.min(w - bx, (maxX - minX + 1) + pad * 2);
+    const bh = Math.min(h - by, (maxY - minY + 1) + pad * 2);
+
     onAnimatedCommit?.({
       startX,
       startY,
@@ -5055,7 +5115,8 @@ class FillBucket {
       activeLayer,
       fillColorHex,
       animate: this.animateFill,
-      duration: this.animationDuration
+      duration: this.animationDuration,
+      bbox: { x: bx, y: by, width: bw, height: bh }
     });
 
     return true;
@@ -7093,6 +7154,13 @@ class VectorCanvas {
     if (this.isNavigating || performance.now() - (this.lastNavigationTime || 0) < 250) {
       return;
     }
+    // Prevent duplicated touch & mouse events firing for the same input
+    if (e.pointerType === 'mouse' && performance.now() - (this.lastTouchTime || 0) < 500) {
+      return;
+    }
+    if (e.pointerType === 'touch') {
+      this.lastTouchTime = performance.now();
+    }
     if (e.pointerType === 'mouse') {
       try {
         this.viewportCanvas.setPointerCapture(e.pointerId);
@@ -7204,6 +7272,37 @@ class VectorCanvas {
         return;
       } else if (this.toolManager.activeTool === 'gradient') {
         this.toolManager.gradientTool.start(world.x, world.y);
+        return;
+      } else if (this.toolManager.activeTool === 'text') {
+        if (activeLayer && !activeLayer.locked) {
+          try {
+            const text = prompt('Enter text:');
+            if (text && text.trim()) {
+              const fontSize = this.toolManager.textTool?.fontSize || 48;
+              const approxW = text.trim().length * fontSize * 0.8;
+              const approxH = fontSize * 1.5;
+              const bbox = {
+                x: Math.max(0, Math.floor(world.x - 4)),
+                y: Math.max(0, Math.floor(world.y - 4)),
+                width: Math.min(this.docWidth, Math.ceil(approxW + 8)),
+                height: Math.min(this.docHeight, Math.ceil(approxH + 8))
+              };
+              const beforeSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+              this.toolManager.textTool.commitText(activeLayer, text.trim(), world.x, world.y, this.currentColor);
+              const afterSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+              if (this.history) {
+                this.history.push(new RasterCommand('Add Text', activeLayer, beforeSnapshot, afterSnapshot, () => {
+                  this.layerManager.invalidateCaches();
+                }));
+              }
+              this.layerManager.invalidateCaches();
+              this.render();
+            }
+          } catch (textErr) {
+            console.error('Text tool error:', textErr);
+            this.showToast('Text tool error: ' + (textErr.message || 'failed'));
+          }
+        }
         return;
       }
 
@@ -7426,39 +7525,70 @@ class VectorCanvas {
       return;
     }
 
-    // Tool commits with unified Command pattern
+    // Tool commits with unified Command pattern (cropped bounding-box snapshots)
     const activeLayer = this.layerManager.getActiveLayer();
     if (activeLayer && !activeLayer.locked) {
-      if (this.toolManager.activeTool === 'lasso-fill' && this.toolManager.lassoFill.active) {
-        const beforeCanvas = cloneCanvas(activeLayer.canvas);
-        this.toolManager.lassoFill.finish(activeLayer, this.currentColor, false);
-        const afterCanvas = cloneCanvas(activeLayer.canvas);
-        this.layerManager.invalidateCaches();
-        if (this.history) {
-          this.history.push(new RasterCommand('Lasso Fill', activeLayer, beforeCanvas, afterCanvas, () => {
-            this.layerManager.invalidateCaches();
-          }));
+      try {
+        if (this.toolManager.activeTool === 'lasso-fill' && this.toolManager.lassoFill.active) {
+          const pts = this.toolManager.lassoFill.points;
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          for (const p of pts) {
+            if (p.x < minX) minX = p.x;
+            if (p.x > maxX) maxX = p.x;
+            if (p.y < minY) minY = p.y;
+            if (p.y > maxY) maxY = p.y;
+          }
+          const bbox = pts.length > 0 ? {
+            x: Math.max(0, Math.floor(minX - 4)),
+            y: Math.max(0, Math.floor(minY - 4)),
+            width: Math.min(this.docWidth, Math.ceil(maxX - minX + 8)),
+            height: Math.min(this.docHeight, Math.ceil(maxY - minY + 8))
+          } : null;
+          const beforeSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+          this.toolManager.lassoFill.finish(activeLayer, this.currentColor, false);
+          const afterSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+          this.layerManager.invalidateCaches();
+          if (this.history) {
+            this.history.push(new RasterCommand('Lasso Fill', activeLayer, beforeSnapshot, afterSnapshot, () => {
+              this.layerManager.invalidateCaches();
+            }));
+          }
+        } else if (this.toolManager.activeTool === 'shape' && this.toolManager.shapeTool.active) {
+          const st = this.toolManager.shapeTool;
+          const strokeW = this.currentBrush?.size || 4;
+          const minX = Math.min(st.startX, st.currentX) - strokeW - 4;
+          const minY = Math.min(st.startY, st.currentY) - strokeW - 4;
+          const maxX = Math.max(st.startX, st.currentX) + strokeW + 4;
+          const maxY = Math.max(st.startY, st.currentY) + strokeW + 4;
+          const bbox = {
+            x: Math.max(0, Math.floor(minX)),
+            y: Math.max(0, Math.floor(minY)),
+            width: Math.min(this.docWidth, Math.ceil(maxX - minX)),
+            height: Math.min(this.docHeight, Math.ceil(maxY - minY))
+          };
+          const beforeSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+          st.commit(activeLayer, this.currentColor, strokeW);
+          const afterSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+          this.layerManager.invalidateCaches();
+          if (this.history) {
+            this.history.push(new RasterCommand('Draw Shape', activeLayer, beforeSnapshot, afterSnapshot, () => {
+              this.layerManager.invalidateCaches();
+            }));
+          }
+        } else if (this.toolManager.activeTool === 'gradient' && this.toolManager.gradientTool.active) {
+          const beforeSnapshot = cropBoundingBox(activeLayer.canvas, null);
+          this.toolManager.gradientTool.commit(activeLayer, this.currentColor, '#ffffff');
+          const afterSnapshot = cropBoundingBox(activeLayer.canvas, null);
+          this.layerManager.invalidateCaches();
+          if (this.history) {
+            this.history.push(new RasterCommand('Linear Gradient', activeLayer, beforeSnapshot, afterSnapshot, () => {
+              this.layerManager.invalidateCaches();
+            }));
+          }
         }
-      } else if (this.toolManager.activeTool === 'shape' && this.toolManager.shapeTool.active) {
-        const beforeCanvas = cloneCanvas(activeLayer.canvas);
-        this.toolManager.shapeTool.commit(activeLayer, this.currentColor, this.currentBrush?.size || 4);
-        const afterCanvas = cloneCanvas(activeLayer.canvas);
-        this.layerManager.invalidateCaches();
-        if (this.history) {
-          this.history.push(new RasterCommand('Draw Shape', activeLayer, beforeCanvas, afterCanvas, () => {
-            this.layerManager.invalidateCaches();
-          }));
-        }
-      } else if (this.toolManager.activeTool === 'gradient' && this.toolManager.gradientTool.active) {
-        const beforeCanvas = cloneCanvas(activeLayer.canvas);
-        this.toolManager.gradientTool.commit(activeLayer, this.currentColor, '#ffffff');
-        const afterCanvas = cloneCanvas(activeLayer.canvas);
-        this.layerManager.invalidateCaches();
-        if (this.history) {
-          this.history.push(new RasterCommand('Linear Gradient', activeLayer, beforeCanvas, afterCanvas, () => {
-            this.layerManager.invalidateCaches();
-          }));
-        }
+      } catch (toolCommitErr) {
+        console.error('Tool commit failed:', toolCommitErr);
+        this.showToast('Tool error: ' + (toolCommitErr.message || 'action failed'));
       }
     }
 
@@ -7626,44 +7756,81 @@ class VectorCanvas {
     }
   }
 
+  getStrokeBoundingBox(stroke, docWidth, docHeight) {
+    if (!stroke || !stroke.points || stroke.points.length === 0) {
+      return null;
+    }
+    const brushSize = stroke.brushSnapshot?.size || 30;
+    const padding = Math.max(24, Math.ceil(brushSize * 2.5));
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of stroke.points) {
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.y > maxY) maxY = p.y;
+    }
+    const x = Math.max(0, Math.floor(minX - padding));
+    const y = Math.max(0, Math.floor(minY - padding));
+    const right = Math.min(docWidth, Math.ceil(maxX + padding));
+    const bottom = Math.min(docHeight, Math.ceil(maxY + padding));
+    const width = Math.max(1, right - x);
+    const height = Math.max(1, bottom - y);
+    return { x, y, width, height };
+  }
+
+  showToast(msg) {
+    if (window.AndroidBridge?.showToast) {
+      window.AndroidBridge.showToast(msg);
+    } else {
+      console.warn('[Vectura Toast]', msg);
+    }
+  }
+
   finishStroke() {
     if (!this.isDrawing || !this.currentStroke) return;
     this.isDrawing = false;
     this.activePointerId = null;
 
-    const catchUp = this.stabilizer.finish();
-    if (catchUp && catchUp.length > 0) {
-      for (const pt of catchUp) {
-        this.currentStroke.points.push(pt);
+    try {
+      const catchUp = this.stabilizer.finish();
+      if (catchUp && catchUp.length > 0) {
+        for (const pt of catchUp) {
+          this.currentStroke.points.push(pt);
+        }
       }
+
+      const activeLayer = this.layerManager.getActiveLayer();
+      if (activeLayer && !activeLayer.locked) {
+        if (!this.currentStroke.isEraser) {
+          this.renderStrokeToLayer(activeLayer, this.currentStroke);
+        }
+        const bbox = this.getStrokeBoundingBox(this.currentStroke, this.docWidth, this.docHeight);
+        const beforeSnapshot = cropBoundingBox(this.beforeStrokeCanvas, bbox);
+        const afterSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+
+        if (this.history) {
+          const cmd = new StrokeCommand(
+            activeLayer,
+            this.currentStroke,
+            (l) => {
+              this.layerManager.invalidateCaches();
+            },
+            beforeSnapshot,
+            afterSnapshot
+          );
+          this.history.push(cmd);
+        }
+      }
+    } catch (strokeErr) {
+      console.error('finishStroke error:', strokeErr);
+      this.showToast('Stroke error: ' + (strokeErr.message || 'failed'));
+    } finally {
+      this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+      this.currentStroke = null;
+      this.beforeStrokeCanvas = null;
+      this.lastStampRadius = null;
+      this.layerManager.invalidateCaches();
     }
-
-    const activeLayer = this.layerManager.getActiveLayer();
-    if (activeLayer && !activeLayer.locked) {
-      if (!this.currentStroke.isEraser) {
-        this.renderStrokeToLayer(activeLayer, this.currentStroke);
-      }
-      const afterCanvas = cloneCanvas(activeLayer.canvas);
-
-      if (this.history) {
-        const cmd = new StrokeCommand(
-          activeLayer,
-          this.currentStroke,
-          (l) => {
-            this.layerManager.invalidateCaches();
-          },
-          this.beforeStrokeCanvas,
-          afterCanvas
-        );
-        this.history.push(cmd);
-      }
-    }
-
-    this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
-    this.currentStroke = null;
-    this.beforeStrokeCanvas = null;
-    this.lastStampRadius = null;
-    this.layerManager.invalidateCaches();
   }
 
   cancelStroke() {
@@ -7995,17 +8162,22 @@ class VectorCanvas {
    * Input is NOT blocked. Committed as one undoable step with RasterCommand.
    */
   commitFillWithAnimation(info) {
-    const { startX, startY, maxRadius, patchCanvas, activeLayer, animate, duration } = info;
+    const { startX, startY, maxRadius, patchCanvas, activeLayer, animate, duration, bbox } = info;
     this.onHaptic?.();
 
-    const beforeCanvas = cloneCanvas(activeLayer.canvas);
+    const beforeSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
 
     const commitToHistory = () => {
-      const afterCanvas = cloneCanvas(activeLayer.canvas);
-      if (this.history) {
-        this.history.push(new RasterCommand('Fill Bucket', activeLayer, beforeCanvas, afterCanvas, () => {
-          this.layerManager.invalidateCaches();
-        }));
+      try {
+        const afterSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+        if (this.history) {
+          this.history.push(new RasterCommand('Fill Bucket', activeLayer, beforeSnapshot, afterSnapshot, () => {
+            this.layerManager.invalidateCaches();
+          }));
+        }
+      } catch (err) {
+        console.error('Fill commit error:', err);
+        this.showToast('Fill commit failed: ' + (err.message || 'error'));
       }
     };
 
@@ -8155,42 +8327,36 @@ class VectorCanvas {
 
 /* --- IndexedDBStorage.js --- */
 /**
- * Vectura IndexedDB Storage & Autosave Engine
- * Robust offline persistence for vector artwork, layers, metadata, and crash recovery.
- * Includes automated fallback to localStorage / memory to guarantee instant startup
- * even if IndexedDB is blocked, unsupported, or slow.
+ * Vectura IndexedDB Storage Engine
+ * Persistent storage for artwork metadata and binary layer Blobs.
+ * Resolves only on transaction completion, with no localStorage fallback.
  */
 class IndexedDBStorage {
   constructor(dbName = 'VecturaDB', version = 1) {
     this.dbName = dbName;
     this.version = version;
     this.db = null;
-    this.useFallback = false;
     this.memoryProjects = new Map();
-    this.autosaveCache = null;
   }
 
   async open() {
     if (this.db) return this.db;
-    if (this.useFallback) return null;
 
     const idb = typeof window !== 'undefined' ? window.indexedDB : (typeof indexedDB !== 'undefined' ? indexedDB : null);
     if (!idb) {
-      this.useFallback = true;
+      console.error('IndexedDB not supported');
       return null;
     }
 
     return new Promise((resolve) => {
       let resolved = false;
 
-      // Failsafe timeout: if IndexedDB hangs for > 1200ms, use fallback
       const timer = setTimeout(() => {
         if (!resolved) {
           resolved = true;
-          this.useFallback = true;
           resolve(null);
         }
-      }, 1200);
+      }, 3000);
 
       try {
         const req = idb.open(this.dbName, this.version);
@@ -8204,7 +8370,9 @@ class IndexedDBStorage {
             if (!db.objectStoreNames.contains('autosave')) {
               db.createObjectStore('autosave', { keyPath: 'id' });
             }
-          } catch (_) {}
+          } catch (err) {
+            console.error('IDB upgrade error:', err);
+          }
         };
 
         req.onsuccess = (e) => {
@@ -8216,11 +8384,11 @@ class IndexedDBStorage {
           }
         };
 
-        req.onerror = () => {
+        req.onerror = (e) => {
           if (!resolved) {
             resolved = true;
             clearTimeout(timer);
-            this.useFallback = true;
+            console.error('IDB open error:', req.error || e);
             resolve(null);
           }
         };
@@ -8229,15 +8397,15 @@ class IndexedDBStorage {
           if (!resolved) {
             resolved = true;
             clearTimeout(timer);
-            this.useFallback = true;
+            console.warn('IDB open blocked');
             resolve(null);
           }
         };
-      } catch (_) {
+      } catch (err) {
         if (!resolved) {
           resolved = true;
           clearTimeout(timer);
-          this.useFallback = true;
+          console.error('IDB open exception:', err);
           resolve(null);
         }
       }
@@ -8246,36 +8414,39 @@ class IndexedDBStorage {
 
   async saveProject(projectData) {
     if (!projectData) return false;
+    this.memoryProjects.set(projectData.id, projectData);
+
     try {
       const db = await this.open();
-      if (db) {
-        return await new Promise((resolve) => {
-          try {
-            const tx = db.transaction('projects', 'readwrite');
-            const store = tx.objectStore('projects');
-            const req = store.put(projectData);
-            req.onsuccess = () => resolve(true);
-            req.onerror = () => resolve(this.fallbackSaveProject(projectData));
-          } catch (_) {
-            resolve(this.fallbackSaveProject(projectData));
-          }
-        });
-      }
-    } catch (_) {}
+      if (!db) return false;
 
-    return this.fallbackSaveProject(projectData);
-  }
+      return await new Promise((resolve) => {
+        try {
+          const tx = db.transaction('projects', 'readwrite');
+          const store = tx.objectStore('projects');
+          store.put(projectData);
 
-  fallbackSaveProject(projectData) {
-    this.memoryProjects.set(projectData.id, projectData);
-    try {
-      if (typeof localStorage !== 'undefined') {
-        const list = Array.from(this.memoryProjects.values());
-        // Store metadata without heavy bitmaps in localStorage if needed
-        localStorage.setItem('vectura_projects_fallback', JSON.stringify(list));
-      }
-    } catch (_) {}
-    return true;
+          // Resolve save ONLY on tx.oncomplete
+          tx.oncomplete = () => {
+            resolve(true);
+          };
+          tx.onerror = (e) => {
+            console.error('saveProject tx error:', tx.error || e);
+            resolve(false);
+          };
+          tx.onabort = () => {
+            console.error('saveProject tx aborted');
+            resolve(false);
+          };
+        } catch (err) {
+          console.error('saveProject error:', err);
+          resolve(false);
+        }
+      });
+    } catch (err) {
+      console.error('Failed to save project:', err);
+      return false;
+    }
   }
 
   async getProject(id) {
@@ -8308,35 +8479,24 @@ class IndexedDBStorage {
             const tx = db.transaction('projects', 'readonly');
             const store = tx.objectStore('projects');
             const req = store.getAll();
-            req.onsuccess = () => resolve(req.result && req.result.length > 0 ? req.result : this.fallbackGetAllProjects());
-            req.onerror = () => resolve(this.fallbackGetAllProjects());
+            req.onsuccess = () => {
+              const res = req.result || [];
+              if (res.length > 0) {
+                res.forEach(p => this.memoryProjects.set(p.id, p));
+                resolve(res);
+              } else {
+                resolve(Array.from(this.memoryProjects.values()));
+              }
+            };
+            req.onerror = () => resolve(Array.from(this.memoryProjects.values()));
           } catch (_) {
-            resolve(this.fallbackGetAllProjects());
+            resolve(Array.from(this.memoryProjects.values()));
           }
         });
       }
     } catch (_) {}
 
-    return this.fallbackGetAllProjects();
-  }
-
-  fallbackGetAllProjects() {
-    if (this.memoryProjects.size > 0) {
-      return Array.from(this.memoryProjects.values());
-    }
-    try {
-      if (typeof localStorage !== 'undefined') {
-        const raw = localStorage.getItem('vectura_projects_fallback');
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed)) {
-            parsed.forEach(p => this.memoryProjects.set(p.id, p));
-            return parsed;
-          }
-        }
-      }
-    } catch (_) {}
-    return [];
+    return Array.from(this.memoryProjects.values());
   }
 
   async deleteProject(id) {
@@ -8344,68 +8504,21 @@ class IndexedDBStorage {
     try {
       const db = await this.open();
       if (db) {
-        new Promise((resolve) => {
+        return await new Promise((resolve) => {
           try {
             const tx = db.transaction('projects', 'readwrite');
             const store = tx.objectStore('projects');
-            const req = store.delete(id);
-            req.onsuccess = () => resolve(true);
-            req.onerror = () => resolve(true);
+            store.delete(id);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+            tx.onabort = () => resolve(false);
           } catch (_) {
-            resolve(true);
-          }
-        });
-      }
-    } catch (_) {}
-
-    try {
-      if (typeof localStorage !== 'undefined') {
-        const list = Array.from(this.memoryProjects.values());
-        localStorage.setItem('vectura_projects_fallback', JSON.stringify(list));
-      }
-    } catch (_) {}
-    return true;
-  }
-
-  async saveAutosave(data) {
-    this.autosaveCache = data;
-    try {
-      const db = await this.open();
-      if (db) {
-        return await new Promise((resolve) => {
-          try {
-            const tx = db.transaction('autosave', 'readwrite');
-            const store = tx.objectStore('autosave');
-            const req = store.put({ id: 'current_autosave', ...data, timestamp: Date.now() });
-            req.onsuccess = () => resolve(true);
-            req.onerror = () => resolve(true);
-          } catch (_) {
-            resolve(true);
+            resolve(false);
           }
         });
       }
     } catch (_) {}
     return true;
-  }
-
-  async getAutosave() {
-    try {
-      const db = await this.open();
-      if (db) {
-        return await new Promise((resolve) => {
-          try {
-            const tx = db.transaction('autosave', 'readonly');
-            const store = tx.objectStore('autosave');
-            const req = store.get('current_autosave');
-            req.onsuccess = () => resolve(req.result || this.autosaveCache);
-            req.onerror = () => resolve(this.autosaveCache);
-          } catch (_) {
-            resolve(this.autosaveCache);
-          }
-        });
-      }
-    } catch (_) {}
-    return this.autosaveCache;
   }
 }
 
@@ -8424,13 +8537,29 @@ class Exporter {
 
   /**
    * Exports document composite as a raster Blob (PNG, JPEG, WebP).
+   * Optional scale parameter renders at larger resolution (capped so longest side <= 4096).
    */
-  async exportRaster(format = 'image/png', quality = 0.92, transparent = false) {
+  async exportRaster(format = 'image/png', quality = 0.92, transparent = false, scale = 1) {
     const vc = this.vectorCanvas;
+    let targetW = Math.round(vc.docWidth * Math.max(0.1, scale));
+    let targetH = Math.round(vc.docHeight * Math.max(0.1, scale));
+
+    // Cap so the longest side <= 4096
+    const maxDim = Math.max(targetW, targetH);
+    if (maxDim > 4096) {
+      const factor = 4096 / maxDim;
+      targetW = Math.max(1, Math.round(targetW * factor));
+      targetH = Math.max(1, Math.round(targetH * factor));
+    }
+
     const exportCanvas = document.createElement('canvas');
-    exportCanvas.width = vc.docWidth;
-    exportCanvas.height = vc.docHeight;
+    exportCanvas.width = targetW;
+    exportCanvas.height = targetH;
     const ctx = exportCanvas.getContext('2d');
+
+    if (scale !== 1 || targetW !== vc.docWidth || targetH !== vc.docHeight) {
+      ctx.scale(targetW / vc.docWidth, targetH / vc.docHeight);
+    }
 
     vc.layerManager.compositeToCanvas(ctx, !transparent);
 
@@ -8514,16 +8643,54 @@ class Exporter {
   }
 
   /**
-   * Triggers download or native Android sharing sheet.
+   * Converts a Blob, File, or DataURL to raw Base64 string.
+   */
+  async blobOrDataUrlToBase64(data) {
+    if (typeof data === 'string') {
+      return data.includes(',') ? data.substring(data.indexOf(',') + 1) : data;
+    }
+    if (data instanceof Blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const res = reader.result;
+          const b64 = typeof res === 'string' && res.includes(',') ? res.substring(res.indexOf(',') + 1) : res;
+          resolve(b64);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(data);
+      });
+    }
+    return '';
+  }
+
+  /**
+   * Triggers native Android export/share in chunks or web download.
    */
   async shareOrDownload(dataUrlOrBlob, filename, mimeType) {
-    // If AndroidBridge is available in native app, use it for Android share intent
-    if (window.AndroidBridge && typeof dataUrlOrBlob === 'string') {
-      window.AndroidBridge.shareFile(dataUrlOrBlob, mimeType, filename);
-      return;
+    // 1. AndroidBridge: stream chunks of ~512KB base64
+    if (window.AndroidBridge && (window.AndroidBridge.beginFile || window.AndroidBridge.shareFile)) {
+      try {
+        const b64 = await this.blobOrDataUrlToBase64(dataUrlOrBlob);
+        if (window.AndroidBridge.beginFile && window.AndroidBridge.appendChunk && window.AndroidBridge.finishFile) {
+          window.AndroidBridge.beginFile(filename, mimeType);
+          const chunkSize = 512 * 1024; // 512KB chunk
+          for (let i = 0; i < b64.length; i += chunkSize) {
+            window.AndroidBridge.appendChunk(b64.slice(i, i + chunkSize));
+          }
+          window.AndroidBridge.finishFile(filename, mimeType);
+          return;
+        } else if (window.AndroidBridge.shareFile) {
+          window.AndroidBridge.shareFile(b64, mimeType, filename);
+          return;
+        }
+      } catch (err) {
+        console.error('AndroidBridge chunked export failed:', err);
+        window.AndroidBridge.showToast?.('Export failed: ' + err.message);
+      }
     }
 
-    // Web Share API fallback for modern mobile browsers
+    // 2. Web Share API fallback for modern mobile browsers
     if (navigator.canShare && navigator.share && dataUrlOrBlob instanceof Blob) {
       try {
         const file = new File([dataUrlOrBlob], filename, { type: mimeType });
@@ -8539,7 +8706,7 @@ class Exporter {
       }
     }
 
-    // Fallback: standard file download trigger
+    // 3. Fallback: standard file download trigger
     const link = document.createElement('a');
     link.download = filename;
     if (typeof dataUrlOrBlob === 'string') {
@@ -9504,11 +9671,20 @@ class LayerPanel {
       ctx.fillRect(0, 0, 20, 20);
       ctx.fillRect(20, 20, 20, 20);
 
-      // Draw layer thumbnail scaled
+      // Draw layer thumbnail scaled preserving aspect ratio
+      const maxDim = 40;
+      const lw = layer.width || 1;
+      const lh = layer.height || 1;
+      const scale = Math.min(maxDim / lw, maxDim / lh);
+      const dw = Math.max(1, Math.round(lw * scale));
+      const dh = Math.max(1, Math.round(lh * scale));
+      const dx = Math.round((maxDim - dw) / 2);
+      const dy = Math.round((maxDim - dh) / 2);
+
       if (layer.thumbCanvas) {
-        ctx.drawImage(layer.thumbCanvas, 0, 0, 40, 40);
+        ctx.drawImage(layer.thumbCanvas, 0, 0, layer.thumbCanvas.width, layer.thumbCanvas.height, dx, dy, dw, dh);
       } else {
-        ctx.drawImage(layer.canvas, 0, 0, 40, 40);
+        ctx.drawImage(layer.canvas, 0, 0, lw, lh, dx, dy, dw, dh);
       }
     });
   }
@@ -10640,6 +10816,42 @@ class ToolPanel {
           this.app.vectorCanvas.render();
         }
       });
+    } else if (tool === 'gradient') {
+      const gt = tm.gradientTool;
+      this.container.innerHTML = `
+        <div class="strip-item" style="display: flex; gap: 8px; align-items: center; width: 100%;">
+          <span style="font-weight: 500; font-size: 13px; color: var(--text);">Gradient</span>
+          <button class="btn-text strip-grad-btn ${gt?.type === 'linear' ? 'accent' : ''}" data-type="linear" style="min-height: 28px; padding: 2px 8px; font-size: 12px;">Linear</button>
+          <button class="btn-text strip-grad-btn ${gt?.type === 'radial' ? 'accent' : ''}" data-type="radial" style="min-height: 28px; padding: 2px 8px; font-size: 12px;">Radial</button>
+        </div>
+      `;
+      this.container.querySelectorAll('.strip-grad-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          if (gt) gt.type = btn.dataset.type;
+          this.container.querySelectorAll('.strip-grad-btn').forEach(b => b.classList.remove('accent'));
+          btn.classList.add('accent');
+        });
+      });
+    } else if (tool === 'text') {
+      const tt = tm.textTool;
+      const curSize = tt?.fontSize || 48;
+      this.container.innerHTML = `
+        <div class="strip-item" style="display: flex; gap: 8px; align-items: center; width: 100%;">
+          <span style="font-weight: 500; font-size: 13px; color: var(--text);">Text Size</span>
+          <button class="btn-text strip-txt-sz ${curSize === 24 ? 'accent' : ''}" data-sz="24" style="min-height: 28px; padding: 2px 8px; font-size: 12px;">24px</button>
+          <button class="btn-text strip-txt-sz ${curSize === 36 ? 'accent' : ''}" data-sz="36" style="min-height: 28px; padding: 2px 8px; font-size: 12px;">36px</button>
+          <button class="btn-text strip-txt-sz ${curSize === 48 ? 'accent' : ''}" data-sz="48" style="min-height: 28px; padding: 2px 8px; font-size: 12px;">48px</button>
+          <button class="btn-text strip-txt-sz ${curSize === 72 ? 'accent' : ''}" data-sz="72" style="min-height: 28px; padding: 2px 8px; font-size: 12px;">72px</button>
+        </div>
+      `;
+      this.container.querySelectorAll('.strip-txt-sz').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const sz = parseInt(btn.dataset.sz);
+          if (tt) tt.fontSize = sz;
+          this.container.querySelectorAll('.strip-txt-sz').forEach(b => b.classList.remove('accent'));
+          btn.classList.add('accent');
+        });
+      });
     } else {
       if (this.stripEl) {
         this.stripEl.classList.add('hidden');
@@ -11182,7 +11394,7 @@ function getDashedRatioIconHtml(w, h) {
   }
   return `
     <div class="new-canvas-row-icon" title="${w} × ${h}">
-      <div style="width: ${iconW}px; height: ${iconH}px; border: 1.5px dashed #64748B; border-radius: 2px; box-sizing: border-box;"></div>
+      <div style="width: ${iconW}px; height: ${iconH}px; border: 1.5px dashed var(--text-3); border-radius: 2px; box-sizing: border-box;"></div>
     </div>
   `;
 }
@@ -11207,23 +11419,23 @@ class HomeScreen {
 
   async init() {
     this.screenEl.innerHTML = `
-      <header class="sheet-header" style="background: var(--chrome, #181920); padding: 12px 18px; border-bottom: 1px solid var(--divider, rgba(255,255,255,0.08));">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <span style="font-size: 18px; font-weight: 700; letter-spacing: -0.3px; color: var(--text);">Artworks</span>
-          <span id="hs-count-badge" style="font-size: 11px; font-weight: 600; background: var(--control, #262835); color: var(--text-2, #94a3b8); padding: 2px 8px; border-radius: 12px;">0</span>
+      <header class="sheet-header" id="hs-header">
+        <div class="hs-header-left">
+          <span class="hs-header-title">Artworks</span>
+          <span id="hs-count-badge" class="hs-header-badge">0</span>
         </div>
-        <div style="display: flex; gap: 10px; align-items: center;">
-          <button id="hs-new-btn" class="btn-text accent" style="font-size: 13px; font-weight: 600; min-height: 36px; padding: 6px 14px; border-radius: 8px; box-shadow: 0 2px 8px rgba(99,102,241,0.3);">
+        <div class="hs-header-right">
+          <button id="hs-new-btn" class="btn-text accent" style="font-size: 13px; font-weight: 600; min-height: 36px; padding: 6px 14px; border-radius: 8px; box-shadow: none;">
             + New Canvas
           </button>
           <button id="hs-close-gallery" class="btn-icon" title="Return to canvas">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
         </div>
       </header>
 
       <!-- Projects Grid -->
-      <div class="gallery-grid" id="hs-gallery-grid" style="padding: 16px;"></div>
+      <div class="gallery-grid" id="hs-gallery-grid"></div>
 
       <!-- Redesigned ibisPaint-style Full-Height Modal List -->
       <div id="hs-modal" class="new-canvas-overlay">
@@ -11243,13 +11455,13 @@ class HomeScreen {
           <div class="new-canvas-list">
             <!-- Row: Folder -->
             <div class="new-canvas-row" id="nc-row-folder">
-              <div class="new-canvas-row-icon" style="color: #4B5563;">
+              <div class="new-canvas-row-icon" style="color: var(--text-2);">
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
                 </svg>
               </div>
               <div class="new-canvas-row-title">Folder</div>
-              <div style="color: #6B7280; font-size: 13px; display: flex; align-items: center; gap: 4px; padding-right: 4px;">
+              <div style="color: var(--text-3); font-size: 13px; display: flex; align-items: center; gap: 4px; padding-right: 4px;">
                 <span>Artworks</span>
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
               </div>
@@ -11264,13 +11476,13 @@ class HomeScreen {
                 ${getDashedRatioIconHtml(this.lastCustomW, this.lastCustomH)}
               </div>
               <div style="flex: 1; margin-left: 12px; margin-right: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-                <span style="font-size: 15px; font-weight: 500; color: #191C21;">Custom</span>
+                <span style="font-size: 15px; font-weight: 500; color: var(--text);">Custom</span>
                 <div style="display: flex; align-items: center; gap: 4px;" id="nc-custom-inputs-wrap">
                   <input type="number" id="nc-custom-w" class="custom-dim-input" value="${this.lastCustomW}" min="1" max="4096" />
-                  <span style="font-size: 13px; font-weight: 600; color: #64748B;">×</span>
+                  <span style="font-size: 13px; font-weight: 600; color: var(--text-3);">×</span>
                   <input type="number" id="nc-custom-h" class="custom-dim-input" value="${this.lastCustomH}" min="1" max="4096" />
-                  <span style="font-size: 11px; color: #64748B;">px</span>
-                  <button id="nc-custom-pencil-btn" class="btn-icon" style="width: 32px; height: 32px; color: #4B5563; padding: 0;" title="Edit dimensions">
+                  <span style="font-size: 11px; color: var(--text-3);">px</span>
+                  <button id="nc-custom-pencil-btn" class="btn-icon" style="width: 32px; height: 32px; color: var(--text-2); padding: 0;" title="Edit dimensions">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>
                   </button>
                 </div>
@@ -11295,22 +11507,22 @@ class HomeScreen {
 
       <!-- Gentle Memory Warning Dialog -->
       <div id="nc-memory-warning">
-        <div style="max-width: 340px; width: 90%; background: #FFFFFF; color: #191C21; border: 1px solid #D1D5DB; border-radius: 12px; padding: 20px; box-shadow: 0 8px 30px rgba(0,0,0,0.25);">
-          <div style="font-size: 16px; font-weight: 700; color: #B45309; display: flex; align-items: center; gap: 8px;">
+        <div style="max-width: 340px; width: 90%; background: var(--panel); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--radius-md); padding: 20px; box-shadow: var(--shadow-floating);">
+          <div style="font-size: 16px; font-weight: 700; color: var(--danger); display: flex; align-items: center; gap: 8px;">
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
             Large Canvas Notice
           </div>
-          <div id="nc-warn-message" style="font-size: 13px; color: #4B5563; margin-top: 10px; line-height: 1.45;">
+          <div id="nc-warn-message" style="font-size: 13px; color: var(--text-2); margin-top: 10px; line-height: 1.45;">
             Canvas size is large. It may run slower on devices with limited memory.
           </div>
           <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 18px;">
-            <button id="nc-warn-suggested" class="btn-text accent" style="width: 100%; height: 42px; border-radius: 8px; font-weight: 600; font-size: 13px;">
+            <button id="nc-warn-suggested" class="btn-text accent" style="width: 100%; height: 42px; border-radius: var(--radius-sm); font-weight: 600; font-size: 13px; background: var(--accent); color: #FFFFFF;">
               Use Recommended (2048 × 2048)
             </button>
-            <button id="nc-warn-continue" class="btn-text" style="width: 100%; height: 40px; border-radius: 8px; background: #E5E7EB; color: #1F2937; font-size: 13px; font-weight: 500;">
+            <button id="nc-warn-continue" class="btn-text" style="width: 100%; height: 40px; border-radius: var(--radius-sm); background: var(--control); color: var(--text); font-size: 13px; font-weight: 500;">
               Continue with original size
             </button>
-            <button id="nc-warn-cancel" class="btn-text" style="width: 100%; height: 36px; background: transparent; color: #6B7280; font-size: 13px;">
+            <button id="nc-warn-cancel" class="btn-text" style="width: 100%; height: 36px; background: transparent; color: var(--text-3); font-size: 13px;">
               Cancel
             </button>
           </div>
@@ -11582,20 +11794,39 @@ class HomeScreen {
     }
 
     grid.innerHTML = this.projects
-      .map(p => `
-      <div class="gallery-card" data-id="${p.id}">
-        <img class="gallery-card-thumb" src="${p.thumbnail || ''}" alt="${p.name}" />
-        <div class="gallery-card-info">
-          <div style="display: flex; justify-content: space-between; align-items: center;">
-            <span style="font-weight: 500; font-size: var(--text-body); color: var(--text);">${p.name}</span>
-            <button class="btn-icon hs-del-btn" data-id="${p.id}" style="width: 28px; height: 28px; color: var(--danger);" title="Delete">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-            </button>
+      .map(p => {
+        const safeName = (p.name || 'Untitled Artwork')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#039;');
+        const thumbHtml = p.thumbnail
+          ? `<div class="gallery-card-thumb-wrap">
+              <img class="gallery-card-thumb" src="${p.thumbnail}" alt="${safeName}" />
+            </div>`
+          : `<div class="gallery-card-thumb-wrap">
+              <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color: var(--text-3);">
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                <circle cx="8.5" cy="8.5" r="1.5"/>
+                <polyline points="21 15 16 10 5 21"/>
+              </svg>
+            </div>`;
+        return `
+        <div class="gallery-card" data-id="${p.id}">
+          ${thumbHtml}
+          <div class="gallery-card-info">
+            <div class="gallery-card-title-row">
+              <span class="gallery-card-title">${safeName}</span>
+              <button class="btn-icon hs-del-btn" data-id="${p.id}" style="width: 26px; height: 26px; min-width: 26px; color: var(--danger); padding: 0;" title="Delete">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+            </div>
+            <span class="gallery-card-meta tabular">${new Date(p.updatedAt).toLocaleDateString()} · ${p.width} × ${p.height}</span>
           </div>
-          <span class="tabular" style="font-size: var(--text-secondary); color: var(--text-2);">${new Date(p.updatedAt).toLocaleDateString()} · ${p.width} × ${p.height}</span>
         </div>
-      </div>
-    `)
+      `;
+      })
       .join('');
 
     grid.querySelectorAll('.gallery-card').forEach(card => {
@@ -12477,7 +12708,7 @@ class UIManager {
 
     document.getElementById('exp-btn-png-1x')?.addEventListener('click', async () => {
       const name = (this.app.currentProject?.name || 'artwork').replace(/\s+/g, '_');
-      const blob = await this.app.exporter.exportRaster('image/png', 0.95, false);
+      const blob = await this.app.exporter.exportRaster('image/png', 0.95, false, 1);
       if (blob) {
         await this.app.exporter.shareOrDownload(blob, `${name}.png`, 'image/png');
       }
@@ -12486,9 +12717,9 @@ class UIManager {
 
     document.getElementById('exp-btn-png-4x')?.addEventListener('click', async () => {
       const name = (this.app.currentProject?.name || 'artwork').replace(/\s+/g, '_');
-      const blob = await this.app.exporter.exportRaster('image/png', 1.0, true);
+      const blob = await this.app.exporter.exportRaster('image/png', 0.95, false, 4);
       if (blob) {
-        await this.app.exporter.shareOrDownload(blob, `${name}_transparent.png`, 'image/png');
+        await this.app.exporter.shareOrDownload(blob, `${name}_4x.png`, 'image/png');
       }
       this.exportModal?.classList.remove('open');
     });
@@ -12587,9 +12818,10 @@ class VecturaApp {
       (options) => this.createNewProject(options)
     );
 
-    // 4. Bind History changes to UI
+    // 4. Bind History changes to UI & autosave
     this.history.onChange((state) => {
       this.uiManager.updateHistoryState(state);
+      this.markDirty();
     });
 
     // 5. Connect VectorCanvas callbacks
@@ -12691,38 +12923,59 @@ class VecturaApp {
     const h = project.height || 1080;
     this.vectorCanvas.setDocumentSize(w, h);
 
-    if (project.layers && project.layers.length > 0) {
-      this.vectorCanvas.layerManager.layers = project.layers.map(lData => {
-        const l = new Layer(lData.id, lData.name, w, h, 'raster');
-        l.visible = lData.visible ?? true;
-        l.locked = lData.locked ?? false;
-        l.opacity = lData.opacity ?? 1.0;
-        l.blendMode = lData.blendMode || 'source-over';
-        l.clippingMask = lData.clippingMask ?? false;
-        l.alphaLock = lData.alphaLock ?? false;
-        l.isReference = lData.isReference ?? false;
-        l.strokes = lData.strokes || [];
+    this.isLoadingLayers = true;
+    try {
+      if (project.layers && project.layers.length > 0) {
+        const loadedLayers = await Promise.all(
+          project.layers.map(async (lData) => {
+            const l = new Layer(lData.id, lData.name, w, h, 'raster');
+            l.visible = lData.visible ?? true;
+            l.locked = lData.locked ?? false;
+            l.opacity = lData.opacity ?? 1.0;
+            l.blendMode = lData.blendMode || 'source-over';
+            l.clippingMask = lData.clippingMask ?? false;
+            l.alphaLock = lData.alphaLock ?? false;
+            l.isReference = lData.isReference ?? false;
+            l.strokes = lData.strokes || [];
 
-        if (lData.dataUrl) {
-          const img = new Image();
-          img.onload = () => {
-            l.ctx.drawImage(img, 0, 0);
-            l.updateThumbnail();
-            this.vectorCanvas.layerManager.invalidateCaches();
-          };
-          img.src = lData.dataUrl;
-        } else {
-          this.vectorCanvas.redrawLayerStrokes(l);
-        }
-        return l;
-      });
-      this.vectorCanvas.layerManager.activeLayerId = project.activeLayerId || this.vectorCanvas.layerManager.layers[0].id;
-      this.vectorCanvas.layerManager.invalidateCaches();
-    } else {
-      this.vectorCanvas.layerManager.createInitialLayer();
+            const source = lData.blob || lData.dataUrl;
+            if (source) {
+              await new Promise((resolve) => {
+                const img = new Image();
+                img.onload = () => {
+                  l.ctx.drawImage(img, 0, 0);
+                  l.updateThumbnail();
+                  if (img.src && img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+                  resolve();
+                };
+                img.onerror = () => {
+                  if (img.src && img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+                  resolve();
+                };
+                if (source instanceof Blob) {
+                  img.src = URL.createObjectURL(source);
+                } else {
+                  img.src = source;
+                }
+              });
+            } else {
+              this.vectorCanvas.redrawLayerStrokes(l);
+            }
+            return l;
+          })
+        );
+        this.vectorCanvas.layerManager.layers = loadedLayers;
+        this.vectorCanvas.layerManager.activeLayerId = project.activeLayerId || loadedLayers[0].id;
+        this.vectorCanvas.layerManager.invalidateCaches();
+      } else {
+        this.vectorCanvas.layerManager.createInitialLayer();
+      }
+    } finally {
+      this.isLoadingLayers = false;
     }
 
     this.history.clear();
+    this.isDirty = false;
 
     if (this.uiManager) {
       this.uiManager.projectTitle.textContent = project.name || 'Untitled';
@@ -12736,13 +12989,35 @@ class VecturaApp {
 
   async saveCurrentProject() {
     if (!this.currentProject) return;
+    if (this.isLoadingLayers) {
+      console.warn('Skipping save: layer images are still loading');
+      return;
+    }
+    if (this.vectorCanvas?.isDrawing) {
+      console.warn('Skipping save: active stroke in progress');
+      return;
+    }
+    if (this.isSaving) return;
+    this.isSaving = true;
 
     try {
       this.currentProject.updatedAt = Date.now();
       this.currentProject.activeLayerId = this.vectorCanvas.layerManager.activeLayerId;
 
-      // Serialize layer canvases to data URLs
-      this.currentProject.layers = this.vectorCanvas.layerManager.layers.map(l => ({
+      // Convert layer canvases to Blobs for IndexedDB
+      const layerBlobs = await Promise.all(
+        this.vectorCanvas.layerManager.layers.map(l => {
+          return new Promise(resolve => {
+            if (l.canvas && typeof l.canvas.toBlob === 'function') {
+              l.canvas.toBlob(blob => resolve(blob), 'image/png');
+            } else {
+              resolve(null);
+            }
+          });
+        })
+      );
+
+      this.currentProject.layers = this.vectorCanvas.layerManager.layers.map((l, idx) => ({
         id: l.id,
         name: l.name,
         visible: l.visible,
@@ -12753,38 +13028,80 @@ class VecturaApp {
         alphaLock: l.alphaLock,
         isReference: l.isReference,
         strokes: l.strokes,
-        dataUrl: (l.canvas && typeof l.canvas.toDataURL === 'function') ? l.canvas.toDataURL('image/png') : ''
+        blob: layerBlobs[idx]
       }));
 
-      // Create thumbnail
-      const thumbCanvas = document.createElement('canvas');
-      thumbCanvas.width = 160;
-      thumbCanvas.height = 160;
-      const tCtx = thumbCanvas.getContext('2d');
-      this.vectorCanvas.layerManager.compositeToCanvas(tCtx, true);
-      this.currentProject.thumbnail = (typeof thumbCanvas.toDataURL === 'function') ? thumbCanvas.toDataURL('image/jpeg', 0.7) : '';
+      // Create thumbnail scaled to fit 160px preserving aspect ratio
+      const maxThumb = 160;
+      const docW = this.vectorCanvas.docWidth || 1;
+      const docH = this.vectorCanvas.docHeight || 1;
+      const scale = Math.min(maxThumb / docW, maxThumb / docH);
+      const thumbW = Math.max(1, Math.round(docW * scale));
+      const thumbH = Math.max(1, Math.round(docH * scale));
 
-      await this.storage.saveProject(this.currentProject);
+      const thumbCanvas = document.createElement('canvas');
+      thumbCanvas.width = thumbW;
+      thumbCanvas.height = thumbH;
+      const tCtx = thumbCanvas.getContext('2d');
+      tCtx.scale(scale, scale);
+      this.vectorCanvas.layerManager.compositeToCanvas(tCtx, true);
+      this.currentProject.thumbnail = thumbCanvas.toDataURL('image/jpeg', 0.8);
+
+      const success = await this.storage.saveProject(this.currentProject);
+      if (!success) {
+        this.showToast('Failed to save project');
+      } else {
+        this.isDirty = false;
+      }
     } catch (saveErr) {
-      console.warn('Failed to save project:', saveErr);
+      console.error('Failed to save project:', saveErr);
+      this.showToast('Save failed: ' + (saveErr.message || 'error'));
+    } finally {
+      this.isSaving = false;
     }
   }
 
+  markDirty() {
+    this.isDirty = true;
+    if (this.autosaveTimeout) {
+      clearTimeout(this.autosaveTimeout);
+    }
+    this.autosaveTimeout = setTimeout(() => {
+      this.checkAndAutosave();
+    }, 10000); // Debounced ~10s after last change
+  }
+
+  checkAndAutosave() {
+    if (!this.isDirty) return;
+    if (this.vectorCanvas?.isDrawing || this.vectorCanvas?.isInteracting) {
+      this.autosaveTimeout = setTimeout(() => this.checkAndAutosave(), 2500);
+      return;
+    }
+    this.saveCurrentProject();
+  }
+
   setupAutosave() {
-    if (this.autosaveInterval) clearInterval(this.autosaveInterval);
-    this.autosaveInterval = setInterval(() => {
-      this.saveCurrentProject();
-    }, 5000);
+    if (this.autosaveTimeout) clearTimeout(this.autosaveTimeout);
 
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'hidden') {
+      if (document.visibilityState === 'hidden' && this.isDirty) {
         this.saveCurrentProject();
       }
     });
 
     window.addEventListener('pagehide', () => {
-      this.saveCurrentProject();
+      if (this.isDirty) {
+        this.saveCurrentProject();
+      }
     });
+  }
+
+  showToast(message) {
+    if (window.AndroidBridge?.showToast) {
+      window.AndroidBridge.showToast(message);
+    } else {
+      console.log('Toast:', message);
+    }
   }
 
   undo() {

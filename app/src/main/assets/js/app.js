@@ -68,9 +68,10 @@ class VecturaApp {
       (options) => this.createNewProject(options)
     );
 
-    // 4. Bind History changes to UI
+    // 4. Bind History changes to UI & autosave
     this.history.onChange((state) => {
       this.uiManager.updateHistoryState(state);
+      this.markDirty();
     });
 
     // 5. Connect VectorCanvas callbacks
@@ -172,38 +173,59 @@ class VecturaApp {
     const h = project.height || 1080;
     this.vectorCanvas.setDocumentSize(w, h);
 
-    if (project.layers && project.layers.length > 0) {
-      this.vectorCanvas.layerManager.layers = project.layers.map(lData => {
-        const l = new Layer(lData.id, lData.name, w, h, 'raster');
-        l.visible = lData.visible ?? true;
-        l.locked = lData.locked ?? false;
-        l.opacity = lData.opacity ?? 1.0;
-        l.blendMode = lData.blendMode || 'source-over';
-        l.clippingMask = lData.clippingMask ?? false;
-        l.alphaLock = lData.alphaLock ?? false;
-        l.isReference = lData.isReference ?? false;
-        l.strokes = lData.strokes || [];
+    this.isLoadingLayers = true;
+    try {
+      if (project.layers && project.layers.length > 0) {
+        const loadedLayers = await Promise.all(
+          project.layers.map(async (lData) => {
+            const l = new Layer(lData.id, lData.name, w, h, 'raster');
+            l.visible = lData.visible ?? true;
+            l.locked = lData.locked ?? false;
+            l.opacity = lData.opacity ?? 1.0;
+            l.blendMode = lData.blendMode || 'source-over';
+            l.clippingMask = lData.clippingMask ?? false;
+            l.alphaLock = lData.alphaLock ?? false;
+            l.isReference = lData.isReference ?? false;
+            l.strokes = lData.strokes || [];
 
-        if (lData.dataUrl) {
-          const img = new Image();
-          img.onload = () => {
-            l.ctx.drawImage(img, 0, 0);
-            l.updateThumbnail();
-            this.vectorCanvas.layerManager.invalidateCaches();
-          };
-          img.src = lData.dataUrl;
-        } else {
-          this.vectorCanvas.redrawLayerStrokes(l);
-        }
-        return l;
-      });
-      this.vectorCanvas.layerManager.activeLayerId = project.activeLayerId || this.vectorCanvas.layerManager.layers[0].id;
-      this.vectorCanvas.layerManager.invalidateCaches();
-    } else {
-      this.vectorCanvas.layerManager.createInitialLayer();
+            const source = lData.blob || lData.dataUrl;
+            if (source) {
+              await new Promise((resolve) => {
+                const img = new Image();
+                img.onload = () => {
+                  l.ctx.drawImage(img, 0, 0);
+                  l.updateThumbnail();
+                  if (img.src && img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+                  resolve();
+                };
+                img.onerror = () => {
+                  if (img.src && img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+                  resolve();
+                };
+                if (source instanceof Blob) {
+                  img.src = URL.createObjectURL(source);
+                } else {
+                  img.src = source;
+                }
+              });
+            } else {
+              this.vectorCanvas.redrawLayerStrokes(l);
+            }
+            return l;
+          })
+        );
+        this.vectorCanvas.layerManager.layers = loadedLayers;
+        this.vectorCanvas.layerManager.activeLayerId = project.activeLayerId || loadedLayers[0].id;
+        this.vectorCanvas.layerManager.invalidateCaches();
+      } else {
+        this.vectorCanvas.layerManager.createInitialLayer();
+      }
+    } finally {
+      this.isLoadingLayers = false;
     }
 
     this.history.clear();
+    this.isDirty = false;
 
     if (this.uiManager) {
       this.uiManager.projectTitle.textContent = project.name || 'Untitled';
@@ -217,13 +239,35 @@ class VecturaApp {
 
   async saveCurrentProject() {
     if (!this.currentProject) return;
+    if (this.isLoadingLayers) {
+      console.warn('Skipping save: layer images are still loading');
+      return;
+    }
+    if (this.vectorCanvas?.isDrawing) {
+      console.warn('Skipping save: active stroke in progress');
+      return;
+    }
+    if (this.isSaving) return;
+    this.isSaving = true;
 
     try {
       this.currentProject.updatedAt = Date.now();
       this.currentProject.activeLayerId = this.vectorCanvas.layerManager.activeLayerId;
 
-      // Serialize layer canvases to data URLs
-      this.currentProject.layers = this.vectorCanvas.layerManager.layers.map(l => ({
+      // Convert layer canvases to Blobs for IndexedDB
+      const layerBlobs = await Promise.all(
+        this.vectorCanvas.layerManager.layers.map(l => {
+          return new Promise(resolve => {
+            if (l.canvas && typeof l.canvas.toBlob === 'function') {
+              l.canvas.toBlob(blob => resolve(blob), 'image/png');
+            } else {
+              resolve(null);
+            }
+          });
+        })
+      );
+
+      this.currentProject.layers = this.vectorCanvas.layerManager.layers.map((l, idx) => ({
         id: l.id,
         name: l.name,
         visible: l.visible,
@@ -234,38 +278,80 @@ class VecturaApp {
         alphaLock: l.alphaLock,
         isReference: l.isReference,
         strokes: l.strokes,
-        dataUrl: (l.canvas && typeof l.canvas.toDataURL === 'function') ? l.canvas.toDataURL('image/png') : ''
+        blob: layerBlobs[idx]
       }));
 
-      // Create thumbnail
-      const thumbCanvas = document.createElement('canvas');
-      thumbCanvas.width = 160;
-      thumbCanvas.height = 160;
-      const tCtx = thumbCanvas.getContext('2d');
-      this.vectorCanvas.layerManager.compositeToCanvas(tCtx, true);
-      this.currentProject.thumbnail = (typeof thumbCanvas.toDataURL === 'function') ? thumbCanvas.toDataURL('image/jpeg', 0.7) : '';
+      // Create thumbnail scaled to fit 160px preserving aspect ratio
+      const maxThumb = 160;
+      const docW = this.vectorCanvas.docWidth || 1;
+      const docH = this.vectorCanvas.docHeight || 1;
+      const scale = Math.min(maxThumb / docW, maxThumb / docH);
+      const thumbW = Math.max(1, Math.round(docW * scale));
+      const thumbH = Math.max(1, Math.round(docH * scale));
 
-      await this.storage.saveProject(this.currentProject);
+      const thumbCanvas = document.createElement('canvas');
+      thumbCanvas.width = thumbW;
+      thumbCanvas.height = thumbH;
+      const tCtx = thumbCanvas.getContext('2d');
+      tCtx.scale(scale, scale);
+      this.vectorCanvas.layerManager.compositeToCanvas(tCtx, true);
+      this.currentProject.thumbnail = thumbCanvas.toDataURL('image/jpeg', 0.8);
+
+      const success = await this.storage.saveProject(this.currentProject);
+      if (!success) {
+        this.showToast('Failed to save project');
+      } else {
+        this.isDirty = false;
+      }
     } catch (saveErr) {
-      console.warn('Failed to save project:', saveErr);
+      console.error('Failed to save project:', saveErr);
+      this.showToast('Save failed: ' + (saveErr.message || 'error'));
+    } finally {
+      this.isSaving = false;
     }
   }
 
+  markDirty() {
+    this.isDirty = true;
+    if (this.autosaveTimeout) {
+      clearTimeout(this.autosaveTimeout);
+    }
+    this.autosaveTimeout = setTimeout(() => {
+      this.checkAndAutosave();
+    }, 10000); // Debounced ~10s after last change
+  }
+
+  checkAndAutosave() {
+    if (!this.isDirty) return;
+    if (this.vectorCanvas?.isDrawing || this.vectorCanvas?.isInteracting) {
+      this.autosaveTimeout = setTimeout(() => this.checkAndAutosave(), 2500);
+      return;
+    }
+    this.saveCurrentProject();
+  }
+
   setupAutosave() {
-    if (this.autosaveInterval) clearInterval(this.autosaveInterval);
-    this.autosaveInterval = setInterval(() => {
-      this.saveCurrentProject();
-    }, 5000);
+    if (this.autosaveTimeout) clearTimeout(this.autosaveTimeout);
 
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'hidden') {
+      if (document.visibilityState === 'hidden' && this.isDirty) {
         this.saveCurrentProject();
       }
     });
 
     window.addEventListener('pagehide', () => {
-      this.saveCurrentProject();
+      if (this.isDirty) {
+        this.saveCurrentProject();
+      }
     });
+  }
+
+  showToast(message) {
+    if (window.AndroidBridge?.showToast) {
+      window.AndroidBridge.showToast(message);
+    } else {
+      console.log('Toast:', message);
+    }
   }
 
   undo() {

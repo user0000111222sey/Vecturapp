@@ -18,7 +18,7 @@ import { CoherentNoise } from './CoherentNoise.js';
 import { Viewport } from './Viewport.js';
 import { LayerManager } from '../layers/LayerManager.js';
 import { ToolManager } from '../tools/ToolManager.js';
-import { StrokeCommand, RasterCommand } from '../history/Command.js';
+import { StrokeCommand, RasterCommand, cropBoundingBox } from '../history/Command.js';
 
 function cloneCanvas(sourceCanvas) {
   if (!sourceCanvas) return null;
@@ -291,6 +291,13 @@ export class VectorCanvas {
     if (this.isNavigating || performance.now() - (this.lastNavigationTime || 0) < 250) {
       return;
     }
+    // Prevent duplicated touch & mouse events firing for the same input
+    if (e.pointerType === 'mouse' && performance.now() - (this.lastTouchTime || 0) < 500) {
+      return;
+    }
+    if (e.pointerType === 'touch') {
+      this.lastTouchTime = performance.now();
+    }
     if (e.pointerType === 'mouse') {
       try {
         this.viewportCanvas.setPointerCapture(e.pointerId);
@@ -402,6 +409,37 @@ export class VectorCanvas {
         return;
       } else if (this.toolManager.activeTool === 'gradient') {
         this.toolManager.gradientTool.start(world.x, world.y);
+        return;
+      } else if (this.toolManager.activeTool === 'text') {
+        if (activeLayer && !activeLayer.locked) {
+          try {
+            const text = prompt('Enter text:');
+            if (text && text.trim()) {
+              const fontSize = this.toolManager.textTool?.fontSize || 48;
+              const approxW = text.trim().length * fontSize * 0.8;
+              const approxH = fontSize * 1.5;
+              const bbox = {
+                x: Math.max(0, Math.floor(world.x - 4)),
+                y: Math.max(0, Math.floor(world.y - 4)),
+                width: Math.min(this.docWidth, Math.ceil(approxW + 8)),
+                height: Math.min(this.docHeight, Math.ceil(approxH + 8))
+              };
+              const beforeSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+              this.toolManager.textTool.commitText(activeLayer, text.trim(), world.x, world.y, this.currentColor);
+              const afterSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+              if (this.history) {
+                this.history.push(new RasterCommand('Add Text', activeLayer, beforeSnapshot, afterSnapshot, () => {
+                  this.layerManager.invalidateCaches();
+                }));
+              }
+              this.layerManager.invalidateCaches();
+              this.render();
+            }
+          } catch (textErr) {
+            console.error('Text tool error:', textErr);
+            this.showToast('Text tool error: ' + (textErr.message || 'failed'));
+          }
+        }
         return;
       }
 
@@ -624,39 +662,70 @@ export class VectorCanvas {
       return;
     }
 
-    // Tool commits with unified Command pattern
+    // Tool commits with unified Command pattern (cropped bounding-box snapshots)
     const activeLayer = this.layerManager.getActiveLayer();
     if (activeLayer && !activeLayer.locked) {
-      if (this.toolManager.activeTool === 'lasso-fill' && this.toolManager.lassoFill.active) {
-        const beforeCanvas = cloneCanvas(activeLayer.canvas);
-        this.toolManager.lassoFill.finish(activeLayer, this.currentColor, false);
-        const afterCanvas = cloneCanvas(activeLayer.canvas);
-        this.layerManager.invalidateCaches();
-        if (this.history) {
-          this.history.push(new RasterCommand('Lasso Fill', activeLayer, beforeCanvas, afterCanvas, () => {
-            this.layerManager.invalidateCaches();
-          }));
+      try {
+        if (this.toolManager.activeTool === 'lasso-fill' && this.toolManager.lassoFill.active) {
+          const pts = this.toolManager.lassoFill.points;
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          for (const p of pts) {
+            if (p.x < minX) minX = p.x;
+            if (p.x > maxX) maxX = p.x;
+            if (p.y < minY) minY = p.y;
+            if (p.y > maxY) maxY = p.y;
+          }
+          const bbox = pts.length > 0 ? {
+            x: Math.max(0, Math.floor(minX - 4)),
+            y: Math.max(0, Math.floor(minY - 4)),
+            width: Math.min(this.docWidth, Math.ceil(maxX - minX + 8)),
+            height: Math.min(this.docHeight, Math.ceil(maxY - minY + 8))
+          } : null;
+          const beforeSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+          this.toolManager.lassoFill.finish(activeLayer, this.currentColor, false);
+          const afterSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+          this.layerManager.invalidateCaches();
+          if (this.history) {
+            this.history.push(new RasterCommand('Lasso Fill', activeLayer, beforeSnapshot, afterSnapshot, () => {
+              this.layerManager.invalidateCaches();
+            }));
+          }
+        } else if (this.toolManager.activeTool === 'shape' && this.toolManager.shapeTool.active) {
+          const st = this.toolManager.shapeTool;
+          const strokeW = this.currentBrush?.size || 4;
+          const minX = Math.min(st.startX, st.currentX) - strokeW - 4;
+          const minY = Math.min(st.startY, st.currentY) - strokeW - 4;
+          const maxX = Math.max(st.startX, st.currentX) + strokeW + 4;
+          const maxY = Math.max(st.startY, st.currentY) + strokeW + 4;
+          const bbox = {
+            x: Math.max(0, Math.floor(minX)),
+            y: Math.max(0, Math.floor(minY)),
+            width: Math.min(this.docWidth, Math.ceil(maxX - minX)),
+            height: Math.min(this.docHeight, Math.ceil(maxY - minY))
+          };
+          const beforeSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+          st.commit(activeLayer, this.currentColor, strokeW);
+          const afterSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+          this.layerManager.invalidateCaches();
+          if (this.history) {
+            this.history.push(new RasterCommand('Draw Shape', activeLayer, beforeSnapshot, afterSnapshot, () => {
+              this.layerManager.invalidateCaches();
+            }));
+          }
+        } else if (this.toolManager.activeTool === 'gradient' && this.toolManager.gradientTool.active) {
+          const beforeSnapshot = cropBoundingBox(activeLayer.canvas, null);
+          this.toolManager.gradientTool.commit(activeLayer, this.currentColor, '#ffffff');
+          const afterSnapshot = cropBoundingBox(activeLayer.canvas, null);
+          this.layerManager.invalidateCaches();
+          if (this.history) {
+            this.history.push(new RasterCommand('Linear Gradient', activeLayer, beforeSnapshot, afterSnapshot, () => {
+              this.layerManager.invalidateCaches();
+            }));
+          }
         }
-      } else if (this.toolManager.activeTool === 'shape' && this.toolManager.shapeTool.active) {
-        const beforeCanvas = cloneCanvas(activeLayer.canvas);
-        this.toolManager.shapeTool.commit(activeLayer, this.currentColor, this.currentBrush?.size || 4);
-        const afterCanvas = cloneCanvas(activeLayer.canvas);
-        this.layerManager.invalidateCaches();
-        if (this.history) {
-          this.history.push(new RasterCommand('Draw Shape', activeLayer, beforeCanvas, afterCanvas, () => {
-            this.layerManager.invalidateCaches();
-          }));
-        }
-      } else if (this.toolManager.activeTool === 'gradient' && this.toolManager.gradientTool.active) {
-        const beforeCanvas = cloneCanvas(activeLayer.canvas);
-        this.toolManager.gradientTool.commit(activeLayer, this.currentColor, '#ffffff');
-        const afterCanvas = cloneCanvas(activeLayer.canvas);
-        this.layerManager.invalidateCaches();
-        if (this.history) {
-          this.history.push(new RasterCommand('Linear Gradient', activeLayer, beforeCanvas, afterCanvas, () => {
-            this.layerManager.invalidateCaches();
-          }));
-        }
+      } catch (toolCommitErr) {
+        console.error('Tool commit failed:', toolCommitErr);
+        this.showToast('Tool error: ' + (toolCommitErr.message || 'action failed'));
       }
     }
 
@@ -824,44 +893,81 @@ export class VectorCanvas {
     }
   }
 
+  getStrokeBoundingBox(stroke, docWidth, docHeight) {
+    if (!stroke || !stroke.points || stroke.points.length === 0) {
+      return null;
+    }
+    const brushSize = stroke.brushSnapshot?.size || 30;
+    const padding = Math.max(24, Math.ceil(brushSize * 2.5));
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of stroke.points) {
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.y > maxY) maxY = p.y;
+    }
+    const x = Math.max(0, Math.floor(minX - padding));
+    const y = Math.max(0, Math.floor(minY - padding));
+    const right = Math.min(docWidth, Math.ceil(maxX + padding));
+    const bottom = Math.min(docHeight, Math.ceil(maxY + padding));
+    const width = Math.max(1, right - x);
+    const height = Math.max(1, bottom - y);
+    return { x, y, width, height };
+  }
+
+  showToast(msg) {
+    if (window.AndroidBridge?.showToast) {
+      window.AndroidBridge.showToast(msg);
+    } else {
+      console.warn('[Vectura Toast]', msg);
+    }
+  }
+
   finishStroke() {
     if (!this.isDrawing || !this.currentStroke) return;
     this.isDrawing = false;
     this.activePointerId = null;
 
-    const catchUp = this.stabilizer.finish();
-    if (catchUp && catchUp.length > 0) {
-      for (const pt of catchUp) {
-        this.currentStroke.points.push(pt);
+    try {
+      const catchUp = this.stabilizer.finish();
+      if (catchUp && catchUp.length > 0) {
+        for (const pt of catchUp) {
+          this.currentStroke.points.push(pt);
+        }
       }
+
+      const activeLayer = this.layerManager.getActiveLayer();
+      if (activeLayer && !activeLayer.locked) {
+        if (!this.currentStroke.isEraser) {
+          this.renderStrokeToLayer(activeLayer, this.currentStroke);
+        }
+        const bbox = this.getStrokeBoundingBox(this.currentStroke, this.docWidth, this.docHeight);
+        const beforeSnapshot = cropBoundingBox(this.beforeStrokeCanvas, bbox);
+        const afterSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+
+        if (this.history) {
+          const cmd = new StrokeCommand(
+            activeLayer,
+            this.currentStroke,
+            (l) => {
+              this.layerManager.invalidateCaches();
+            },
+            beforeSnapshot,
+            afterSnapshot
+          );
+          this.history.push(cmd);
+        }
+      }
+    } catch (strokeErr) {
+      console.error('finishStroke error:', strokeErr);
+      this.showToast('Stroke error: ' + (strokeErr.message || 'failed'));
+    } finally {
+      this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+      this.currentStroke = null;
+      this.beforeStrokeCanvas = null;
+      this.lastStampRadius = null;
+      this.layerManager.invalidateCaches();
     }
-
-    const activeLayer = this.layerManager.getActiveLayer();
-    if (activeLayer && !activeLayer.locked) {
-      if (!this.currentStroke.isEraser) {
-        this.renderStrokeToLayer(activeLayer, this.currentStroke);
-      }
-      const afterCanvas = cloneCanvas(activeLayer.canvas);
-
-      if (this.history) {
-        const cmd = new StrokeCommand(
-          activeLayer,
-          this.currentStroke,
-          (l) => {
-            this.layerManager.invalidateCaches();
-          },
-          this.beforeStrokeCanvas,
-          afterCanvas
-        );
-        this.history.push(cmd);
-      }
-    }
-
-    this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
-    this.currentStroke = null;
-    this.beforeStrokeCanvas = null;
-    this.lastStampRadius = null;
-    this.layerManager.invalidateCaches();
   }
 
   cancelStroke() {
@@ -1193,17 +1299,22 @@ export class VectorCanvas {
    * Input is NOT blocked. Committed as one undoable step with RasterCommand.
    */
   commitFillWithAnimation(info) {
-    const { startX, startY, maxRadius, patchCanvas, activeLayer, animate, duration } = info;
+    const { startX, startY, maxRadius, patchCanvas, activeLayer, animate, duration, bbox } = info;
     this.onHaptic?.();
 
-    const beforeCanvas = cloneCanvas(activeLayer.canvas);
+    const beforeSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
 
     const commitToHistory = () => {
-      const afterCanvas = cloneCanvas(activeLayer.canvas);
-      if (this.history) {
-        this.history.push(new RasterCommand('Fill Bucket', activeLayer, beforeCanvas, afterCanvas, () => {
-          this.layerManager.invalidateCaches();
-        }));
+      try {
+        const afterSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
+        if (this.history) {
+          this.history.push(new RasterCommand('Fill Bucket', activeLayer, beforeSnapshot, afterSnapshot, () => {
+            this.layerManager.invalidateCaches();
+          }));
+        }
+      } catch (err) {
+        console.error('Fill commit error:', err);
+        this.showToast('Fill commit failed: ' + (err.message || 'error'));
       }
     };
 

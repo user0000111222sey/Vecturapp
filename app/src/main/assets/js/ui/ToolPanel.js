@@ -262,6 +262,42 @@ export class ToolPanel {
           this.app.vectorCanvas.render();
         }
       });
+    } else if (tool === 'gradient') {
+      const gt = tm.gradientTool;
+      this.container.innerHTML = `
+        <div class="strip-item" style="display: flex; gap: 8px; align-items: center; width: 100%;">
+          <span style="font-weight: 500; font-size: 13px; color: var(--text);">Gradient</span>
+          <button class="btn-text strip-grad-btn ${gt?.type === 'linear' ? 'accent' : ''}" data-type="linear" style="min-height: 28px; padding: 2px 8px; font-size: 12px;">Linear</button>
+          <button class="btn-text strip-grad-btn ${gt?.type === 'radial' ? 'accent' : ''}" data-type="radial" style="min-height: 28px; padding: 2px 8px; font-size: 12px;">Radial</button>
+        </div>
+      `;
+      this.container.querySelectorAll('.strip-grad-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          if (gt) gt.type = btn.dataset.type;
+          this.container.querySelectorAll('.strip-grad-btn').forEach(b => b.classList.remove('accent'));
+          btn.classList.add('accent');
+        });
+      });
+    } else if (tool === 'text') {
+      const tt = tm.textTool;
+      const curSize = tt?.fontSize || 48;
+      this.container.innerHTML = `
+        <div class="strip-item" style="display: flex; gap: 8px; align-items: center; width: 100%;">
+          <span style="font-weight: 500; font-size: 13px; color: var(--text);">Text Size</span>
+          <button class="btn-text strip-txt-sz ${curSize === 24 ? 'accent' : ''}" data-sz="24" style="min-height: 28px; padding: 2px 8px; font-size: 12px;">24px</button>
+          <button class="btn-text strip-txt-sz ${curSize === 36 ? 'accent' : ''}" data-sz="36" style="min-height: 28px; padding: 2px 8px; font-size: 12px;">36px</button>
+          <button class="btn-text strip-txt-sz ${curSize === 48 ? 'accent' : ''}" data-sz="48" style="min-height: 28px; padding: 2px 8px; font-size: 12px;">48px</button>
+          <button class="btn-text strip-txt-sz ${curSize === 72 ? 'accent' : ''}" data-sz="72" style="min-height: 28px; padding: 2px 8px; font-size: 12px;">72px</button>
+        </div>
+      `;
+      this.container.querySelectorAll('.strip-txt-sz').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const sz = parseInt(btn.dataset.sz);
+          if (tt) tt.fontSize = sz;
+          this.container.querySelectorAll('.strip-txt-sz').forEach(b => b.classList.remove('accent'));
+          btn.classList.add('accent');
+        });
+      });
     } else {
       if (this.stripEl) {
         this.stripEl.classList.add('hidden');

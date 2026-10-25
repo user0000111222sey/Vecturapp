@@ -161,6 +161,12 @@ export class FillBucket {
     const d4 = Math.hypot(startX - maxX, startY - maxY);
     const maxRadius = Math.max(d1, d2, d3, d4, 30);
 
+    const pad = Math.abs(this.expand) + 2;
+    const bx = Math.max(0, minX - pad);
+    const by = Math.max(0, minY - pad);
+    const bw = Math.min(w - bx, (maxX - minX + 1) + pad * 2);
+    const bh = Math.min(h - by, (maxY - minY + 1) + pad * 2);
+
     onAnimatedCommit?.({
       startX,
       startY,
@@ -169,7 +175,8 @@ export class FillBucket {
       activeLayer,
       fillColorHex,
       animate: this.animateFill,
-      duration: this.animationDuration
+      duration: this.animationDuration,
+      bbox: { x: bx, y: by, width: bw, height: bh }
     });
 
     return true;

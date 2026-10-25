@@ -1,11 +1,6 @@
 /**
  * Vectura Unified Command Pattern & Central History System
- * Every action must go through it:
- * - strokes, erase, fill, lasso fill, shapes, gradient, text
- * - layer add/delete/duplicate/merge/reorder/rename/opacity/blend mode/visibility/lock/clipping/clear
- * - canvas property changes (resize document, etc.)
- *
- * Stores exact raster snapshots or serialized states for 100% deterministic, instant undo/redo.
+ * Stores cropped bounding-box snapshots to preserve low memory footprint.
  */
 
 export class Command {
@@ -15,19 +10,40 @@ export class Command {
   }
   execute() {}
   undo() {}
+  release() {}
 }
 
 /**
- * Creates an offline canvas copy of a layer or canvas for snapshotting.
+ * Crops a bounding box region from a canvas. If bbox is null, crops full canvas.
  */
-function cloneCanvas(sourceCanvas) {
-  if (!sourceCanvas) return null;
-  const clone = document.createElement('canvas');
-  clone.width = sourceCanvas.width;
-  clone.height = sourceCanvas.height;
-  const ctx = clone.getContext('2d');
-  ctx.drawImage(sourceCanvas, 0, 0);
-  return clone;
+export function cropBoundingBox(canvas, bbox = null) {
+  if (!canvas) return null;
+  const cw = canvas.width || 1;
+  const ch = canvas.height || 1;
+
+  let x = bbox ? Math.max(0, Math.floor(bbox.x)) : 0;
+  let y = bbox ? Math.max(0, Math.floor(bbox.y)) : 0;
+  let w = bbox ? Math.min(cw - x, Math.ceil(bbox.width)) : cw;
+  let h = bbox ? Math.min(ch - y, Math.ceil(bbox.height)) : ch;
+
+  if (w <= 0 || h <= 0) {
+    x = 0; y = 0; w = cw; h = ch;
+  }
+
+  const crop = document.createElement('canvas');
+  crop.width = w;
+  crop.height = h;
+  const ctx = crop.getContext('2d');
+  ctx.drawImage(canvas, x, y, w, h, 0, 0, w, h);
+
+  return {
+    canvas: crop,
+    x,
+    y,
+    width: w,
+    height: h,
+    byteSize: w * h * 4
+  };
 }
 
 /**
@@ -53,23 +69,26 @@ export function areCanvasesIdentical(c1, c2) {
  * Command for brush and eraser raster strokes.
  */
 export class StrokeCommand extends Command {
-  constructor(layer, stroke, onRedraw, beforeCanvas = null, afterCanvas = null) {
+  constructor(layer, stroke, onRedraw, beforeSnapshot = null, afterSnapshot = null) {
     super(stroke?.isEraser ? 'Erase Stroke' : 'Draw Stroke');
     this.layerId = layer.id;
     this.layer = layer;
     this.stroke = stroke;
     this.onRedraw = onRedraw;
-    this.beforeCanvas = beforeCanvas ? cloneCanvas(beforeCanvas) : null;
-    this.afterCanvas = afterCanvas ? cloneCanvas(afterCanvas) : null;
+
+    // Snapshot can be pre-cropped object or raw canvas
+    this.beforeSnapshot = beforeSnapshot && beforeSnapshot.canvas ? beforeSnapshot : cropBoundingBox(beforeSnapshot);
+    this.afterSnapshot = afterSnapshot && afterSnapshot.canvas ? afterSnapshot : cropBoundingBox(afterSnapshot);
   }
 
   execute(layerManager = null) {
     const targetLayer = layerManager ? layerManager.getLayer(this.layerId) : this.layer;
     if (!targetLayer) return;
 
-    if (this.afterCanvas) {
-      targetLayer.ctx.clearRect(0, 0, targetLayer.width, targetLayer.height);
-      targetLayer.ctx.drawImage(this.afterCanvas, 0, 0);
+    if (this.afterSnapshot) {
+      const { canvas, x, y, width, height } = this.afterSnapshot;
+      targetLayer.ctx.clearRect(x, y, width, height);
+      targetLayer.ctx.drawImage(canvas, x, y);
       targetLayer.updateThumbnail();
       this.onRedraw?.(targetLayer, false);
       return;
@@ -82,9 +101,10 @@ export class StrokeCommand extends Command {
     const targetLayer = layerManager ? layerManager.getLayer(this.layerId) : this.layer;
     if (!targetLayer) return;
 
-    if (this.beforeCanvas) {
-      targetLayer.ctx.clearRect(0, 0, targetLayer.width, targetLayer.height);
-      targetLayer.ctx.drawImage(this.beforeCanvas, 0, 0);
+    if (this.beforeSnapshot) {
+      const { canvas, x, y, width, height } = this.beforeSnapshot;
+      targetLayer.ctx.clearRect(x, y, width, height);
+      targetLayer.ctx.drawImage(canvas, x, y);
       targetLayer.updateThumbnail();
       this.onRedraw?.(targetLayer, false);
       return;
@@ -95,50 +115,81 @@ export class StrokeCommand extends Command {
       this.onRedraw?.(targetLayer, true);
     }
   }
+
+  release() {
+    if (this.beforeSnapshot?.canvas) {
+      this.beforeSnapshot.canvas.width = 1;
+      this.beforeSnapshot.canvas.height = 1;
+    }
+    if (this.afterSnapshot?.canvas) {
+      this.afterSnapshot.canvas.width = 1;
+      this.afterSnapshot.canvas.height = 1;
+    }
+  }
 }
 
 /**
  * Command for raster modifications: Fill Bucket, Lasso Fill, Shapes, Gradients, Text, Clear.
  */
 export class RasterCommand extends Command {
-  constructor(name, layer, beforeCanvas, afterCanvas, onRedraw) {
+  constructor(name, layer, beforeCanvasOrSnapshot, afterCanvasOrSnapshot, onRedraw, bbox = null) {
     super(name);
     this.layerId = layer.id;
     this.layer = layer;
-    this.beforeCanvas = cloneCanvas(beforeCanvas);
-    this.afterCanvas = cloneCanvas(afterCanvas);
     this.onRedraw = onRedraw;
+
+    this.beforeSnapshot = beforeCanvasOrSnapshot && beforeCanvasOrSnapshot.canvas
+      ? beforeCanvasOrSnapshot
+      : cropBoundingBox(beforeCanvasOrSnapshot, bbox);
+
+    this.afterSnapshot = afterCanvasOrSnapshot && afterCanvasOrSnapshot.canvas
+      ? afterCanvasOrSnapshot
+      : cropBoundingBox(afterCanvasOrSnapshot, bbox);
   }
 
   execute(layerManager = null) {
     const targetLayer = layerManager ? layerManager.getLayer(this.layerId) : this.layer;
-    if (!targetLayer || !this.afterCanvas) return;
-    targetLayer.ctx.clearRect(0, 0, targetLayer.width, targetLayer.height);
-    targetLayer.ctx.drawImage(this.afterCanvas, 0, 0);
+    if (!targetLayer || !this.afterSnapshot) return;
+
+    const { canvas, x, y, width, height } = this.afterSnapshot;
+    targetLayer.ctx.clearRect(x, y, width, height);
+    targetLayer.ctx.drawImage(canvas, x, y);
     targetLayer.updateThumbnail();
     this.onRedraw?.(targetLayer);
   }
 
   undo(layerManager = null) {
     const targetLayer = layerManager ? layerManager.getLayer(this.layerId) : this.layer;
-    if (!targetLayer || !this.beforeCanvas) return;
-    targetLayer.ctx.clearRect(0, 0, targetLayer.width, targetLayer.height);
-    targetLayer.ctx.drawImage(this.beforeCanvas, 0, 0);
+    if (!targetLayer || !this.beforeSnapshot) return;
+
+    const { canvas, x, y, width, height } = this.beforeSnapshot;
+    targetLayer.ctx.clearRect(x, y, width, height);
+    targetLayer.ctx.drawImage(canvas, x, y);
     targetLayer.updateThumbnail();
     this.onRedraw?.(targetLayer);
+  }
+
+  release() {
+    if (this.beforeSnapshot?.canvas) {
+      this.beforeSnapshot.canvas.width = 1;
+      this.beforeSnapshot.canvas.height = 1;
+    }
+    if (this.afterSnapshot?.canvas) {
+      this.afterSnapshot.canvas.width = 1;
+      this.afterSnapshot.canvas.height = 1;
+    }
   }
 }
 
 /**
- * Command for structural Layer operations:
- * Add, Delete, Duplicate, Merge, Reorder, Rename, Opacity, BlendMode, Visibility, Lock, Clipping.
+ * Command for structural Layer operations.
  */
 export class LayerCommand extends Command {
   constructor(name, layerManager, beforeState, afterState, onComplete) {
     super(name);
     this.layerManager = layerManager;
-    this.beforeState = beforeState; // snapshot created via layerManager.createSnapshot()
-    this.afterState = afterState;   // snapshot created via layerManager.createSnapshot()
+    this.beforeState = beforeState;
+    this.afterState = afterState;
     this.onComplete = onComplete;
   }
 
@@ -155,6 +206,8 @@ export class LayerCommand extends Command {
       this.onComplete?.();
     }
   }
+
+  release() {}
 }
 
 /**
@@ -178,4 +231,6 @@ export class CanvasPropertyCommand extends Command {
     this.vectorCanvas.applyDocProperties(this.beforeProps);
     this.onComplete?.();
   }
+
+  release() {}
 }

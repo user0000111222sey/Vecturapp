@@ -70,11 +70,18 @@ export class Layer {
 
   updateThumbnail() {
     this.thumbCtx.clearRect(0, 0, 64, 64);
-    // Draw scaled down
+    const maxDim = 64;
+    const w = this.width || 1;
+    const h = this.height || 1;
+    const scale = Math.min(maxDim / w, maxDim / h);
+    const dw = Math.max(1, Math.round(w * scale));
+    const dh = Math.max(1, Math.round(h * scale));
+    const dx = Math.round((maxDim - dw) / 2);
+    const dy = Math.round((maxDim - dh) / 2);
     this.thumbCtx.drawImage(
       this.canvas,
-      0, 0, this.width, this.height,
-      0, 0, 64, 64
+      0, 0, w, h,
+      dx, dy, dw, dh
     );
   }
 

@@ -842,7 +842,7 @@ export class UIManager {
 
     document.getElementById('exp-btn-png-1x')?.addEventListener('click', async () => {
       const name = (this.app.currentProject?.name || 'artwork').replace(/\s+/g, '_');
-      const blob = await this.app.exporter.exportRaster('image/png', 0.95, false);
+      const blob = await this.app.exporter.exportRaster('image/png', 0.95, false, 1);
       if (blob) {
         await this.app.exporter.shareOrDownload(blob, `${name}.png`, 'image/png');
       }
@@ -851,9 +851,9 @@ export class UIManager {
 
     document.getElementById('exp-btn-png-4x')?.addEventListener('click', async () => {
       const name = (this.app.currentProject?.name || 'artwork').replace(/\s+/g, '_');
-      const blob = await this.app.exporter.exportRaster('image/png', 1.0, true);
+      const blob = await this.app.exporter.exportRaster('image/png', 0.95, false, 4);
       if (blob) {
-        await this.app.exporter.shareOrDownload(blob, `${name}_transparent.png`, 'image/png');
+        await this.app.exporter.shareOrDownload(blob, `${name}_4x.png`, 'image/png');
       }
       this.exportModal?.classList.remove('open');
     });

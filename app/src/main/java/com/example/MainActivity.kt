@@ -102,7 +102,6 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView(wv: WebView) {
-        wv.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         wv.isVerticalScrollBarEnabled = false
         wv.isHorizontalScrollBarEnabled = false
         wv.overScrollMode = View.OVER_SCROLL_NEVER
@@ -171,6 +170,14 @@ class MainActivity : ComponentActivity() {
                 }
                 return true
             }
+
+            override fun onRenderProcessGone(view: WebView?, detail: android.webkit.RenderProcessGoneDetail?): Boolean {
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Renderer refreshed. Recovering canvas...", Toast.LENGTH_SHORT).show()
+                    view?.loadUrl("file:///android_asset/index.html")
+                }
+                return true
+            }
         }
 
         wv.loadUrl("file:///android_asset/index.html")
@@ -195,6 +202,10 @@ class MainActivity : ComponentActivity() {
     }
 
     inner class AndroidBridge(private val context: Context) {
+
+        private var currentExportStream: java.io.ByteArrayOutputStream? = null
+        private var currentExportFilename: String = ""
+        private var currentExportMimeType: String = ""
 
         @JavascriptInterface
         fun isAndroid(): Boolean = true
@@ -243,35 +254,106 @@ class MainActivity : ComponentActivity() {
         }
 
         @JavascriptInterface
-        fun shareFile(base64Data: String, mimeType: String, filename: String) {
+        fun beginFile(filename: String, mimeType: String) {
             try {
-                val cleanData = if (base64Data.contains(",")) base64Data.substringAfter(",") else base64Data
-                val bytes = Base64.decode(cleanData, Base64.DEFAULT)
+                currentExportFilename = sanitizeFilename(filename)
+                currentExportMimeType = mimeType
+                currentExportStream = java.io.ByteArrayOutputStream()
+            } catch (e: Exception) {
+                showToast("Export error: ${e.localizedMessage ?: "initialization failed"}")
+            }
+        }
 
+        @JavascriptInterface
+        fun appendChunk(base64Chunk: String) {
+            try {
+                val stream = currentExportStream ?: return
+                val cleanChunk = if (base64Chunk.contains(",")) base64Chunk.substringAfter(",") else base64Chunk
+                if (cleanChunk.isNotEmpty()) {
+                    val bytes = Base64.decode(cleanChunk, Base64.DEFAULT)
+                    stream.write(bytes)
+                }
+            } catch (e: Exception) {
+                showToast("Export write error: ${e.localizedMessage ?: "chunk failed"}")
+            }
+        }
+
+        @JavascriptInterface
+        fun finishFile(filename: String, mimeType: String) {
+            try {
+                val stream = currentExportStream
+                if (stream == null || stream.size() == 0) {
+                    showToast("Export failed: empty file")
+                    currentExportStream = null
+                    return
+                }
+                val safeName = sanitizeFilename(filename.ifEmpty { currentExportFilename })
+                val safeMime = mimeType.ifEmpty { currentExportMimeType.ifEmpty { "image/png" } }
+                val bytes = stream.toByteArray()
+                currentExportStream = null
+
+                // Save to MediaStore Pictures/Vectura without permissions on API 29+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    try {
+                        val contentValues = android.content.ContentValues().apply {
+                            put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, safeName)
+                            put(android.provider.MediaStore.MediaColumns.MIME_TYPE, safeMime)
+                            put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/Vectura")
+                            put(android.provider.MediaStore.MediaColumns.IS_PENDING, 1)
+                        }
+                        val collection = if (safeMime.startsWith("image/")) {
+                            android.provider.MediaStore.Images.Media.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                        } else {
+                            android.provider.MediaStore.Downloads.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                        }
+                        val savedUri = context.contentResolver.insert(collection, contentValues)
+                        if (savedUri != null) {
+                            context.contentResolver.openOutputStream(savedUri)?.use { out ->
+                                out.write(bytes)
+                            }
+                            contentValues.clear()
+                            contentValues.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0)
+                            context.contentResolver.update(savedUri, contentValues, null, null)
+                        }
+                    } catch (e: Exception) {
+                        // Fall back to cache sharing if MediaStore fails
+                    }
+                }
+
+                // Write to cacheDir for instant FileProvider share sheet
                 val sharedDir = File(context.cacheDir, "shared")
                 if (!sharedDir.exists()) sharedDir.mkdirs()
-
-                val outFile = File(sharedDir, filename)
+                val outFile = File(sharedDir, safeName)
                 FileOutputStream(outFile).use { it.write(bytes) }
 
-                val contentUri = FileProvider.getUriForFile(
+                val shareUri = FileProvider.getUriForFile(
                     context,
                     "${context.packageName}.fileprovider",
                     outFile
                 )
 
+                showToast("Saved $safeName to Pictures/Vectura")
+
                 val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                    type = mimeType
-                    putExtra(Intent.EXTRA_STREAM, contentUri)
+                    type = safeMime
+                    putExtra(Intent.EXTRA_STREAM, shareUri)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
-
-                val chooser = Intent.createChooser(shareIntent, "Share artwork")
-                chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                val chooser = Intent.createChooser(shareIntent, "Share $safeName").apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
                 context.startActivity(chooser)
             } catch (e: Exception) {
-                e.printStackTrace()
+                showToast("Export failed: ${e.localizedMessage ?: "Unknown error"}")
+                currentExportStream = null
             }
+        }
+
+        @JavascriptInterface
+        fun shareFile(base64Data: String, mimeType: String, filename: String) {
+            beginFile(filename, mimeType)
+            appendChunk(base64Data)
+            finishFile(filename, mimeType)
         }
 
         @JavascriptInterface
@@ -279,6 +361,11 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
             }
+        }
+
+        private fun sanitizeFilename(name: String): String {
+            val sanitized = name.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            return if (sanitized.isBlank()) "artwork_${System.currentTimeMillis()}" else sanitized
         }
     }
 }

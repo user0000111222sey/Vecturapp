@@ -142,7 +142,7 @@ function getDashedRatioIconHtml(w, h) {
   }
   return `
     <div class="new-canvas-row-icon" title="${w} × ${h}">
-      <div style="width: ${iconW}px; height: ${iconH}px; border: 1.5px dashed #64748B; border-radius: 2px; box-sizing: border-box;"></div>
+      <div style="width: ${iconW}px; height: ${iconH}px; border: 1.5px dashed var(--text-3); border-radius: 2px; box-sizing: border-box;"></div>
     </div>
   `;
 }
@@ -167,23 +167,23 @@ export class HomeScreen {
 
   async init() {
     this.screenEl.innerHTML = `
-      <header class="sheet-header" style="background: var(--chrome, #181920); padding: 12px 18px; border-bottom: 1px solid var(--divider, rgba(255,255,255,0.08));">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <span style="font-size: 18px; font-weight: 700; letter-spacing: -0.3px; color: var(--text);">Artworks</span>
-          <span id="hs-count-badge" style="font-size: 11px; font-weight: 600; background: var(--control, #262835); color: var(--text-2, #94a3b8); padding: 2px 8px; border-radius: 12px;">0</span>
+      <header class="sheet-header" id="hs-header">
+        <div class="hs-header-left">
+          <span class="hs-header-title">Artworks</span>
+          <span id="hs-count-badge" class="hs-header-badge">0</span>
         </div>
-        <div style="display: flex; gap: 10px; align-items: center;">
-          <button id="hs-new-btn" class="btn-text accent" style="font-size: 13px; font-weight: 600; min-height: 36px; padding: 6px 14px; border-radius: 8px; box-shadow: 0 2px 8px rgba(99,102,241,0.3);">
+        <div class="hs-header-right">
+          <button id="hs-new-btn" class="btn-text accent" style="font-size: 13px; font-weight: 600; min-height: 36px; padding: 6px 14px; border-radius: 8px; box-shadow: none;">
             + New Canvas
           </button>
           <button id="hs-close-gallery" class="btn-icon" title="Return to canvas">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
         </div>
       </header>
 
       <!-- Projects Grid -->
-      <div class="gallery-grid" id="hs-gallery-grid" style="padding: 16px;"></div>
+      <div class="gallery-grid" id="hs-gallery-grid"></div>
 
       <!-- Redesigned ibisPaint-style Full-Height Modal List -->
       <div id="hs-modal" class="new-canvas-overlay">
@@ -203,13 +203,13 @@ export class HomeScreen {
           <div class="new-canvas-list">
             <!-- Row: Folder -->
             <div class="new-canvas-row" id="nc-row-folder">
-              <div class="new-canvas-row-icon" style="color: #4B5563;">
+              <div class="new-canvas-row-icon" style="color: var(--text-2);">
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
                 </svg>
               </div>
               <div class="new-canvas-row-title">Folder</div>
-              <div style="color: #6B7280; font-size: 13px; display: flex; align-items: center; gap: 4px; padding-right: 4px;">
+              <div style="color: var(--text-3); font-size: 13px; display: flex; align-items: center; gap: 4px; padding-right: 4px;">
                 <span>Artworks</span>
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
               </div>
@@ -224,13 +224,13 @@ export class HomeScreen {
                 ${getDashedRatioIconHtml(this.lastCustomW, this.lastCustomH)}
               </div>
               <div style="flex: 1; margin-left: 12px; margin-right: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-                <span style="font-size: 15px; font-weight: 500; color: #191C21;">Custom</span>
+                <span style="font-size: 15px; font-weight: 500; color: var(--text);">Custom</span>
                 <div style="display: flex; align-items: center; gap: 4px;" id="nc-custom-inputs-wrap">
                   <input type="number" id="nc-custom-w" class="custom-dim-input" value="${this.lastCustomW}" min="1" max="4096" />
-                  <span style="font-size: 13px; font-weight: 600; color: #64748B;">×</span>
+                  <span style="font-size: 13px; font-weight: 600; color: var(--text-3);">×</span>
                   <input type="number" id="nc-custom-h" class="custom-dim-input" value="${this.lastCustomH}" min="1" max="4096" />
-                  <span style="font-size: 11px; color: #64748B;">px</span>
-                  <button id="nc-custom-pencil-btn" class="btn-icon" style="width: 32px; height: 32px; color: #4B5563; padding: 0;" title="Edit dimensions">
+                  <span style="font-size: 11px; color: var(--text-3);">px</span>
+                  <button id="nc-custom-pencil-btn" class="btn-icon" style="width: 32px; height: 32px; color: var(--text-2); padding: 0;" title="Edit dimensions">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>
                   </button>
                 </div>
@@ -255,22 +255,22 @@ export class HomeScreen {
 
       <!-- Gentle Memory Warning Dialog -->
       <div id="nc-memory-warning">
-        <div style="max-width: 340px; width: 90%; background: #FFFFFF; color: #191C21; border: 1px solid #D1D5DB; border-radius: 12px; padding: 20px; box-shadow: 0 8px 30px rgba(0,0,0,0.25);">
-          <div style="font-size: 16px; font-weight: 700; color: #B45309; display: flex; align-items: center; gap: 8px;">
+        <div style="max-width: 340px; width: 90%; background: var(--panel); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--radius-md); padding: 20px; box-shadow: var(--shadow-floating);">
+          <div style="font-size: 16px; font-weight: 700; color: var(--danger); display: flex; align-items: center; gap: 8px;">
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
             Large Canvas Notice
           </div>
-          <div id="nc-warn-message" style="font-size: 13px; color: #4B5563; margin-top: 10px; line-height: 1.45;">
+          <div id="nc-warn-message" style="font-size: 13px; color: var(--text-2); margin-top: 10px; line-height: 1.45;">
             Canvas size is large. It may run slower on devices with limited memory.
           </div>
           <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 18px;">
-            <button id="nc-warn-suggested" class="btn-text accent" style="width: 100%; height: 42px; border-radius: 8px; font-weight: 600; font-size: 13px;">
+            <button id="nc-warn-suggested" class="btn-text accent" style="width: 100%; height: 42px; border-radius: var(--radius-sm); font-weight: 600; font-size: 13px; background: var(--accent); color: #FFFFFF;">
               Use Recommended (2048 × 2048)
             </button>
-            <button id="nc-warn-continue" class="btn-text" style="width: 100%; height: 40px; border-radius: 8px; background: #E5E7EB; color: #1F2937; font-size: 13px; font-weight: 500;">
+            <button id="nc-warn-continue" class="btn-text" style="width: 100%; height: 40px; border-radius: var(--radius-sm); background: var(--control); color: var(--text); font-size: 13px; font-weight: 500;">
               Continue with original size
             </button>
-            <button id="nc-warn-cancel" class="btn-text" style="width: 100%; height: 36px; background: transparent; color: #6B7280; font-size: 13px;">
+            <button id="nc-warn-cancel" class="btn-text" style="width: 100%; height: 36px; background: transparent; color: var(--text-3); font-size: 13px;">
               Cancel
             </button>
           </div>
@@ -542,20 +542,39 @@ export class HomeScreen {
     }
 
     grid.innerHTML = this.projects
-      .map(p => `
-      <div class="gallery-card" data-id="${p.id}">
-        <img class="gallery-card-thumb" src="${p.thumbnail || ''}" alt="${p.name}" />
-        <div class="gallery-card-info">
-          <div style="display: flex; justify-content: space-between; align-items: center;">
-            <span style="font-weight: 500; font-size: var(--text-body); color: var(--text);">${p.name}</span>
-            <button class="btn-icon hs-del-btn" data-id="${p.id}" style="width: 28px; height: 28px; color: var(--danger);" title="Delete">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-            </button>
+      .map(p => {
+        const safeName = (p.name || 'Untitled Artwork')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#039;');
+        const thumbHtml = p.thumbnail
+          ? `<div class="gallery-card-thumb-wrap">
+              <img class="gallery-card-thumb" src="${p.thumbnail}" alt="${safeName}" />
+            </div>`
+          : `<div class="gallery-card-thumb-wrap">
+              <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color: var(--text-3);">
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                <circle cx="8.5" cy="8.5" r="1.5"/>
+                <polyline points="21 15 16 10 5 21"/>
+              </svg>
+            </div>`;
+        return `
+        <div class="gallery-card" data-id="${p.id}">
+          ${thumbHtml}
+          <div class="gallery-card-info">
+            <div class="gallery-card-title-row">
+              <span class="gallery-card-title">${safeName}</span>
+              <button class="btn-icon hs-del-btn" data-id="${p.id}" style="width: 26px; height: 26px; min-width: 26px; color: var(--danger); padding: 0;" title="Delete">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+            </div>
+            <span class="gallery-card-meta tabular">${new Date(p.updatedAt).toLocaleDateString()} · ${p.width} × ${p.height}</span>
           </div>
-          <span class="tabular" style="font-size: var(--text-secondary); color: var(--text-2);">${new Date(p.updatedAt).toLocaleDateString()} · ${p.width} × ${p.height}</span>
         </div>
-      </div>
-    `)
+      `;
+      })
       .join('');
 
     grid.querySelectorAll('.gallery-card').forEach(card => {
