@@ -6411,17 +6411,59 @@ class TextTool {
     this.italic = false;
   }
 
+  getFontStyle() {
+    return `${this.italic ? 'italic ' : ''}${this.bold ? 'bold ' : ''}${this.fontSize}px ${this.fontFamily}`;
+  }
+
+  measureTextBounds(ctx, text, x, y) {
+    if (!text) return { x, y, width: 0, height: 0, lines: [], lineHeight: 0 };
+
+    ctx.save();
+    ctx.font = this.getFontStyle();
+    ctx.textBaseline = 'top';
+
+    const lines = text.split('\n');
+    const lineHeight = Math.round(this.fontSize * 1.25);
+    let maxLineWidth = 0;
+
+    for (const line of lines) {
+      const metrics = ctx.measureText(line);
+      const w = metrics.width || (line.length * this.fontSize * 0.6);
+      if (w > maxLineWidth) {
+        maxLineWidth = w;
+      }
+    }
+
+    const totalHeight = Math.max(lineHeight, lines.length * lineHeight);
+    ctx.restore();
+
+    return {
+      x,
+      y,
+      width: Math.ceil(maxLineWidth),
+      height: Math.ceil(totalHeight),
+      lineHeight,
+      lines
+    };
+  }
+
   commitText(layer, text, x, y, colorHex) {
     if (!text || !layer) return null;
 
-    const fontStyle = `${this.italic ? 'italic ' : ''}${this.bold ? 'bold ' : ''}${this.fontSize}px ${this.fontFamily}`;
-
     const ctx = layer.ctx;
+    const bounds = this.measureTextBounds(ctx, text, x, y);
+    const fontStyle = this.getFontStyle();
+
     ctx.save();
     ctx.font = fontStyle;
     ctx.fillStyle = colorHex;
     ctx.textBaseline = 'top';
-    ctx.fillText(text, x, y);
+
+    let curY = y;
+    for (const line of bounds.lines) {
+      ctx.fillText(line, x, curY);
+      curY += bounds.lineHeight;
+    }
     ctx.restore();
 
     layer.updateThumbnail();
@@ -6435,7 +6477,7 @@ class TextTool {
       color: colorHex
     };
     layer.addStroke(textOp);
-    return textOp;
+    return bounds;
   }
 }
 
@@ -7278,17 +7320,17 @@ class VectorCanvas {
           try {
             const text = prompt('Enter text:');
             if (text && text.trim()) {
-              const fontSize = this.toolManager.textTool?.fontSize || 48;
-              const approxW = text.trim().length * fontSize * 0.8;
-              const approxH = fontSize * 1.5;
+              const tt = this.toolManager.textTool;
+              const bounds = tt.measureTextBounds(activeLayer.ctx, text.trim(), world.x, world.y);
+              const padding = 12;
               const bbox = {
-                x: Math.max(0, Math.floor(world.x - 4)),
-                y: Math.max(0, Math.floor(world.y - 4)),
-                width: Math.min(this.docWidth, Math.ceil(approxW + 8)),
-                height: Math.min(this.docHeight, Math.ceil(approxH + 8))
+                x: Math.max(0, Math.floor(bounds.x - padding)),
+                y: Math.max(0, Math.floor(bounds.y - padding)),
+                width: Math.min(this.docWidth, Math.ceil(bounds.width + padding * 2)),
+                height: Math.min(this.docHeight, Math.ceil(bounds.height + padding * 2))
               };
               const beforeSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
-              this.toolManager.textTool.commitText(activeLayer, text.trim(), world.x, world.y, this.currentColor);
+              tt.commitText(activeLayer, text.trim(), world.x, world.y, this.currentColor);
               const afterSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
               if (this.history) {
                 this.history.push(new RasterCommand('Add Text', activeLayer, beforeSnapshot, afterSnapshot, () => {
@@ -9479,17 +9521,22 @@ class ColorPicker {
 
 
 class LayerPanel {
-  constructor(containerEl, layerManager, onLayerChanged, history = null) {
+  constructor(containerEl, layerManager, onLayerChanged, history = null, app = null) {
     this.container = containerEl;
     this.layerManager = layerManager;
     this.onLayerChanged = onLayerChanged;
     this.history = history;
+    this.app = app;
 
     this.render();
   }
 
   setHistory(history) {
     this.history = history;
+  }
+
+  setApp(app) {
+    this.app = app;
   }
 
   executeLayerOp(name, action, includePixels = false) {
@@ -9518,6 +9565,7 @@ class LayerPanel {
       this.history.push(new LayerCommand(name, lm, beforeState, afterState, () => {
         this.render();
         this.onLayerChanged?.();
+        this.app?.markDirty?.();
       }));
     }
 
@@ -9527,6 +9575,7 @@ class LayerPanel {
     } catch (err) {
       console.warn('onLayerChanged error caught:', err);
     }
+    this.app?.markDirty?.();
   }
 
   render() {
@@ -9813,6 +9862,7 @@ class LayerPanel {
         active.opacity = val / 100;
         lm.invalidateCaches();
         this.onLayerChanged?.();
+        this.app?.markDirty?.();
       }
     });
 
@@ -12006,8 +12056,10 @@ class UIManager {
         const active = this.vc.layerManager.getActiveLayer();
         this.vc.toolManager.setTool(this.activeTool, active);
         this.vc.render();
+        this.app.markDirty();
       },
-      this.app.history
+      this.app.history,
+      this.app
     );
 
     // 3. Brush Panel
@@ -12833,6 +12885,11 @@ class VecturaApp {
     this.vectorCanvas.onUndoRequested = () => this.undo();
     this.vectorCanvas.onRedoRequested = () => this.redo();
     this.vectorCanvas.onHaptic = () => this.triggerHaptic();
+    this.vectorCanvas.onStrokeFinished = () => {
+      if (this.pendingSave) {
+        this.saveCurrentProject();
+      }
+    };
 
     // 6. Setup Autosave & Lifecycle hooks
     this.setupAutosave();
@@ -12924,6 +12981,7 @@ class VecturaApp {
     this.vectorCanvas.setDocumentSize(w, h);
 
     this.isLoadingLayers = true;
+    let anyDecodeFailed = false;
     try {
       if (project.layers && project.layers.length > 0) {
         const loadedLayers = await Promise.all(
@@ -12940,17 +12998,18 @@ class VecturaApp {
 
             const source = lData.blob || lData.dataUrl;
             if (source) {
-              await new Promise((resolve) => {
+              const decodedOk = await new Promise((resolve) => {
                 const img = new Image();
                 img.onload = () => {
                   l.ctx.drawImage(img, 0, 0);
                   l.updateThumbnail();
                   if (img.src && img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
-                  resolve();
+                  resolve(true);
                 };
                 img.onerror = () => {
+                  console.error('Failed to decode layer image for layer:', lData.id, lData.name);
                   if (img.src && img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
-                  resolve();
+                  resolve(false);
                 };
                 if (source instanceof Blob) {
                   img.src = URL.createObjectURL(source);
@@ -12958,6 +13017,9 @@ class VecturaApp {
                   img.src = source;
                 }
               });
+              if (!decodedOk) {
+                anyDecodeFailed = true;
+              }
             } else {
               this.vectorCanvas.redrawLayerStrokes(l);
             }
@@ -12972,6 +13034,13 @@ class VecturaApp {
       }
     } finally {
       this.isLoadingLayers = false;
+    }
+
+    if (anyDecodeFailed) {
+      this.saveBlockedDueToDecodeError = true;
+      this.showToast('Warning: layer failed to load. Saving is disabled to protect artwork.');
+    } else {
+      this.saveBlockedDueToDecodeError = false;
     }
 
     this.history.clear();
@@ -12989,15 +13058,25 @@ class VecturaApp {
 
   async saveCurrentProject() {
     if (!this.currentProject) return;
+    if (this.saveBlockedDueToDecodeError) {
+      console.warn('Saving blocked: a layer image failed to decode when this project was loaded');
+      this.showToast('Save blocked: protecting artwork from corrupt layer overwrite');
+      return;
+    }
     if (this.isLoadingLayers) {
       console.warn('Skipping save: layer images are still loading');
+      this.pendingSave = true;
       return;
     }
     if (this.vectorCanvas?.isDrawing) {
       console.warn('Skipping save: active stroke in progress');
+      this.pendingSave = true;
       return;
     }
-    if (this.isSaving) return;
+    if (this.isSaving) {
+      this.pendingSave = true;
+      return;
+    }
     this.isSaving = true;
 
     try {
@@ -13058,6 +13137,10 @@ class VecturaApp {
       this.showToast('Save failed: ' + (saveErr.message || 'error'));
     } finally {
       this.isSaving = false;
+      if (this.pendingSave) {
+        this.pendingSave = false;
+        setTimeout(() => this.saveCurrentProject(), 50);
+      }
     }
   }
 
@@ -13083,16 +13166,31 @@ class VecturaApp {
   setupAutosave() {
     if (this.autosaveTimeout) clearTimeout(this.autosaveTimeout);
 
+    const handleBackgroundSave = () => {
+      if (!this.isDirty) return;
+      if (this.vectorCanvas?.isDrawing) {
+        this.pendingSave = true;
+        // Retry quickly once the stroke ends
+        const interval = setInterval(() => {
+          if (!this.vectorCanvas?.isDrawing) {
+            clearInterval(interval);
+            this.saveCurrentProject();
+          }
+        }, 50);
+        setTimeout(() => clearInterval(interval), 3000);
+        return;
+      }
+      this.saveCurrentProject();
+    };
+
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'hidden' && this.isDirty) {
-        this.saveCurrentProject();
+      if (document.visibilityState === 'hidden') {
+        handleBackgroundSave();
       }
     });
 
     window.addEventListener('pagehide', () => {
-      if (this.isDirty) {
-        this.saveCurrentProject();
-      }
+      handleBackgroundSave();
     });
   }
 

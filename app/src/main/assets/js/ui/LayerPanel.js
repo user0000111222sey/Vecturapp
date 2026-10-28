@@ -8,17 +8,22 @@ import { BLEND_MODES } from '../layers/BlendModes.js';
 import { LayerCommand } from '../history/Command.js';
 
 export class LayerPanel {
-  constructor(containerEl, layerManager, onLayerChanged, history = null) {
+  constructor(containerEl, layerManager, onLayerChanged, history = null, app = null) {
     this.container = containerEl;
     this.layerManager = layerManager;
     this.onLayerChanged = onLayerChanged;
     this.history = history;
+    this.app = app;
 
     this.render();
   }
 
   setHistory(history) {
     this.history = history;
+  }
+
+  setApp(app) {
+    this.app = app;
   }
 
   executeLayerOp(name, action, includePixels = false) {
@@ -47,6 +52,7 @@ export class LayerPanel {
       this.history.push(new LayerCommand(name, lm, beforeState, afterState, () => {
         this.render();
         this.onLayerChanged?.();
+        this.app?.markDirty?.();
       }));
     }
 
@@ -56,6 +62,7 @@ export class LayerPanel {
     } catch (err) {
       console.warn('onLayerChanged error caught:', err);
     }
+    this.app?.markDirty?.();
   }
 
   render() {
@@ -342,6 +349,7 @@ export class LayerPanel {
         active.opacity = val / 100;
         lm.invalidateCaches();
         this.onLayerChanged?.();
+        this.app?.markDirty?.();
       }
     });
 

@@ -203,7 +203,8 @@ class MainActivity : ComponentActivity() {
 
     inner class AndroidBridge(private val context: Context) {
 
-        private var currentExportStream: java.io.ByteArrayOutputStream? = null
+        private var currentExportTempFile: File? = null
+        private var currentExportFileOutputStream: FileOutputStream? = null
         private var currentExportFilename: String = ""
         private var currentExportMimeType: String = ""
 
@@ -256,9 +257,18 @@ class MainActivity : ComponentActivity() {
         @JavascriptInterface
         fun beginFile(filename: String, mimeType: String) {
             try {
+                try {
+                    currentExportFileOutputStream?.close()
+                } catch (_: Exception) {}
+                currentExportTempFile?.delete()
+
                 currentExportFilename = sanitizeFilename(filename)
                 currentExportMimeType = mimeType
-                currentExportStream = java.io.ByteArrayOutputStream()
+
+                val tempDir = File(context.cacheDir, "export_temp").apply { if (!exists()) mkdirs() }
+                val tempFile = File(tempDir, "export_${System.currentTimeMillis()}.bin")
+                currentExportTempFile = tempFile
+                currentExportFileOutputStream = FileOutputStream(tempFile)
             } catch (e: Exception) {
                 showToast("Export error: ${e.localizedMessage ?: "initialization failed"}")
             }
@@ -267,11 +277,11 @@ class MainActivity : ComponentActivity() {
         @JavascriptInterface
         fun appendChunk(base64Chunk: String) {
             try {
-                val stream = currentExportStream ?: return
+                val fos = currentExportFileOutputStream ?: return
                 val cleanChunk = if (base64Chunk.contains(",")) base64Chunk.substringAfter(",") else base64Chunk
                 if (cleanChunk.isNotEmpty()) {
                     val bytes = Base64.decode(cleanChunk, Base64.DEFAULT)
-                    stream.write(bytes)
+                    fos.write(bytes)
                 }
             } catch (e: Exception) {
                 showToast("Export write error: ${e.localizedMessage ?: "chunk failed"}")
@@ -281,16 +291,24 @@ class MainActivity : ComponentActivity() {
         @JavascriptInterface
         fun finishFile(filename: String, mimeType: String) {
             try {
-                val stream = currentExportStream
-                if (stream == null || stream.size() == 0) {
+                try {
+                    currentExportFileOutputStream?.flush()
+                    currentExportFileOutputStream?.close()
+                } catch (_: Exception) {}
+                currentExportFileOutputStream = null
+
+                val tempFile = currentExportTempFile
+                if (tempFile == null || !tempFile.exists() || tempFile.length() == 0L) {
                     showToast("Export failed: empty file")
-                    currentExportStream = null
+                    tempFile?.delete()
+                    currentExportTempFile = null
                     return
                 }
+
                 val safeName = sanitizeFilename(filename.ifEmpty { currentExportFilename })
                 val safeMime = mimeType.ifEmpty { currentExportMimeType.ifEmpty { "image/png" } }
-                val bytes = stream.toByteArray()
-                currentExportStream = null
+
+                var mediaStoreSucceeded = false
 
                 // Save to MediaStore Pictures/Vectura without permissions on API 29+
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -308,31 +326,42 @@ class MainActivity : ComponentActivity() {
                         }
                         val savedUri = context.contentResolver.insert(collection, contentValues)
                         if (savedUri != null) {
-                            context.contentResolver.openOutputStream(savedUri)?.use { out ->
-                                out.write(bytes)
+                            var bytesCopied = 0L
+                            context.contentResolver.openOutputStream(savedUri)?.use { outStream ->
+                                tempFile.inputStream().use { inStream ->
+                                    bytesCopied = inStream.copyTo(outStream)
+                                }
                             }
                             contentValues.clear()
                             contentValues.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0)
                             context.contentResolver.update(savedUri, contentValues, null, null)
+                            if (bytesCopied > 0L) {
+                                mediaStoreSucceeded = true
+                            }
                         }
                     } catch (e: Exception) {
-                        // Fall back to cache sharing if MediaStore fails
+                        mediaStoreSucceeded = false
                     }
                 }
 
-                // Write to cacheDir for instant FileProvider share sheet
-                val sharedDir = File(context.cacheDir, "shared")
-                if (!sharedDir.exists()) sharedDir.mkdirs()
-                val outFile = File(sharedDir, safeName)
-                FileOutputStream(outFile).use { it.write(bytes) }
+                // Copy to cacheDir/shared for instant FileProvider share sheet
+                val sharedDir = File(context.cacheDir, "shared").apply { if (!exists()) mkdirs() }
+                val shareFile = File(sharedDir, safeName)
+                tempFile.copyTo(shareFile, overwrite = true)
+                tempFile.delete()
+                currentExportTempFile = null
 
                 val shareUri = FileProvider.getUriForFile(
                     context,
                     "${context.packageName}.fileprovider",
-                    outFile
+                    shareFile
                 )
 
-                showToast("Saved $safeName to Pictures/Vectura")
+                if (mediaStoreSucceeded) {
+                    showToast("Saved $safeName to Pictures/Vectura")
+                } else {
+                    showToast("Export ready: sharing $safeName")
+                }
 
                 val shareIntent = Intent(Intent.ACTION_SEND).apply {
                     type = safeMime
@@ -345,7 +374,12 @@ class MainActivity : ComponentActivity() {
                 context.startActivity(chooser)
             } catch (e: Exception) {
                 showToast("Export failed: ${e.localizedMessage ?: "Unknown error"}")
-                currentExportStream = null
+                try {
+                    currentExportFileOutputStream?.close()
+                } catch (_: Exception) {}
+                currentExportFileOutputStream = null
+                currentExportTempFile?.delete()
+                currentExportTempFile = null
             }
         }
 

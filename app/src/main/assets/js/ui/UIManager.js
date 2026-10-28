@@ -140,8 +140,10 @@ export class UIManager {
         const active = this.vc.layerManager.getActiveLayer();
         this.vc.toolManager.setTool(this.activeTool, active);
         this.vc.render();
+        this.app.markDirty();
       },
-      this.app.history
+      this.app.history,
+      this.app
     );
 
     // 3. Brush Panel

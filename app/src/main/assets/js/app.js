@@ -83,6 +83,11 @@ class VecturaApp {
     this.vectorCanvas.onUndoRequested = () => this.undo();
     this.vectorCanvas.onRedoRequested = () => this.redo();
     this.vectorCanvas.onHaptic = () => this.triggerHaptic();
+    this.vectorCanvas.onStrokeFinished = () => {
+      if (this.pendingSave) {
+        this.saveCurrentProject();
+      }
+    };
 
     // 6. Setup Autosave & Lifecycle hooks
     this.setupAutosave();
@@ -174,6 +179,7 @@ class VecturaApp {
     this.vectorCanvas.setDocumentSize(w, h);
 
     this.isLoadingLayers = true;
+    let anyDecodeFailed = false;
     try {
       if (project.layers && project.layers.length > 0) {
         const loadedLayers = await Promise.all(
@@ -190,17 +196,18 @@ class VecturaApp {
 
             const source = lData.blob || lData.dataUrl;
             if (source) {
-              await new Promise((resolve) => {
+              const decodedOk = await new Promise((resolve) => {
                 const img = new Image();
                 img.onload = () => {
                   l.ctx.drawImage(img, 0, 0);
                   l.updateThumbnail();
                   if (img.src && img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
-                  resolve();
+                  resolve(true);
                 };
                 img.onerror = () => {
+                  console.error('Failed to decode layer image for layer:', lData.id, lData.name);
                   if (img.src && img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
-                  resolve();
+                  resolve(false);
                 };
                 if (source instanceof Blob) {
                   img.src = URL.createObjectURL(source);
@@ -208,6 +215,9 @@ class VecturaApp {
                   img.src = source;
                 }
               });
+              if (!decodedOk) {
+                anyDecodeFailed = true;
+              }
             } else {
               this.vectorCanvas.redrawLayerStrokes(l);
             }
@@ -222,6 +232,13 @@ class VecturaApp {
       }
     } finally {
       this.isLoadingLayers = false;
+    }
+
+    if (anyDecodeFailed) {
+      this.saveBlockedDueToDecodeError = true;
+      this.showToast('Warning: layer failed to load. Saving is disabled to protect artwork.');
+    } else {
+      this.saveBlockedDueToDecodeError = false;
     }
 
     this.history.clear();
@@ -239,15 +256,25 @@ class VecturaApp {
 
   async saveCurrentProject() {
     if (!this.currentProject) return;
+    if (this.saveBlockedDueToDecodeError) {
+      console.warn('Saving blocked: a layer image failed to decode when this project was loaded');
+      this.showToast('Save blocked: protecting artwork from corrupt layer overwrite');
+      return;
+    }
     if (this.isLoadingLayers) {
       console.warn('Skipping save: layer images are still loading');
+      this.pendingSave = true;
       return;
     }
     if (this.vectorCanvas?.isDrawing) {
       console.warn('Skipping save: active stroke in progress');
+      this.pendingSave = true;
       return;
     }
-    if (this.isSaving) return;
+    if (this.isSaving) {
+      this.pendingSave = true;
+      return;
+    }
     this.isSaving = true;
 
     try {
@@ -308,6 +335,10 @@ class VecturaApp {
       this.showToast('Save failed: ' + (saveErr.message || 'error'));
     } finally {
       this.isSaving = false;
+      if (this.pendingSave) {
+        this.pendingSave = false;
+        setTimeout(() => this.saveCurrentProject(), 50);
+      }
     }
   }
 
@@ -333,16 +364,31 @@ class VecturaApp {
   setupAutosave() {
     if (this.autosaveTimeout) clearTimeout(this.autosaveTimeout);
 
+    const handleBackgroundSave = () => {
+      if (!this.isDirty) return;
+      if (this.vectorCanvas?.isDrawing) {
+        this.pendingSave = true;
+        // Retry quickly once the stroke ends
+        const interval = setInterval(() => {
+          if (!this.vectorCanvas?.isDrawing) {
+            clearInterval(interval);
+            this.saveCurrentProject();
+          }
+        }, 50);
+        setTimeout(() => clearInterval(interval), 3000);
+        return;
+      }
+      this.saveCurrentProject();
+    };
+
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'hidden' && this.isDirty) {
-        this.saveCurrentProject();
+      if (document.visibilityState === 'hidden') {
+        handleBackgroundSave();
       }
     });
 
     window.addEventListener('pagehide', () => {
-      if (this.isDirty) {
-        this.saveCurrentProject();
-      }
+      handleBackgroundSave();
     });
   }
 

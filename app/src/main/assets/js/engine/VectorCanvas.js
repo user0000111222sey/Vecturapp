@@ -415,17 +415,17 @@ export class VectorCanvas {
           try {
             const text = prompt('Enter text:');
             if (text && text.trim()) {
-              const fontSize = this.toolManager.textTool?.fontSize || 48;
-              const approxW = text.trim().length * fontSize * 0.8;
-              const approxH = fontSize * 1.5;
+              const tt = this.toolManager.textTool;
+              const bounds = tt.measureTextBounds(activeLayer.ctx, text.trim(), world.x, world.y);
+              const padding = 12;
               const bbox = {
-                x: Math.max(0, Math.floor(world.x - 4)),
-                y: Math.max(0, Math.floor(world.y - 4)),
-                width: Math.min(this.docWidth, Math.ceil(approxW + 8)),
-                height: Math.min(this.docHeight, Math.ceil(approxH + 8))
+                x: Math.max(0, Math.floor(bounds.x - padding)),
+                y: Math.max(0, Math.floor(bounds.y - padding)),
+                width: Math.min(this.docWidth, Math.ceil(bounds.width + padding * 2)),
+                height: Math.min(this.docHeight, Math.ceil(bounds.height + padding * 2))
               };
               const beforeSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
-              this.toolManager.textTool.commitText(activeLayer, text.trim(), world.x, world.y, this.currentColor);
+              tt.commitText(activeLayer, text.trim(), world.x, world.y, this.currentColor);
               const afterSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
               if (this.history) {
                 this.history.push(new RasterCommand('Add Text', activeLayer, beforeSnapshot, afterSnapshot, () => {
@@ -967,6 +967,7 @@ export class VectorCanvas {
       this.beforeStrokeCanvas = null;
       this.lastStampRadius = null;
       this.layerManager.invalidateCaches();
+      this.onStrokeFinished?.();
     }
   }
 
@@ -987,6 +988,7 @@ export class VectorCanvas {
       this.lastStampRadius = null;
       this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
       this.layerManager.invalidateCaches();
+      this.onStrokeFinished?.();
     }
     if (this.toolManager.lassoFill?.active) {
       this.toolManager.lassoFill.cancel();
