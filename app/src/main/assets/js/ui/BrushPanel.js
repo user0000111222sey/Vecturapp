@@ -9,13 +9,12 @@ import { Brush } from '../brushes/Brush.js';
 export class BrushPanel {
   constructor(containerEl, currentBrush, onBrushChanged, currentColor = '#3B6EDC') {
     this.container = containerEl;
-    this.currentBrush = currentBrush || new Brush(DEFAULT_BRUSH_PRESETS[0]);
     this.onBrushChanged = onBrushChanged;
     this.currentColor = currentColor;
 
     this.viewMode = 'library'; // 'library' | 'settings'
     this.activePack = 'ink';
-    this.activeFactorTab = 'velocity'; // 'velocity' | 'jitter' | 'noise'
+    this.activeFactorTab = 'velocity'; // 'pressure' | 'velocity' | 'jitter' | 'noise'
 
     // Available packs
     this.packs = [
@@ -27,7 +26,46 @@ export class BrushPanel {
     ];
 
     this.brushes = DEFAULT_BRUSH_PRESETS.map(p => new Brush(p));
+
+    // Restore per-brush settings (size, opacity, minSize, maxSize) from localStorage
+    for (const b of this.brushes) {
+      try {
+        const saved = localStorage.getItem(`vectura_brush_settings_${b.id}`);
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (parsed.minSize !== undefined) b.minSize = parsed.minSize;
+          if (parsed.maxSize !== undefined) b.maxSize = parsed.maxSize;
+          if (parsed.size !== undefined) b.size = Math.max(b.minSize || 1, Math.min(b.maxSize || 500, parsed.size));
+          if (parsed.opacity !== undefined) b.opacity = parsed.opacity;
+        }
+      } catch (_) {}
+    }
+
+    // Restore last used brush
+    let initialBrush = currentBrush;
+    if (!initialBrush) {
+      const lastBrushId = localStorage.getItem('vectura_last_brush_id');
+      if (lastBrushId) {
+        const match = this.brushes.find(b => b.id === lastBrushId);
+        if (match) initialBrush = match;
+      }
+    }
+    this.currentBrush = initialBrush || this.brushes[0];
+
     this.render();
+  }
+
+  persistBrushSettings(b) {
+    if (!b) return;
+    try {
+      localStorage.setItem(`vectura_brush_settings_${b.id}`, JSON.stringify({
+        size: b.size,
+        opacity: b.opacity,
+        minSize: b.minSize,
+        maxSize: b.maxSize
+      }));
+      localStorage.setItem('vectura_last_brush_id', b.id);
+    } catch (_) {}
   }
 
   get activeTab() {
@@ -133,17 +171,17 @@ export class BrushPanel {
       return;
     }
 
-    if (!b.factorLinks) {
-      b.factorLinks = {
-        velocity: { size: Math.round(b.velocityDynamics?.factor ?? 0), opacity: 0, rotation: 0, spacing: 0 },
-        jitter: { size: Math.round(b.jitter?.size ?? 0), opacity: 0, rotation: 0, spacing: 0 },
-        noise: { size: 0, opacity: 0, rotation: 0, spacing: 0 }
+    if (!b.dynamics) {
+      b.dynamics = {
+        pressure: { size: 100, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+        velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+        jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+        noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
       };
     }
 
     const curFactor = this.activeFactorTab || 'velocity';
-    const factorObj = b.factorLinks[curFactor] || { size: 0, opacity: 0, rotation: 0, spacing: 0 };
-    const minFactorVal = curFactor === 'velocity' ? -100 : 0;
+    const factorObj = b.dynamics[curFactor] || { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 };
 
     const spacingVal = Math.round((b.spacing || 0.1) * 100);
     const stabilizerVal = Math.round(b.stabilizerStrength || 35);
@@ -152,6 +190,10 @@ export class BrushPanel {
     const roundnessVal = Math.round((b.roundness ?? 1.0) * 100);
     const opacityVal = Math.round((b.opacity ?? 1.0) * 100);
 
+    const minSize = Math.max(1, Math.round(b.minSize || 1));
+    const maxSize = Math.max(minSize + 1, Math.round(b.maxSize || 200));
+    b.size = Math.max(minSize, Math.min(maxSize, b.size || 12));
+
     this.container.innerHTML = `
       <div style="height: 100%; display: flex; flex-direction: column;">
         <!-- 1. LIVE STROKE PREVIEW (STICKY HEADER) -->
@@ -159,7 +201,7 @@ export class BrushPanel {
           <canvas id="brush-live-stroke-preview" width="320" height="64" style="width: 100%; height: 64px; border-radius: 8px; display: block;"></canvas>
           <div class="brush-preview-meta" style="display: flex; justify-content: space-between; margin-top: 6px; font-size: 11px; color: var(--text-2);">
             <span class="brush-preview-title" style="font-weight: 600; color: var(--text);">${b.name}</span>
-            <span class="brush-preview-size tabular" id="bs-preview-size-label">${b.size || 12}px (min ${b.minSize || 1}px – max ${b.maxSize || 200}px)</span>
+            <span class="brush-preview-size tabular" id="bs-preview-size-label">${b.size || 12}px (min ${minSize}px – max ${maxSize}px)</span>
           </div>
         </div>
 
@@ -189,34 +231,41 @@ export class BrushPanel {
           <div class="settings-dense-group">
             <div class="settings-slider-row">
               <span class="settings-slider-label">Current Size</span>
-              <input type="range" class="dense-slider" id="bs-size" min="1" max="150" value="${b.size || 12}">
-              <span class="settings-slider-val" id="bs-size-val">${b.size || 12}px</span>
+              <input type="range" class="dense-slider" id="bs-size" min="${minSize}" max="${maxSize}" value="${b.size}">
+              <span class="settings-slider-val" id="bs-size-val">${b.size}px</span>
             </div>
             <div class="settings-slider-row">
               <span class="settings-slider-label">Min Size</span>
-              <input type="range" class="dense-slider" id="bs-min-size" min="1" max="100" value="${b.minSize || 1}">
-              <span class="settings-slider-val" id="bs-min-size-val">${b.minSize || 1}px</span>
+              <input type="range" class="dense-slider" id="bs-min-size" min="1" max="100" value="${minSize}">
+              <span class="settings-slider-val" id="bs-min-size-val">${minSize}px</span>
             </div>
             <div class="settings-slider-row">
               <span class="settings-slider-label">Max Size</span>
-              <input type="range" class="dense-slider" id="bs-max-size" min="10" max="500" value="${b.maxSize || 200}">
-              <span class="settings-slider-val" id="bs-max-size-val">${b.maxSize || 200}px</span>
+              <input type="range" class="dense-slider" id="bs-max-size" min="10" max="500" value="${maxSize}">
+              <span class="settings-slider-val" id="bs-max-size-val">${maxSize}px</span>
             </div>
             <div class="settings-slider-row">
               <span class="settings-slider-label">Opacity</span>
               <input type="range" class="dense-slider" id="bs-opacity" min="1" max="100" value="${opacityVal}">
               <span class="settings-slider-val" id="bs-opacity-val">${opacityVal}%</span>
             </div>
-            <div class="settings-slider-row">
-              <span class="settings-slider-label">Airbrush Build-up</span>
-              <input type="checkbox" id="bs-buildup" ${b.buildUp ? 'checked' : ''} style="width: 20px; height: 20px; accent-color: var(--accent); cursor: pointer;">
-              <span class="settings-slider-val" id="bs-buildup-val">${b.buildUp ? 'On' : 'Off'}</span>
+          </div>
+
+          <!-- 4. DYNAMICS LIVE TEST PREVIEW -->
+          <div class="section-header">Dynamics Live Test</div>
+          <div class="settings-dense-group" style="padding: 10px;">
+            <canvas id="brush-dynamics-preview" width="300" height="84" style="width: 100%; height: 84px; border-radius: 6px; background: var(--control); display: block;"></canvas>
+            <div style="display: flex; justify-content: space-between; font-size: 10px; color: var(--text-3); margin-top: 5px;">
+              <span>Slow (Low Velocity)</span>
+              <span>Medium Speed</span>
+              <span>Fast Flick (High Velocity)</span>
             </div>
           </div>
 
-          <!-- 4. FACTOR & CHILD MATRIX SECTION -->
-          <div class="section-header">Factor & Child Links</div>
+          <!-- 5. UNIFIED DYNAMICS (SOURCES & TARGET LINKS) -->
+          <div class="section-header">Dynamics Source & Targets</div>
           <div class="factor-tabs-nav" style="display: flex; gap: 4px; margin-bottom: 8px;">
+            <button class="factor-tab-btn ${curFactor === 'pressure' ? 'active' : ''}" data-factor="pressure" style="flex: 1; padding: 6px; font-size: 11px; border-radius: 6px; border: 1px solid var(--border); background: ${curFactor === 'pressure' ? 'var(--accent)' : 'var(--control)'}; color: ${curFactor === 'pressure' ? '#ffffff' : 'var(--text)'};">Pressure</button>
             <button class="factor-tab-btn ${curFactor === 'velocity' ? 'active' : ''}" data-factor="velocity" style="flex: 1; padding: 6px; font-size: 11px; border-radius: 6px; border: 1px solid var(--border); background: ${curFactor === 'velocity' ? 'var(--accent)' : 'var(--control)'}; color: ${curFactor === 'velocity' ? '#ffffff' : 'var(--text)'};">Velocity</button>
             <button class="factor-tab-btn ${curFactor === 'jitter' ? 'active' : ''}" data-factor="jitter" style="flex: 1; padding: 6px; font-size: 11px; border-radius: 6px; border: 1px solid var(--border); background: ${curFactor === 'jitter' ? 'var(--accent)' : 'var(--control)'}; color: ${curFactor === 'jitter' ? '#ffffff' : 'var(--text)'};">Jitter</button>
             <button class="factor-tab-btn ${curFactor === 'noise' ? 'active' : ''}" data-factor="noise" style="flex: 1; padding: 6px; font-size: 11px; border-radius: 6px; border: 1px solid var(--border); background: ${curFactor === 'noise' ? 'var(--accent)' : 'var(--control)'}; color: ${curFactor === 'noise' ? '#ffffff' : 'var(--text)'};">2D Noise</button>
@@ -224,53 +273,48 @@ export class BrushPanel {
           <div class="settings-dense-group" id="factor-child-controls">
             <div class="settings-slider-row">
               <span class="settings-slider-label">→ Size</span>
-              <input type="range" class="dense-slider" id="bs-fc-size" min="${minFactorVal}" max="100" value="${factorObj.size ?? 0}">
+              <input type="range" class="dense-slider" id="bs-fc-size" min="-100" max="100" value="${factorObj.size ?? 0}">
               <span class="settings-slider-val" id="bs-fc-size-val">${factorObj.size ?? 0}%</span>
             </div>
             <div class="settings-slider-row">
               <span class="settings-slider-label">→ Opacity</span>
-              <input type="range" class="dense-slider" id="bs-fc-opacity" min="${minFactorVal}" max="100" value="${factorObj.opacity ?? 0}">
+              <input type="range" class="dense-slider" id="bs-fc-opacity" min="-100" max="100" value="${factorObj.opacity ?? 0}">
               <span class="settings-slider-val" id="bs-fc-opacity-val">${factorObj.opacity ?? 0}%</span>
             </div>
             <div class="settings-slider-row">
               <span class="settings-slider-label">→ Rotation</span>
-              <input type="range" class="dense-slider" id="bs-fc-rotation" min="${minFactorVal}" max="100" value="${factorObj.rotation ?? 0}">
+              <input type="range" class="dense-slider" id="bs-fc-rotation" min="-100" max="100" value="${factorObj.rotation ?? 0}">
               <span class="settings-slider-val" id="bs-fc-rotation-val">${factorObj.rotation ?? 0}%</span>
             </div>
             <div class="settings-slider-row">
-              <span class="settings-slider-label">→ Tip Rotation</span>
-              <input type="range" class="dense-slider" id="bs-fc-tip-rotation" min="${minFactorVal}" max="100" value="${factorObj.tipRotation ?? 0}">
-              <span class="settings-slider-val" id="bs-fc-tip-rotation-val">${factorObj.tipRotation ?? 0}%</span>
+              <span class="settings-slider-label">→ Spacing</span>
+              <input type="range" class="dense-slider" id="bs-fc-spacing" min="-100" max="100" value="${factorObj.spacing ?? 0}">
+              <span class="settings-slider-val" id="bs-fc-spacing-val">${factorObj.spacing ?? 0}%</span>
             </div>
             <div class="settings-slider-row">
-              <span class="settings-slider-label">→ Spacing</span>
-              <input type="range" class="dense-slider" id="bs-fc-spacing" min="${minFactorVal}" max="100" value="${factorObj.spacing ?? 0}">
-              <span class="settings-slider-val" id="bs-fc-spacing-val">${factorObj.spacing ?? 0}%</span>
+              <span class="settings-slider-label">→ Scatter</span>
+              <input type="range" class="dense-slider" id="bs-fc-scatter" min="-100" max="100" value="${factorObj.scatter ?? 0}">
+              <span class="settings-slider-val" id="bs-fc-scatter-val">${factorObj.scatter ?? 0}%</span>
             </div>
           </div>
 
           ${curFactor === 'noise' ? `
-            <div class="section-header">2D Noise Generator</div>
+            <div class="section-header">2D Noise Settings</div>
             <div class="settings-dense-group">
               <div class="settings-slider-row">
                 <span class="settings-slider-label">Noise Scale</span>
-                <input type="range" class="dense-slider" id="bs-noise-scale" min="1" max="100" value="${b.noiseScale || 20}">
-                <span class="settings-slider-val" id="bs-noise-scale-val">${b.noiseScale || 20}</span>
-              </div>
-              <div class="settings-slider-row">
-                <span class="settings-slider-label">Intensity</span>
-                <input type="range" class="dense-slider" id="bs-noise-intensity" min="0" max="100" value="${b.noiseIntensity ?? 50}">
-                <span class="settings-slider-val" id="bs-noise-intensity-val">${b.noiseIntensity ?? 50}%</span>
+                <input type="range" class="dense-slider" id="bs-noise-scale" min="1" max="100" value="${Math.round((b.noiseScale || 0.02) * 1000)}">
+                <span class="settings-slider-val" id="bs-noise-scale-val">${Math.round((b.noiseScale || 0.02) * 1000)}</span>
               </div>
               <div class="settings-slider-row">
                 <span class="settings-slider-label">Octaves</span>
-                <input type="range" class="dense-slider" id="bs-noise-octaves" min="1" max="6" value="${b.noiseOctaves || 3}">
-                <span class="settings-slider-val" id="bs-noise-octaves-val">${b.noiseOctaves || 3}</span>
+                <input type="range" class="dense-slider" id="bs-noise-octaves" min="1" max="5" value="${b.noiseOctaves || 2}">
+                <span class="settings-slider-val" id="bs-noise-octaves-val">${b.noiseOctaves || 2}</span>
               </div>
             </div>
           ` : ''}
 
-          <!-- 5. CORE STROKE & TEXTURE -->
+          <!-- 6. CORE STROKE & TEXTURE -->
           <div class="section-header">Stroke & Spacing</div>
           <div class="settings-dense-group">
             <div class="settings-slider-row">
@@ -300,6 +344,7 @@ export class BrushPanel {
 
     this.setupSettingsEvents();
     this.drawSettingsStrokePreview();
+    this.drawDynamicsPreview();
   }
 
   setupSettingsEvents() {
@@ -315,6 +360,8 @@ export class BrushPanel {
         onChange(val, valEl);
         this.updateMetaLabels();
         this.drawSettingsStrokePreview();
+        this.drawDynamicsPreview();
+        this.persistBrushSettings(b);
         this.onBrushChanged?.(this.currentBrush);
       });
     };
@@ -325,9 +372,12 @@ export class BrushPanel {
         b.tipShape = btn.dataset.tip;
         this.container.querySelectorAll('.tip-shape-btn').forEach(bb => {
           bb.classList.toggle('active', bb.dataset.tip === b.tipShape);
-          bb.style.background = bb.dataset.tip === b.tipShape ? 'var(--accent, #6366f1)' : 'var(--card, #20222e)';
+          bb.style.background = bb.dataset.tip === b.tipShape ? 'var(--accent)' : 'var(--control)';
+          bb.style.color = bb.dataset.tip === b.tipShape ? '#ffffff' : 'var(--text)';
         });
         this.drawSettingsStrokePreview();
+        this.drawDynamicsPreview();
+        this.persistBrushSettings(b);
         this.onBrushChanged?.(this.currentBrush);
       });
     });
@@ -346,22 +396,44 @@ export class BrushPanel {
       });
     });
 
-    // Size & Limits
+    // Size & Limits - strictly synced
     bindSlider('bs-size', (v, valEl) => {
       b.size = v;
       valEl.textContent = `${Math.round(v)}px`;
     });
 
     bindSlider('bs-min-size', (v, valEl) => {
-      b.minSize = v;
-      if (b.minSize > b.maxSize) b.maxSize = b.minSize;
-      valEl.textContent = `${Math.round(v)}px`;
+      b.minSize = Math.max(1, Math.round(v));
+      if (b.minSize >= b.maxSize) b.maxSize = b.minSize + 1;
+      b.size = Math.max(b.minSize, Math.min(b.maxSize, b.size));
+      const sizeSlider = this.container.querySelector('#bs-size');
+      if (sizeSlider) {
+        sizeSlider.min = b.minSize;
+        sizeSlider.max = b.maxSize;
+        sizeSlider.value = b.size;
+        const sizeVal = this.container.querySelector('#bs-size-val');
+        if (sizeVal) sizeVal.textContent = `${Math.round(b.size)}px`;
+      }
+      const maxSlider = this.container.querySelector('#bs-max-size');
+      if (maxSlider) maxSlider.value = b.maxSize;
+      valEl.textContent = `${Math.round(b.minSize)}px`;
     });
 
     bindSlider('bs-max-size', (v, valEl) => {
-      b.maxSize = v;
-      if (b.maxSize < b.minSize) b.minSize = b.maxSize;
-      valEl.textContent = `${Math.round(v)}px`;
+      b.maxSize = Math.max(2, Math.round(v));
+      if (b.maxSize <= b.minSize) b.minSize = Math.max(1, b.maxSize - 1);
+      b.size = Math.max(b.minSize, Math.min(b.maxSize, b.size));
+      const sizeSlider = this.container.querySelector('#bs-size');
+      if (sizeSlider) {
+        sizeSlider.min = b.minSize;
+        sizeSlider.max = b.maxSize;
+        sizeSlider.value = b.size;
+        const sizeVal = this.container.querySelector('#bs-size-val');
+        if (sizeVal) sizeVal.textContent = `${Math.round(b.size)}px`;
+      }
+      const minSlider = this.container.querySelector('#bs-min-size');
+      if (minSlider) minSlider.value = b.minSize;
+      valEl.textContent = `${Math.round(b.maxSize)}px`;
     });
 
     bindSlider('bs-opacity', (v, valEl) => {
@@ -369,55 +441,49 @@ export class BrushPanel {
       valEl.textContent = `${Math.round(v)}%`;
     });
 
-    const buildupEl = this.container.querySelector('#bs-buildup');
-    const buildupVal = this.container.querySelector('#bs-buildup-val');
-    buildupEl?.addEventListener('change', (e) => {
-      b.buildUp = e.target.checked;
-      if (buildupVal) buildupVal.textContent = b.buildUp ? 'On' : 'Off';
-      this.drawSettingsStrokePreview();
-      this.onBrushChanged?.(this.currentBrush);
-    });
-
-    // Factor Child Matrix Sliders
+    // Unified Dynamics Sliders
     const curFactor = this.activeFactorTab || 'velocity';
-    if (!b.factorLinks) b.factorLinks = {};
-    if (!b.factorLinks[curFactor]) b.factorLinks[curFactor] = { size: 0, opacity: 0, rotation: 0, tipRotation: 0, spacing: 0 };
+    if (!b.dynamics) {
+      b.dynamics = {
+        pressure: { size: 100, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+        velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+        jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+        noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
+      };
+    }
+    if (!b.dynamics[curFactor]) {
+      b.dynamics[curFactor] = { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 };
+    }
 
     bindSlider('bs-fc-size', (v, valEl) => {
-      b.factorLinks[curFactor].size = v;
-      if (curFactor === 'velocity' && b.velocityDynamics) b.velocityDynamics.factor = v;
+      b.dynamics[curFactor].size = v;
       valEl.textContent = `${Math.round(v)}%`;
     });
 
     bindSlider('bs-fc-opacity', (v, valEl) => {
-      b.factorLinks[curFactor].opacity = v;
+      b.dynamics[curFactor].opacity = v;
       valEl.textContent = `${Math.round(v)}%`;
     });
 
     bindSlider('bs-fc-rotation', (v, valEl) => {
-      b.factorLinks[curFactor].rotation = v;
-      valEl.textContent = `${Math.round(v)}%`;
-    });
-
-    bindSlider('bs-fc-tip-rotation', (v, valEl) => {
-      b.factorLinks[curFactor].tipRotation = v;
+      b.dynamics[curFactor].rotation = v;
       valEl.textContent = `${Math.round(v)}%`;
     });
 
     bindSlider('bs-fc-spacing', (v, valEl) => {
-      b.factorLinks[curFactor].spacing = v;
+      b.dynamics[curFactor].spacing = v;
       valEl.textContent = `${Math.round(v)}%`;
     });
 
-    // 2D Noise controls if noise tab
+    bindSlider('bs-fc-scatter', (v, valEl) => {
+      b.dynamics[curFactor].scatter = v;
+      valEl.textContent = `${Math.round(v)}%`;
+    });
+
     if (curFactor === 'noise') {
       bindSlider('bs-noise-scale', (v, valEl) => {
-        b.noiseScale = v;
+        b.noiseScale = v / 1000;
         valEl.textContent = `${Math.round(v)}`;
-      });
-      bindSlider('bs-noise-intensity', (v, valEl) => {
-        b.noiseIntensity = v;
-        valEl.textContent = `${Math.round(v)}%`;
       });
       bindSlider('bs-noise-octaves', (v, valEl) => {
         b.noiseOctaves = Math.round(v);
@@ -425,7 +491,7 @@ export class BrushPanel {
       });
     }
 
-    // Stroke & Texture
+    // Core stroke & texture sliders
     bindSlider('bs-spacing', (v, valEl) => {
       b.spacing = v / 100;
       valEl.textContent = `${Math.round(v)}%`;
@@ -433,11 +499,6 @@ export class BrushPanel {
 
     bindSlider('bs-stabilizer', (v, valEl) => {
       b.stabilizerStrength = v;
-      valEl.textContent = `${Math.round(v)}%`;
-    });
-
-    bindSlider('bs-hardness', (v, valEl) => {
-      b.hardness = v / 100;
       valEl.textContent = `${Math.round(v)}%`;
     });
 
@@ -450,6 +511,60 @@ export class BrushPanel {
       b.grain = v / 100;
       valEl.textContent = `${Math.round(v)}%`;
     });
+  }
+
+  drawDynamicsPreview() {
+    const canvas = this.container.querySelector('#brush-dynamics-preview');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    const b = this.currentBrush;
+    if (!b) return;
+
+    const color = this.currentColor || '#3B6EDC';
+    const dyn = b.dynamics || {};
+    const dP = dyn.pressure || {};
+    const dV = dyn.velocity || {};
+
+    const strokes = [
+      { y: 20, v: 0.2, pStart: 0.2, pEnd: 0.8 },
+      { y: 44, v: 1.0, pStart: 0.5, pEnd: 0.5 },
+      { y: 68, v: 3.5, pStart: 0.8, pEnd: 0.1 }
+    ];
+
+    ctx.save();
+    for (const st of strokes) {
+      const vFactor = Math.min(1.5, Math.max(-1.0, (st.v - 0.6) / 0.8));
+      const step = Math.max(1.8, (b.size || 8) * (b.spacing || 0.1));
+
+      for (let x = 12; x < w - 12; x += step) {
+        const t = (x - 12) / (w - 24);
+        const pNorm = st.pStart + t * (st.pEnd - st.pStart);
+        const pFactor = (pNorm - 0.5) * 2;
+
+        let sizeMod = 1.0;
+        if (dP.size) sizeMod += (dP.size / 100) * pFactor;
+        if (dV.size) sizeMod += (dV.size / 100) * vFactor;
+
+        let r = Math.max(0.5, ((b.size || 8) / 2) * Math.max(0.05, sizeMod));
+        r = Math.max((b.minSize || 1) / 2, Math.min((b.maxSize || 200) / 2, r));
+
+        let alphaMod = 0;
+        if (dP.opacity) alphaMod += (dP.opacity / 100) * pFactor;
+        if (dV.opacity) alphaMod += (dV.opacity / 100) * vFactor;
+        const alpha = Math.max(0.05, Math.min(1.0, (b.opacity ?? 1.0) * Math.max(0, 1.0 + alphaMod)));
+
+        ctx.fillStyle = color;
+        ctx.globalAlpha = alpha;
+        ctx.beginPath();
+        ctx.arc(x, st.y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
   }
 
   updateMetaLabels() {
@@ -492,10 +607,11 @@ export class BrushPanel {
     const minR = Math.max(0.25, (b.minSize || 1) / 2);
     const maxR = Math.max(minR + 0.5, (b.maxSize || 200) / 2);
 
-    const fl = b.factorLinks || {};
-    const vLinks = fl.velocity || {};
-    const jLinks = fl.jitter || {};
-    const nLinks = fl.noise || {};
+    const dyn = b.dynamics || {};
+    const dP = dyn.pressure || {};
+    const dV = dyn.velocity || {};
+    const dJ = dyn.jitter || {};
+    const dN = dyn.noise || {};
 
     ctx.save();
     ctx.fillStyle = b.isEraser ? '#ffffff' : color;
@@ -503,40 +619,34 @@ export class BrushPanel {
 
     for (let i = 0; i < pts.length; i++) {
       const p = pts[i];
-      let r = (baseSize * p.pressure) / 2;
+      const pFactor = (p.pressure - 0.5) * 2.0;
+      const vFactor = Math.min(1.5, Math.max(-1.0, (p.speed - 0.6) / 0.8));
+      const jVal = ((Math.sin(i * 1337.7) * 43758.5453) % 1.0);
+      const nVal = Math.sin(i * 0.18) * 0.7;
 
-      // Factors
-      const vFactor = Math.min(1.5, Math.max(-1.0, (p.pressure - 0.5) * 2.0));
-      const jFactor = ((Math.sin(i * 1337.7) * 43758.5453) % 1.0);
-      const nFactor = Math.sin(i * 0.18) * 0.7;
-
-      // Modulate size
       let sizeMod = 1.0;
-      if (vLinks.size) sizeMod += (vLinks.size / 100) * vFactor;
-      if (jLinks.size) sizeMod += (jLinks.size / 100) * jFactor * 0.5;
-      if (nLinks.size) sizeMod += (nLinks.size / 100) * nFactor * 0.35;
-      r = Math.max(minR, Math.min(maxR, r * Math.max(0.05, sizeMod)));
+      if (dP.size) sizeMod += (dP.size / 100) * pFactor;
+      if (dV.size) sizeMod += (dV.size / 100) * vFactor;
+      if (dJ.size) sizeMod += (dJ.size / 100) * jVal;
+      if (dN.size) sizeMod += (dN.size / 100) * nVal;
 
-      // Modulate opacity
-      let alpha = b.opacity ?? 1.0;
+      let r = ((baseSize * p.pressure) / 2) * Math.max(0.05, sizeMod);
+      r = Math.max(minR, Math.min(maxR, r));
+
       let alphaMod = 0;
-      if (vLinks.opacity) alphaMod += (vLinks.opacity / 100) * vFactor;
-      if (jLinks.opacity) alphaMod += (jLinks.opacity / 100) * jFactor * 0.5;
-      if (nLinks.opacity) alphaMod += (nLinks.opacity / 100) * nFactor * 0.4;
-      alpha = Math.max(0.05, Math.min(1.0, alpha * (1.0 + alphaMod)));
+      if (dP.opacity) alphaMod += (dP.opacity / 100) * pFactor;
+      if (dV.opacity) alphaMod += (dV.opacity / 100) * vFactor;
+      if (dJ.opacity) alphaMod += (dJ.opacity / 100) * jVal;
+      if (dN.opacity) alphaMod += (dN.opacity / 100) * nVal;
+      let alpha = Math.max(0.05, Math.min(1.0, (b.opacity ?? 1.0) * Math.max(0, 1.0 + alphaMod)));
 
-      // Modulate rotation & tipRotation
       let rot = (b.rotation || 0) * (Math.PI / 180);
-      if (vLinks.rotation) rot += (vLinks.rotation / 100) * vFactor * Math.PI;
-      if (jLinks.rotation) rot += (jLinks.rotation / 100) * jFactor * Math.PI;
-      if (nLinks.rotation) rot += (nLinks.rotation / 100) * nFactor * 0.5 * Math.PI;
+      if (dP.rotation) rot += (dP.rotation / 100) * pFactor * Math.PI;
+      if (dV.rotation) rot += (dV.rotation / 100) * vFactor * Math.PI;
+      if (dJ.rotation) rot += (dJ.rotation / 100) * jVal * Math.PI;
+      if (dN.rotation) rot += (dN.rotation / 100) * nVal * Math.PI;
 
-      let tipRot = 0;
-      if (vLinks.tipRotation) tipRot += (vLinks.tipRotation / 100) * vFactor * Math.PI;
-      if (jLinks.tipRotation) tipRot += (jLinks.tipRotation / 100) * jFactor * Math.PI;
-      if (nLinks.tipRotation) tipRot += (nLinks.tipRotation / 100) * nFactor * 0.5 * Math.PI;
-
-      const totalAngle = rot + tipRot;
+      const totalAngle = rot;
       const aspect = Math.max(0.1, b.aspectRatio ?? 1.0);
       const rx = Math.max(0.5, r * Math.sqrt(aspect));
       const ry = Math.max(0.5, r / Math.sqrt(aspect));

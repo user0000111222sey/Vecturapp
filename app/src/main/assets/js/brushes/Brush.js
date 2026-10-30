@@ -30,39 +30,48 @@ export class Brush {
     this.aspectRatio = data.aspectRatio ?? 1.0;
     this.rotation = data.rotation ?? 0.0;
     this.tipShape = data.tipShape || 'round'; // 'round' | 'square' | 'chisel' | 'calligraphy' | 'soft' | 'star' | 'bristle'
-    this.buildUp = data.buildUp ?? (data.id?.includes('airbrush') || false);
-
     // 2D Noise Settings
     this.noiseScale = data.noiseScale ?? 20;
     this.noiseIntensity = data.noiseIntensity ?? 50;
     this.noiseSeed = data.noiseSeed ?? 1337;
     this.noiseOctaves = data.noiseOctaves ?? 3;
 
-    // Factor & Child Dynamic System
-    // Factors (Inputs): velocity, jitter, noise
-    // Children (Outputs): size, rotation, spacing, opacity, tipRotation
+    // ONE Clean Dynamics System:
+    // Sources: pressure, velocity, jitter, noise
+    // Targets: size, opacity, rotation, spacing, scatter (-100 to +100)
+    const d = data.dynamics || {};
     const fl = data.factorLinks || {};
-    this.factorLinks = {
+    const vd = data.velocityDynamics || {};
+    const jt = data.jitter || {};
+
+    this.dynamics = {
+      pressure: {
+        size: d.pressure?.size ?? 50,
+        opacity: d.pressure?.opacity ?? 0,
+        rotation: d.pressure?.rotation ?? 0,
+        spacing: d.pressure?.spacing ?? 0,
+        scatter: d.pressure?.scatter ?? 0
+      },
       velocity: {
-        size: fl.velocity?.size ?? (data.velocityDynamics?.factor ?? 0),
-        opacity: fl.velocity?.opacity ?? 0,
-        rotation: fl.velocity?.rotation ?? 0,
-        spacing: fl.velocity?.spacing ?? 0,
-        tipRotation: fl.velocity?.tipRotation ?? 0
+        size: d.velocity?.size ?? fl.velocity?.size ?? (vd.factor ?? 0),
+        opacity: d.velocity?.opacity ?? fl.velocity?.opacity ?? 0,
+        rotation: d.velocity?.rotation ?? fl.velocity?.rotation ?? fl.velocity?.tipRotation ?? 0,
+        spacing: d.velocity?.spacing ?? fl.velocity?.spacing ?? 0,
+        scatter: d.velocity?.scatter ?? 0
       },
       jitter: {
-        size: fl.jitter?.size ?? (data.jitter?.size ?? 0),
-        opacity: fl.jitter?.opacity ?? 0,
-        rotation: fl.jitter?.rotation ?? 0,
-        spacing: fl.jitter?.spacing ?? 0,
-        tipRotation: fl.jitter?.tipRotation ?? 0
+        size: d.jitter?.size ?? fl.jitter?.size ?? (jt.enabled ? (jt.targets?.size ?? 0) : 0),
+        opacity: d.jitter?.opacity ?? fl.jitter?.opacity ?? (jt.enabled ? (jt.targets?.opacity ?? 0) : 0),
+        rotation: d.jitter?.rotation ?? fl.jitter?.rotation ?? fl.jitter?.tipRotation ?? 0,
+        spacing: d.jitter?.spacing ?? fl.jitter?.spacing ?? 0,
+        scatter: d.jitter?.scatter ?? (jt.enabled ? (jt.targets?.positionWobble ?? 0) : 0)
       },
       noise: {
-        size: fl.noise?.size ?? 0,
-        opacity: fl.noise?.opacity ?? 0,
-        rotation: fl.noise?.rotation ?? 0,
-        spacing: fl.noise?.spacing ?? 0,
-        tipRotation: fl.noise?.tipRotation ?? 0
+        size: d.noise?.size ?? fl.noise?.size ?? 0,
+        opacity: d.noise?.opacity ?? fl.noise?.opacity ?? 0,
+        rotation: d.noise?.rotation ?? fl.noise?.rotation ?? fl.noise?.tipRotation ?? 0,
+        spacing: d.noise?.spacing ?? fl.noise?.spacing ?? 0,
+        scatter: d.noise?.scatter ?? 0
       }
     };
 
@@ -71,69 +80,13 @@ export class Brush {
     this.spacingSettings = {
       spacing: sp.spacing ?? data.spacing ?? 0.08,    // 0.01 to 2.0 (1% to 200%)
       minSpacingPx: sp.minSpacingPx ?? 1.0,           // minimum spacing in pixels
-      spacingJitter: sp.spacingJitter ?? 0,           // 0 to 100%
-      speedFactor: sp.speedFactor ?? 0,               // -100 to +100 linked to speed
       autoSpacing: sp.autoSpacing ?? false,           // adaptively maintain smoothness
       pixelArtMode: sp.pixelArtMode ?? false          // fixed exact pixel steps
     };
     this.spacing = this.spacingSettings.spacing;
     this.scatter = data.scatter ?? 0.0;
 
-    // 3. Velocity Dynamics Group (-100 to +100 factor)
-    const vd = data.velocityDynamics || {};
-    this.velocityDynamics = {
-      factor: vd.factor ?? 0,                                 // Integer -100 to +100 (0 = neutral)
-      minSpeed: vd.minSpeed ?? 0.0,                           // px/ms
-      maxSpeed: vd.maxSpeed ?? 3.0,                           // px/ms
-      curve: vd.curve ? [...vd.curve] : [0.25, 0.1, 0.25, 1.0], // draggable cubic bezier
-      smoothing: vd.smoothing ?? 0.35,                        // EMA smoothing factor
-      minOutput: vd.minOutput ?? 0.1,                         // minimum output
-      maxOutput: vd.maxOutput ?? 1.0                          // maximum output
-    };
-
-    // Velocity Targets Modulation
-    const vt = data.velocityTargets || {};
-    this.velocityTargets = {
-      size: { enabled: vt.size?.enabled ?? true, factor: vt.size?.factor ?? 1.0, useCurve: vt.size?.useCurve ?? true },
-      opacity: { enabled: vt.opacity?.enabled ?? true, factor: vt.opacity?.factor ?? 1.0, useCurve: vt.opacity?.useCurve ?? true },
-      flow: { enabled: vt.flow?.enabled ?? false, factor: vt.flow?.factor ?? 1.0, useCurve: vt.flow?.useCurve ?? false },
-      spacing: { enabled: vt.spacing?.enabled ?? false, factor: vt.spacing?.factor ?? 1.0, useCurve: vt.spacing?.useCurve ?? false },
-      scatter: { enabled: vt.scatter?.enabled ?? false, factor: vt.scatter?.factor ?? 1.0, useCurve: vt.scatter?.useCurve ?? false },
-      angle: { enabled: vt.angle?.enabled ?? false, factor: vt.angle?.factor ?? 1.0, useCurve: vt.angle?.useCurve ?? false },
-      jitter: { enabled: vt.jitter?.enabled ?? false, factor: vt.jitter?.factor ?? 1.0, useCurve: vt.jitter?.useCurve ?? false },
-      taper: { enabled: vt.taper?.enabled ?? false, factor: vt.taper?.factor ?? 1.0, useCurve: vt.taper?.useCurve ?? false }
-    };
-
-    // 4. Smooth Coherent Jitter
-    const jt = data.jitter || {};
-    this.jitter = {
-      enabled: jt.enabled ?? false,
-      amplitude: jt.amplitude ?? 1.0,                 // 0 to 200
-      frequency: jt.frequency ?? 0.05,                // 0.01 to 10.0
-      octaves: jt.octaves ?? 3,                       // 1 to 8
-      persistence: jt.persistence ?? 0.5,             // 0.1 to 1.0
-      lacunarity: jt.lacunarity ?? 2.0,               // 1.5 to 4.0
-      seed: jt.seed ?? 1337,                          // PRNG seed
-      noiseType: jt.noiseType || 'sines',             // 'sines' | 'perlin' | 'keyframes'
-      basis: jt.basis || 'distance',                  // 'distance' | 'time'
-      phaseOffset: jt.phaseOffset ?? 0,               // 0 to 360 deg
-      fadeIn: jt.fadeIn ?? 0,                         // px
-      fadeOut: jt.fadeOut ?? 0,                       // px
-      velocityLink: jt.velocityLink ?? 0,             // -100 to +100
-      targets: {
-        size: jt.targets?.size ?? 30,                 // 0 to 100%
-        opacity: jt.targets?.opacity ?? 0,            // 0 to 100%
-        flow: jt.targets?.flow ?? 0,
-        angle: jt.targets?.angle ?? 0,
-        positionWobble: jt.targets?.positionWobble ?? 0,
-        hue: jt.targets?.hue ?? 0,
-        saturation: jt.targets?.saturation ?? 0,
-        brightness: jt.targets?.brightness ?? 0,
-        spacing: jt.targets?.spacing ?? 0
-      }
-    };
-
-    // 5. Texture & Wet Edge
+    // 5. Texture & Wet Edge & Quality
     this.grain = data.grain ?? 0.0;
     this.wetEdge = data.wetEdge ?? 0.0;
     this.glowWidth = data.glowWidth ?? 0.0;
@@ -163,6 +116,14 @@ export class Brush {
     this._stampCacheKey = '';
   }
 
+  // Backward compatibility alias for factorLinks
+  get factorLinks() {
+    return this.dynamics;
+  }
+  set factorLinks(val) {
+    if (val) this.dynamics = val;
+  }
+
   createSnapshot() {
     return JSON.parse(JSON.stringify({
       id: this.id,
@@ -181,9 +142,11 @@ export class Brush {
       spacingSettings: this.spacingSettings,
       spacing: this.spacingSettings.spacing,
       scatter: this.scatter,
-      velocityDynamics: this.velocityDynamics,
-      velocityTargets: this.velocityTargets,
-      jitter: this.jitter,
+      dynamics: this.dynamics,
+      noiseScale: this.noiseScale,
+      noiseIntensity: this.noiseIntensity,
+      noiseSeed: this.noiseSeed,
+      noiseOctaves: this.noiseOctaves,
       grain: this.grain,
       wetEdge: this.wetEdge,
       glowWidth: this.glowWidth,
@@ -192,8 +155,6 @@ export class Brush {
       taperEnd: this.taperEnd,
       blendMode: this.blendMode,
       stabilizer: this.stabilizer,
-      factorLinks: this.factorLinks,
-      buildUp: this.buildUp,
       isEraser: this.isEraser,
       isPixel: this.isPixel
     }));

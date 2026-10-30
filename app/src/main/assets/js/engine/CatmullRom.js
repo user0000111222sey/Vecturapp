@@ -87,6 +87,9 @@ export class CatmullRomSpline {
       const p3 = i + 2 < n ? controlPoints[i + 2] : p2;
 
       const segDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const dt = Math.max(1, (p2.time || 0) - (p1.time || 0));
+      const segSpeed = segDist / dt; // real px/ms speed
+
       const subSteps = Math.max(2, Math.min(16, Math.ceil(segDist / 2)));
       const seg = this.interpolateSegment(p0, p1, p2, p3, subSteps);
       const startIdx = i === 0 ? 0 : 1;
@@ -97,16 +100,17 @@ export class CatmullRomSpline {
           totalDist += Math.hypot(pt.x - prev.x, pt.y - prev.y);
         }
         pt.distance = totalDist;
+        pt.speed = segSpeed;
         dense.push(pt);
       }
     }
 
     if (dense.length <= 1) return dense;
 
-    // 2. Uniform Arc-Length Resampling strictly by stepPx
-    const step = Math.max(0.5, stepPx || 4);
+    // 2. Uniform or Variable Arc-Length Resampling strictly by step distance
+    const initialStep = (typeof stepPx === 'function') ? Math.max(0.5, stepPx(dense[0])) : Math.max(0.5, stepPx || 4);
     const samples = [dense[0]];
-    let nextDist = step;
+    let nextDist = initialStep;
     let dIdx = 0;
 
     while (nextDist <= totalDist && dIdx < dense.length - 1) {
@@ -120,19 +124,26 @@ export class CatmullRomSpline {
       const span = pB.distance - pA.distance;
       const u = span > 0.0001 ? (nextDist - pA.distance) / span : 0;
 
-      samples.push({
+      const interpolatedSample = {
         x: pA.x + u * (pB.x - pA.x),
         y: pA.y + u * (pB.y - pA.y),
         pressure: pA.pressure + u * (pB.pressure - pA.pressure),
         time: pA.time + u * (pB.time - pA.time),
+        speed: (pA.speed || 0) + u * ((pB.speed || 0) - (pA.speed || 0)),
         distance: nextDist
-      });
+      };
+      samples.push(interpolatedSample);
 
-      nextDist += step;
+      const dynamicStep = (typeof stepPx === 'function')
+        ? Math.max(0.5, stepPx(interpolatedSample))
+        : Math.max(0.5, stepPx || 4);
+
+      nextDist += dynamicStep;
     }
 
     const lastDense = dense[dense.length - 1];
-    if (samples.length === 1 || Math.hypot(lastDense.x - samples[samples.length - 1].x, lastDense.y - samples[samples.length - 1].y) > step * 0.4) {
+    const finalStep = (typeof stepPx === 'function') ? Math.max(0.5, stepPx(lastDense)) : Math.max(0.5, stepPx || 4);
+    if (samples.length === 1 || Math.hypot(lastDense.x - samples[samples.length - 1].x, lastDense.y - samples[samples.length - 1].y) > finalStep * 0.4) {
       samples.push(lastDense);
     }
 

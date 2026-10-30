@@ -37,6 +37,7 @@ const MODULE_FILES = [
   'ui/ColorPicker.js',
   'ui/LayerPanel.js',
   'ui/BrushPanel.js',
+  'ui/LassoPanel.js',
   'ui/ToolPanel.js',
   'ui/SettingsDialog.js',
   'ui/Tutorial.js',

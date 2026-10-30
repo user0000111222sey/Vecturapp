@@ -37,7 +37,7 @@ export class SymmetryManager {
 
   hitTest(wx, wy, zoom = 1.0) {
     if (this.mode === 'off' || this.locked) return false;
-    const hitRadius = 28 / Math.max(0.1, zoom);
+    const hitRadius = Math.max(26, 26 / Math.max(0.1, zoom));
     const dist = Math.hypot(wx - this.centerX, wy - this.centerY);
     return dist <= hitRadius;
   }

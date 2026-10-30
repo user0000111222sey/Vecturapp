@@ -65,7 +65,20 @@ class VecturaApp {
     this.homeScreen = new HomeScreen(
       this.storage,
       (project) => this.loadProject(project),
-      (options) => this.createNewProject(options)
+      (options) => this.createNewProject(options),
+      async (id) => {
+        if (this.currentProject && this.currentProject.id === id) {
+          if (this.autosaveTimeout) {
+            clearTimeout(this.autosaveTimeout);
+            this.autosaveTimeout = null;
+          }
+          this.isDirty = false;
+          this.pendingSave = false;
+          this.currentProject = null;
+        }
+        await this.storage.deleteProject(id);
+      },
+      this
     );
 
     // 4. Bind History changes to UI & autosave
@@ -93,11 +106,11 @@ class VecturaApp {
     this.setupAutosave();
 
     try {
-      // 7. Load most recent project in background, and ALWAYS open on Project View (Artworks gallery)
-      await this.loadInitialProject();
+      // 7. ALWAYS open on Project View (Artworks gallery) by default
       if (this.homeScreen) {
         this.homeScreen.show();
       }
+      await this.loadInitialProject();
 
       // Android Lifecycle Hooks
       window.onAndroidPause = () => {
@@ -130,16 +143,18 @@ class VecturaApp {
       const all = await this.storage.getAllProjects();
       if (all && all.length > 0) {
         all.sort((a, b) => b.updatedAt - a.updatedAt);
-        await this.loadProject(all[0]);
-      } else {
-        await this.createNewProject({ width: 1080, height: 1080 });
+        await this.loadProject(all[0], false); // Keep gallery open on initial load
       }
-    } catch (_) {
-      await this.createNewProject({ width: 1080, height: 1080 });
+    } catch (err) {
+      console.warn('loadInitialProject error:', err);
     }
   }
 
-  async createNewProject(options = {}) {
+  async createNewProject(options = {}, hideGallery = true) {
+    if (this.isDirty && this.currentProject) {
+      await this.saveCurrentProject();
+    }
+
     const w = options.width || 1080;
     const h = options.height || 1080;
     const name = options.name || 'Untitled Artwork';
@@ -149,6 +164,7 @@ class VecturaApp {
       name: name,
       width: w,
       height: h,
+      folderId: options.folderId || null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
       layers: []
@@ -165,13 +181,18 @@ class VecturaApp {
       this.uiManager.closeSheets();
     }
 
-    this.homeScreen.hide();
+    if (hideGallery) {
+      this.homeScreen?.hide();
+    }
     this.vectorCanvas.viewport.fitToScreen();
     await this.saveCurrentProject();
   }
 
-  async loadProject(project) {
+  async loadProject(project, hideGallery = true) {
     if (!project) return;
+    if (this.isDirty && this.currentProject && this.currentProject.id !== project.id) {
+      await this.saveCurrentProject();
+    }
     this.currentProject = project;
 
     const w = project.width || 1080;
@@ -250,7 +271,9 @@ class VecturaApp {
       this.uiManager.closeSheets();
     }
 
-    this.homeScreen.hide();
+    if (hideGallery) {
+      this.homeScreen?.hide();
+    }
     this.vectorCanvas.viewport.fitToScreen();
   }
 
@@ -286,7 +309,16 @@ class VecturaApp {
         this.vectorCanvas.layerManager.layers.map(l => {
           return new Promise(resolve => {
             if (l.canvas && typeof l.canvas.toBlob === 'function') {
-              l.canvas.toBlob(blob => resolve(blob), 'image/png');
+              const timer = setTimeout(() => resolve(null), 1200);
+              try {
+                l.canvas.toBlob(blob => {
+                  clearTimeout(timer);
+                  resolve(blob);
+                }, 'image/png');
+              } catch (_) {
+                clearTimeout(timer);
+                resolve(null);
+              }
             } else {
               resolve(null);
             }
@@ -329,6 +361,7 @@ class VecturaApp {
         this.showToast('Failed to save project');
       } else {
         this.isDirty = false;
+        this.homeScreen?.refresh?.();
       }
     } catch (saveErr) {
       console.error('Failed to save project:', saveErr);
@@ -410,9 +443,17 @@ class VecturaApp {
     this.history.redo();
   }
 
-  openGallery() {
-    this.saveCurrentProject();
-    this.homeScreen.show();
+  async openGallery() {
+    if (this.homeScreen) {
+      this.homeScreen.show();
+    }
+    try {
+      if (this.isDirty && this.currentProject) {
+        await this.saveCurrentProject();
+      }
+    } catch (err) {
+      console.warn('saveCurrentProject error in openGallery:', err);
+    }
   }
 
   triggerHaptic() {
@@ -465,6 +506,18 @@ class VecturaApp {
   }
 }
 
-window.addEventListener('DOMContentLoaded', () => {
-  window.vecturaApp = new VecturaApp();
-});
+function bootVectura() {
+  if (!window.vecturaApp) {
+    try {
+      window.vecturaApp = new VecturaApp();
+    } catch (err) {
+      console.error('Critical Vectura startup error:', err);
+    }
+  }
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', bootVectura);
+} else {
+  bootVectura();
+}

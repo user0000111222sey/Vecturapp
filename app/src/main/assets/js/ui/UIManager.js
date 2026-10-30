@@ -14,6 +14,7 @@ import { LayerPanel } from './LayerPanel.js';
 import { BrushPanel } from './BrushPanel.js';
 import { ToolPanel } from './ToolPanel.js';
 import { SettingsDialog } from './SettingsDialog.js';
+import { LassoPanel } from './LassoPanel.js';
 
 const LAYOUT_STORAGE_KEY = 'vectura_ui_layout_v2';
 
@@ -103,6 +104,7 @@ export class UIManager {
     // Bottom Sheets
     this.sheetLayers = document.getElementById('sheet-layers');
     this.sheetBrushes = document.getElementById('sheet-brushes');
+    this.sheetLasso = document.getElementById('sheet-lasso');
     this.sheetColor = document.getElementById('sheet-color');
 
     // Modals
@@ -152,12 +154,23 @@ export class UIManager {
       this.vc.currentBrush,
       (brush) => {
         this.vc.currentBrush = brush;
-        this.updateEdgeSlidersFromBrush();
+        this.updateEdgeSliders();
         if (this.toolPanel) {
           this.toolPanel.render();
         }
       },
       this.vc.currentColor
+    );
+    if (this.brushPanel.currentBrush) {
+      this.vc.currentBrush = this.brushPanel.currentBrush;
+    }
+    this.setupEraserMenuEvents();
+
+    // 3b. Lasso Studio Panel
+    this.lassoPanel = new LassoPanel(
+      document.getElementById('sheet-lasso-content'),
+      this.vc.toolManager.lassoFill,
+      this.app
     );
 
     // 4. Tool Options Strip Panel
@@ -255,13 +268,33 @@ export class UIManager {
       this.hideChips();
     });
 
-    // Close more menu & shapes popover when tapping outside
+    document.getElementById('menu-btn-clear-canvas')?.addEventListener('click', () => {
+      this.closeMoreMenu();
+      const active = this.vc.layerManager.getActiveLayer();
+      if (active && !active.locked) {
+        this.layerPanel.executeLayerOp('Clear Layer', () => {
+          active.ctx.clearRect(0, 0, active.width, active.height);
+          active.updateThumbnail();
+        }, true);
+      }
+    });
+
+    document.getElementById('menu-btn-new-artwork')?.addEventListener('click', () => {
+      this.closeMoreMenu();
+      this.app?.homeScreen?.show();
+      this.app?.homeScreen?.openModal();
+    });
+
+    // Close more menu, shapes popover & eraser popover when tapping outside
     window.addEventListener('pointerdown', (e) => {
       if (!e.target.closest('#more-menu-popover, #btn-more-menu')) {
         this.closeMoreMenu();
       }
       if (!e.target.closest('#shapes-popover-menu, #top-btn-shapes')) {
         document.getElementById('shapes-popover-menu')?.classList.add('hidden');
+      }
+      if (!e.target.closest('#eraser-popover-menu, #bar-btn-eraser')) {
+        this.closeEraserMenu();
       }
     });
 
@@ -280,6 +313,10 @@ export class UIManager {
         this.vc.toolManager.selectionTool.clear();
       }
       this.selectTool('transform', 'top-btn-transform');
+    });
+
+    document.getElementById('top-btn-pan')?.addEventListener('click', () => {
+      this.selectTool('pan', 'top-btn-pan');
     });
 
     document.getElementById('top-btn-shapes')?.addEventListener('click', () => {
@@ -344,6 +381,17 @@ export class UIManager {
           this.toggleSheet('brushes');
           return;
         }
+        if (item.tool === 'eraser' && this.activeTool === 'eraser') {
+          // Second tap on active Eraser opens Eraser popup menu
+          this.toggleEraserMenu();
+          return;
+        }
+        if (item.tool === 'lasso-fill' && this.activeTool === 'lasso-fill') {
+          // Second tap on active Lasso opens Lasso Studio sheet
+          this.toggleSheet('lasso');
+          return;
+        }
+        this.closeEraserMenu();
         this.selectTool(item.tool, item.id);
       });
     }
@@ -369,6 +417,14 @@ export class UIManager {
     });
     document.getElementById('bp-tab-settings')?.addEventListener('click', () => {
       this.brushPanel.activeTab = 'settings';
+    });
+
+    // Header tabs for Lasso Studio
+    document.getElementById('lp-tab-library')?.addEventListener('click', () => {
+      this.lassoPanel.setTab('library');
+    });
+    document.getElementById('lp-tab-settings')?.addEventListener('click', () => {
+      this.lassoPanel.setTab('settings');
     });
 
     ['disc', 'classic', 'sliders', 'palettes'].forEach(t => {
@@ -408,7 +464,10 @@ export class UIManager {
         this.settingsDialog.close();
         return true;
       }
-      if (!document.getElementById('home-screen').classList.contains('hidden')) {
+      if (this.app.homeScreen && !document.getElementById('home-screen').classList.contains('hidden')) {
+        if (this.app.homeScreen.handleBack && this.app.homeScreen.handleBack()) {
+          return true;
+        }
         return false;
       }
       this.app.openGallery();
@@ -432,6 +491,8 @@ export class UIManager {
     }
 
     this.updateTopPanelContext(toolName);
+    this.updateEdgeSliders();
+    this.toolPanel?.update(toolName);
   }
 
   updateTopPanelContext(toolName) {
@@ -461,11 +522,20 @@ export class UIManager {
       });
       ctxEl.querySelector('#ctx-btn-invert')?.addEventListener('click', () => {
         this.vc.toolManager.selectionTool.invert(this.vc.docWidth, this.vc.docHeight);
+        this.vc.needsRender = true;
       });
       ctxEl.querySelector('#ctx-btn-clear')?.addEventListener('click', () => {
         const activeLayer = this.vc.layerManager.getActiveLayer();
-        if (activeLayer) {
-          this.vc.toolManager.selectionTool.clearSelectedArea(activeLayer);
+        if (activeLayer && this.vc.toolManager.selectionTool.hasSelection) {
+          this.vc.toolManager.selectionTool.clearSelectedArea(
+            activeLayer,
+            this.vc.history,
+            () => {
+              this.vc.layerManager.invalidateCaches();
+              this.vc.needsRender = true;
+              this.app?.markDirty?.();
+            }
+          );
         }
       });
     } else if (toolName === 'transform') {
@@ -519,6 +589,7 @@ export class UIManager {
 
     const map = {
       brushes: this.sheetBrushes,
+      lasso: this.sheetLasso,
       color: this.sheetColor,
       layers: this.sheetLayers
     };
@@ -529,13 +600,14 @@ export class UIManager {
       sheet.classList.add('open');
       if (name === 'layers') this.layerPanel.render();
       if (name === 'brushes') this.brushPanel.render();
+      if (name === 'lasso') this.lassoPanel.render();
       if (name === 'color') this.colorPicker.render();
     }
   }
 
   closeSheets() {
     this.activeSheet = null;
-    [this.sheetBrushes, this.sheetColor, this.sheetLayers].forEach(s => {
+    [this.sheetBrushes, this.sheetLasso, this.sheetColor, this.sheetLayers].forEach(s => {
       if (s) {
         s.classList.remove('open');
         s.style.transform = '';
@@ -545,7 +617,7 @@ export class UIManager {
   }
 
   setupSheetGestures() {
-    [this.sheetBrushes, this.sheetColor, this.sheetLayers].forEach(sheet => {
+    [this.sheetBrushes, this.sheetLasso, this.sheetColor, this.sheetLayers].forEach(sheet => {
       if (!sheet) return;
       const handleZone = sheet.querySelector('.sheet-drag-handle-zone');
       if (!handleZone) return;
@@ -636,22 +708,29 @@ export class UIManager {
       this.saveLayout();
     });
 
-    // Size slider interaction dynamically clamped to brush minSize/maxSize (never 0)
+    // Size slider interaction dynamically clamped to brush or eraser minSize/maxSize (never 0)
     this.bindVerticalTrack(
       document.getElementById('track-wrap-size'),
       document.getElementById('thumb-size'),
       document.getElementById('track-fill-size'),
       document.getElementById('bubble-size'),
       document.getElementById('slider-col-size'),
-      () => Math.max(1, Math.round(this.vc.currentBrush?.minSize || 1)),
-      () => Math.max(Math.max(1, Math.round(this.vc.currentBrush?.minSize || 1)) + 1, Math.round(this.vc.currentBrush?.maxSize || 200)),
-      () => Math.max(1, Math.round(this.vc.currentBrush?.size || 8)),
+      () => this.activeTool === 'eraser' ? 1 : Math.max(1, Math.round(this.vc.currentBrush?.minSize || 1)),
+      () => this.activeTool === 'eraser' ? 500 : Math.max(Math.max(1, Math.round(this.vc.currentBrush?.minSize || 1)) + 1, Math.round(this.vc.currentBrush?.maxSize || 200)),
+      () => this.activeTool === 'eraser' ? Math.max(1, Math.round(this.vc.currentEraser?.size || 28)) : Math.max(1, Math.round(this.vc.currentBrush?.size || 8)),
       (val) => {
-        if (this.vc.currentBrush) {
+        if (this.activeTool === 'eraser') {
+          if (this.vc.currentEraser) {
+            this.vc.currentEraser.size = Math.max(1, Math.min(500, val));
+            this.vc.saveEraserState?.();
+            this.syncEraserMenuUI();
+          }
+        } else if (this.vc.currentBrush) {
           const min = Math.max(1, Math.round(this.vc.currentBrush.minSize || 1));
           const max = Math.max(min + 1, Math.round(this.vc.currentBrush.maxSize || 200));
           const clamped = Math.max(min, Math.min(max, val));
           this.vc.currentBrush.size = clamped;
+          this.brushPanel?.persistBrushSettings?.(this.vc.currentBrush);
         }
       },
       (val) => `${val} px`
@@ -666,104 +745,280 @@ export class UIManager {
       document.getElementById('slider-col-opacity'),
       1, 100, 100,
       (val) => {
-        if (this.vc.currentBrush) {
+        if (this.activeTool === 'eraser') {
+          if (this.vc.currentEraser) {
+            this.vc.currentEraser.opacity = Math.max(0.01, Math.min(1.0, val / 100));
+            this.vc.saveEraserState?.();
+            this.syncEraserMenuUI();
+          }
+        } else if (this.vc.currentBrush) {
           this.vc.currentBrush.opacity = Math.max(0.01, Math.min(1.0, val / 100));
+          this.brushPanel?.persistBrushSettings?.(this.vc.currentBrush);
         }
       },
       (val) => `${val}%`
     );
   }
 
-  bindVerticalTrack(wrap, thumb, fill, bubble, colEl, min, max, initial, onChange, formatBubble) {
-    if (!wrap || !thumb) return;
+  bindVerticalTrack(trackWrap, thumb, fill, bubble, col, minOrGetter, maxOrGetter, valOrGetter, onChange, formatLabel) {
+    if (!trackWrap || !thumb || !fill) return;
 
-    const getMin = () => typeof min === 'function' ? min() : min;
-    const getMax = () => typeof max === 'function' ? max() : max;
+    let isDragging = false;
+    let fadeTimeout = null;
 
-    let currentValue = typeof initial === 'function' ? initial() : initial;
-    let fadeTimer = null;
-
-    const updateVisual = (val) => {
-      const curMin = getMin();
-      const curMax = getMax();
-      const pct = Math.max(0, Math.min(1, (val - curMin) / (curMax - curMin)));
-      const pctStr = `${Math.round(pct * 100)}%`;
-      thumb.style.bottom = pctStr;
-      if (fill) fill.style.height = pctStr;
-      if (bubble) bubble.textContent = formatBubble(val);
+    const showBubble = (text) => {
+      if (!bubble) return;
+      bubble.textContent = text;
+      bubble.classList.add('visible');
+      if (fadeTimeout) clearTimeout(fadeTimeout);
+      fadeTimeout = setTimeout(() => {
+        if (!isDragging) {
+          bubble.classList.remove('visible');
+        }
+      }, 900);
     };
 
-    const handlePointer = (e) => {
-      const rect = wrap.getBoundingClientRect();
-      const clampedY = Math.max(rect.top, Math.min(rect.bottom, e.clientY));
-      const normalized = 1.0 - (clampedY - rect.top) / rect.height;
-      const curMin = getMin();
-      const curMax = getMax();
-      currentValue = Math.max(curMin, Math.min(curMax, Math.round(curMin + normalized * (curMax - curMin))));
-      updateVisual(currentValue);
-      onChange(currentValue);
-    };
+    const updateFromPointer = (clientY) => {
+      const rect = trackWrap.getBoundingClientRect();
+      if (!rect || rect.height <= 0) return;
+      const pct = Math.max(0, Math.min(1, (rect.bottom - clientY) / rect.height));
+      const min = typeof minOrGetter === 'function' ? minOrGetter() : (typeof minOrGetter === 'number' ? minOrGetter : 1);
+      const max = typeof maxOrGetter === 'function' ? maxOrGetter() : (typeof maxOrGetter === 'number' ? maxOrGetter : 100);
+      const val = Math.round(min + pct * (max - min));
 
-    let isDown = false;
-    wrap.addEventListener('pointerdown', (e) => {
-      isDown = true;
-      colEl?.classList.add('dragging');
-      if (fadeTimer) clearTimeout(fadeTimer);
-      bubble?.classList.add('visible');
-      try { wrap.setPointerCapture(e.pointerId); } catch (_) {}
-      handlePointer(e);
-    });
+      thumb.style.bottom = `${Math.round(pct * 100)}%`;
+      fill.style.height = `${Math.round(pct * 100)}%`;
 
-    wrap.addEventListener('pointermove', (e) => {
-      if (isDown) {
-        if (fadeTimer) clearTimeout(fadeTimer);
-        bubble?.classList.add('visible');
-        handlePointer(e);
-      }
-    });
+      const label = formatLabel ? formatLabel(val) : `${val}`;
+      showBubble(label);
 
-    const onEnd = () => {
-      if (isDown) {
-        isDown = false;
-        colEl?.classList.remove('dragging');
-        if (fadeTimer) clearTimeout(fadeTimer);
-        fadeTimer = setTimeout(() => {
-          bubble?.classList.remove('visible');
-        }, 600);
+      if (typeof onChange === 'function') {
+        onChange(val);
       }
     };
 
-    wrap.addEventListener('pointerup', onEnd);
-    wrap.addEventListener('pointercancel', onEnd);
+    const onPointerDown = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      isDragging = true;
+      col?.classList.add('dragging');
+      if (trackWrap.setPointerCapture) {
+        try {
+          trackWrap.setPointerCapture(e.pointerId);
+        } catch (_) {}
+      }
+      updateFromPointer(e.clientY);
+    };
 
-    updateVisual(currentValue);
+    const onPointerMove = (e) => {
+      if (!isDragging) return;
+      e.preventDefault();
+      e.stopPropagation();
+      updateFromPointer(e.clientY);
+    };
+
+    const onPointerUp = (e) => {
+      if (!isDragging) return;
+      isDragging = false;
+      col?.classList.remove('dragging');
+      if (trackWrap.releasePointerCapture) {
+        try {
+          trackWrap.releasePointerCapture(e.pointerId);
+        } catch (_) {}
+      }
+      if (fadeTimeout) clearTimeout(fadeTimeout);
+      fadeTimeout = setTimeout(() => {
+        bubble?.classList.remove('visible');
+      }, 700);
+    };
+
+    trackWrap.addEventListener('pointerdown', onPointerDown);
+    trackWrap.addEventListener('pointermove', onPointerMove);
+    trackWrap.addEventListener('pointerup', onPointerUp);
+    trackWrap.addEventListener('pointercancel', onPointerUp);
+  }
+
+  setupEraserMenuEvents() {
+    const popover = document.getElementById('eraser-popover-menu');
+    if (!popover) return;
+
+    document.getElementById('eraser-popover-close')?.addEventListener('click', () => {
+      this.closeEraserMenu();
+    });
+
+    const sizeSlider = document.getElementById('eraser-size-slider');
+    const sizeVal = document.getElementById('eraser-size-val');
+    const opacitySlider = document.getElementById('eraser-opacity-slider');
+    const opacityVal = document.getElementById('eraser-opacity-val');
+    const hardnessSlider = document.getElementById('eraser-hardness-slider');
+    const hardnessVal = document.getElementById('eraser-hardness-val');
+    const spacingSlider = document.getElementById('eraser-spacing-slider');
+    const spacingVal = document.getElementById('eraser-spacing-val');
+
+    sizeSlider?.addEventListener('input', (e) => {
+      const v = parseInt(e.target.value, 10);
+      this.vc.currentEraser.size = v;
+      if (sizeVal) sizeVal.textContent = `${v}px`;
+      this.vc.saveEraserState?.();
+      this.updateEdgeSliders();
+    });
+
+    opacitySlider?.addEventListener('input', (e) => {
+      const v = parseInt(e.target.value, 10);
+      this.vc.currentEraser.opacity = v / 100;
+      if (opacityVal) opacityVal.textContent = `${v}%`;
+      this.vc.saveEraserState?.();
+      this.updateEdgeSliders();
+    });
+
+    hardnessSlider?.addEventListener('input', (e) => {
+      const v = parseInt(e.target.value, 10);
+      this.vc.currentEraser.hardness = v / 100;
+      if (hardnessVal) hardnessVal.textContent = `${v}%`;
+      this.vc.saveEraserState?.();
+    });
+
+    spacingSlider?.addEventListener('input', (e) => {
+      const v = parseInt(e.target.value, 10);
+      this.vc.currentEraser.spacing = v / 100;
+      if (spacingVal) spacingVal.textContent = `${v}%`;
+      this.vc.saveEraserState?.();
+    });
+
+    // Preset types: Hard, Airbrush, Soft
+    popover.querySelectorAll('.eraser-type-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        const type = chip.dataset.type;
+        popover.querySelectorAll('.eraser-type-chip').forEach(c => {
+          const isActive = c.dataset.type === type;
+          c.classList.toggle('active', isActive);
+          c.style.background = isActive ? 'var(--accent)' : 'var(--control)';
+          c.style.color = isActive ? '#ffffff' : 'var(--text)';
+        });
+
+        this.vc.currentEraser.type = type;
+        if (type === 'hard') {
+          this.vc.currentEraser.hardness = 1.0;
+          this.vc.currentEraser.spacing = 0.05;
+          this.vc.currentEraser.tipShape = 'round';
+        } else if (type === 'airbrush') {
+          this.vc.currentEraser.hardness = 0.1;
+          this.vc.currentEraser.spacing = 0.04;
+          this.vc.currentEraser.tipShape = 'soft';
+        } else if (type === 'soft') {
+          this.vc.currentEraser.hardness = 0.4;
+          this.vc.currentEraser.spacing = 0.06;
+          this.vc.currentEraser.tipShape = 'soft';
+        }
+        this.vc.saveEraserState?.();
+        this.syncEraserMenuUI();
+        this.updateEdgeSliders();
+      });
+    });
+
+    this.syncEraserMenuUI();
+  }
+
+  syncEraserMenuUI() {
+    const e = this.vc.currentEraser;
+    if (!e) return;
+    const popover = document.getElementById('eraser-popover-menu');
+    if (!popover) return;
+
+    popover.querySelectorAll('.eraser-type-chip').forEach(c => {
+      const isActive = c.dataset.type === (e.type || 'hard');
+      c.classList.toggle('active', isActive);
+      c.style.background = isActive ? 'var(--accent)' : 'var(--control)';
+      c.style.color = isActive ? '#ffffff' : 'var(--text)';
+    });
+
+    const sizeSlider = document.getElementById('eraser-size-slider');
+    const sizeVal = document.getElementById('eraser-size-val');
+    const opacitySlider = document.getElementById('eraser-opacity-slider');
+    const opacityVal = document.getElementById('eraser-opacity-val');
+    const hardnessSlider = document.getElementById('eraser-hardness-slider');
+    const hardnessVal = document.getElementById('eraser-hardness-val');
+    const spacingSlider = document.getElementById('eraser-spacing-slider');
+    const spacingVal = document.getElementById('eraser-spacing-val');
+
+    if (sizeSlider) sizeSlider.value = e.size || 28;
+    if (sizeVal) sizeVal.textContent = `${Math.round(e.size || 28)}px`;
+    if (opacitySlider) opacitySlider.value = Math.round((e.opacity ?? 1.0) * 100);
+    if (opacityVal) opacityVal.textContent = `${Math.round((e.opacity ?? 1.0) * 100)}%`;
+    if (hardnessSlider) hardnessSlider.value = Math.round((e.hardness ?? 1.0) * 100);
+    if (hardnessVal) hardnessVal.textContent = `${Math.round((e.hardness ?? 1.0) * 100)}%`;
+    if (spacingSlider) spacingSlider.value = Math.round((e.spacing ?? 0.05) * 100);
+    if (spacingVal) spacingVal.textContent = `${Math.round((e.spacing ?? 0.05) * 100)}%`;
+  }
+
+  toggleEraserMenu() {
+    const popover = document.getElementById('eraser-popover-menu');
+    if (popover) {
+      const isHidden = popover.classList.contains('hidden');
+      if (isHidden) {
+        this.syncEraserMenuUI();
+        popover.classList.remove('hidden');
+      } else {
+        popover.classList.add('hidden');
+      }
+    }
+  }
+
+  closeEraserMenu() {
+    document.getElementById('eraser-popover-menu')?.classList.add('hidden');
+  }
+
+  updateEdgeSliders() {
+    if (this.activeTool === 'eraser') {
+      const e = this.vc.currentEraser;
+      if (!e) return;
+      const minSize = 1;
+      const maxSize = 500;
+      const curSize = Math.max(1, Math.min(500, e.size || 28));
+
+      const thumbSize = document.getElementById('thumb-size');
+      const fillSize = document.getElementById('track-fill-size');
+      const bubbleSize = document.getElementById('bubble-size');
+      const pctSize = Math.max(0, Math.min(1, (curSize - minSize) / (maxSize - minSize)));
+      if (thumbSize) thumbSize.style.bottom = `${Math.round(pctSize * 100)}%`;
+      if (fillSize) fillSize.style.height = `${Math.round(pctSize * 100)}%`;
+      if (bubbleSize) bubbleSize.textContent = `${Math.round(curSize)} px`;
+
+      const opac = Math.round((e.opacity ?? 1.0) * 100);
+      const thumbOpac = document.getElementById('thumb-opacity');
+      const fillOpac = document.getElementById('track-fill-opacity');
+      const bubbleOpac = document.getElementById('bubble-opacity');
+      if (thumbOpac) thumbOpac.style.bottom = `${opac}%`;
+      if (fillOpac) fillOpac.style.height = `${opac}%`;
+      if (bubbleOpac) bubbleOpac.textContent = `${opac}%`;
+    } else {
+      const b = this.vc.currentBrush;
+      if (!b) return;
+
+      const minSize = Math.max(1, Math.round(b.minSize || 1));
+      const maxSize = Math.max(minSize + 1, Math.round(b.maxSize || 200));
+      b.size = Math.max(minSize, Math.min(maxSize, b.size || 8));
+
+      const thumbSize = document.getElementById('thumb-size');
+      const fillSize = document.getElementById('track-fill-size');
+      const bubbleSize = document.getElementById('bubble-size');
+      const pctSize = Math.max(0, Math.min(1, (b.size - minSize) / (maxSize - minSize)));
+      if (thumbSize) thumbSize.style.bottom = `${Math.round(pctSize * 100)}%`;
+      if (fillSize) fillSize.style.height = `${Math.round(pctSize * 100)}%`;
+      if (bubbleSize) bubbleSize.textContent = `${Math.round(b.size)} px`;
+
+      const opac = Math.round((b.opacity ?? 1.0) * 100);
+      const thumbOpac = document.getElementById('thumb-opacity');
+      const fillOpac = document.getElementById('track-fill-opacity');
+      const bubbleOpac = document.getElementById('bubble-opacity');
+      if (thumbOpac) thumbOpac.style.bottom = `${opac}%`;
+      if (fillOpac) fillOpac.style.height = `${opac}%`;
+      if (bubbleOpac) bubbleOpac.textContent = `${opac}%`;
+    }
   }
 
   updateEdgeSlidersFromBrush() {
-    const b = this.vc.currentBrush;
-    if (!b) return;
-
-    // Enforce and clamp size within brush minSize & maxSize
-    const minSize = Math.max(1, Math.round(b.minSize || 1));
-    const maxSize = Math.max(minSize + 1, Math.round(b.maxSize || 200));
-    b.size = Math.max(minSize, Math.min(maxSize, b.size || 8));
-
-    const thumbSize = document.getElementById('thumb-size');
-    const fillSize = document.getElementById('track-fill-size');
-    const bubbleSize = document.getElementById('bubble-size');
-    const pctSize = Math.max(0, Math.min(1, (b.size - minSize) / (maxSize - minSize)));
-    if (thumbSize) thumbSize.style.bottom = `${Math.round(pctSize * 100)}%`;
-    if (fillSize) fillSize.style.height = `${Math.round(pctSize * 100)}%`;
-    if (bubbleSize) bubbleSize.textContent = `${Math.round(b.size)} px`;
-
-    // Opacity
-    const opac = Math.round((b.opacity ?? 1.0) * 100);
-    const thumbOpac = document.getElementById('thumb-opacity');
-    const fillOpac = document.getElementById('track-fill-opacity');
-    const bubbleOpac = document.getElementById('bubble-opacity');
-    if (thumbOpac) thumbOpac.style.bottom = `${opac}%`;
-    if (fillOpac) fillOpac.style.height = `${opac}%`;
-    if (bubbleOpac) bubbleOpac.textContent = `${opac}%`;
+    this.updateEdgeSliders();
   }
 
   setupViewportFeedback() {

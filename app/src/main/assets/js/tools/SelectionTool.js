@@ -3,6 +3,8 @@
  * High-performance rectangular box selection with animated marching ants overlay,
  * pixel extraction, clearing, and transform integration.
  */
+import { cropBoundingBox, RasterCommand } from '../history/Command.js';
+
 export class SelectionTool {
   constructor(docWidth = 1080, docHeight = 1080) {
     this.docWidth = docWidth;
@@ -78,11 +80,32 @@ export class SelectionTool {
     this.box = null;
     this.hasSelection = false;
     this.active = false;
+    this.isInverse = false;
   }
 
   selectAll() {
     this.box = { x: 0, y: 0, w: this.docWidth, h: this.docHeight };
     this.hasSelection = true;
+    this.isInverse = false;
+  }
+
+  invert(docWidth = this.docWidth, docHeight = this.docHeight) {
+    this.docWidth = docWidth || this.docWidth;
+    this.docHeight = docHeight || this.docHeight;
+
+    if (!this.hasSelection || !this.box) {
+      this.selectAll();
+      return;
+    }
+
+    if (this.box.x === 0 && this.box.y === 0 && this.box.w >= this.docWidth && this.box.h >= this.docHeight) {
+      if (!this.isInverse) {
+        this.clear();
+        return;
+      }
+    }
+
+    this.isInverse = !this.isInverse;
   }
 
   getBounds() {
@@ -101,12 +124,13 @@ export class SelectionTool {
 
   containsPoint(x, y) {
     const b = this.getBounds();
-    if (!b) return false;
-    return x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h;
+    if (!b) return true;
+    const inside = x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h;
+    return this.isInverse ? !inside : inside;
   }
 
   /**
-   * Cuts the raster pixels inside the box selection from the given layer.
+   * Cuts the raster pixels inside the selection from the given layer.
    * Returns a detached canvas containing the extracted content.
    */
   cutSelectedPixels(layer) {
@@ -138,13 +162,44 @@ export class SelectionTool {
   }
 
   /**
-   * Clears the raster content inside the selection box on the layer.
+   * Clears the raster content inside the selection area on the layer.
+   * Creates ONE undoable command (single undo step) if history is provided.
    */
-  clearSelectedArea(layer) {
+  clearSelectedArea(layer, history = null, onRedraw = null) {
     if (!this.hasSelection || !this.box || !layer) return;
     const { x, y, w, h } = this.box;
-    layer.ctx.clearRect(x, y, w, h);
+
+    const bbox = this.isInverse
+      ? { x: 0, y: 0, width: this.docWidth, height: this.docHeight }
+      : { x, y, width: w, height: h };
+
+    let beforeSnapshot = null;
+    if (history && typeof cropBoundingBox === 'function') {
+      beforeSnapshot = cropBoundingBox(layer.canvas, bbox);
+    }
+
+    layer.ctx.save();
+    if (!this.isInverse) {
+      layer.ctx.clearRect(x, y, w, h);
+    } else {
+      // Clear 4 boundary rects outside the box
+      if (y > 0) layer.ctx.clearRect(0, 0, this.docWidth, y);
+      const btmY = y + h;
+      if (btmY < this.docHeight) layer.ctx.clearRect(0, btmY, this.docWidth, this.docHeight - btmY);
+      if (x > 0) layer.ctx.clearRect(0, y, x, h);
+      const rgtX = x + w;
+      if (rgtX < this.docWidth) layer.ctx.clearRect(rgtX, y, this.docWidth - rgtX, h);
+    }
+    layer.ctx.restore();
     layer.updateThumbnail();
+
+    if (history && beforeSnapshot && typeof RasterCommand === 'function') {
+      const afterSnapshot = cropBoundingBox(layer.canvas, bbox);
+      const cmd = new RasterCommand('Clear Selection', layer, beforeSnapshot, afterSnapshot, onRedraw, bbox);
+      history.push(cmd);
+    }
+
+    onRedraw?.(layer);
   }
 
   /**
@@ -160,15 +215,22 @@ export class SelectionTool {
     const lw = Math.max(1, 1.5 / zoom);
     targetCtx.lineWidth = lw;
 
-    // Outer dark stroke
-    targetCtx.strokeStyle = '#1B1B1D';
-    targetCtx.strokeRect(bounds.x, bounds.y, bounds.w, bounds.h);
+    const drawAntsRect = (rx, ry, rw, rh) => {
+      targetCtx.strokeStyle = '#1B1B1D';
+      targetCtx.setLineDash([]);
+      targetCtx.strokeRect(rx, ry, rw, rh);
 
-    // Inner marching ants stroke
-    targetCtx.strokeStyle = '#FFFFFF';
-    targetCtx.setLineDash([5 / zoom, 5 / zoom]);
-    targetCtx.lineDashOffset = -this.dashOffset / zoom;
-    targetCtx.strokeRect(bounds.x, bounds.y, bounds.w, bounds.h);
+      targetCtx.strokeStyle = '#FFFFFF';
+      targetCtx.setLineDash([5 / zoom, 5 / zoom]);
+      targetCtx.lineDashOffset = -this.dashOffset / zoom;
+      targetCtx.strokeRect(rx, ry, rw, rh);
+    };
+
+    if (this.isInverse) {
+      drawAntsRect(0, 0, this.docWidth, this.docHeight);
+    }
+
+    drawAntsRect(bounds.x, bounds.y, bounds.w, bounds.h);
 
     // Corner grip handles
     targetCtx.fillStyle = '#3B6EDC';

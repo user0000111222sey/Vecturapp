@@ -32,11 +32,16 @@ export class LayerManager {
     this.cachedComposite.height = docHeight;
     this.cachedCompositeCtx = this.cachedComposite.getContext('2d');
 
-    // Clipping group offscreen buffer
+    // Clipping group offscreen buffers
     this.clipGroupCanvas = document.createElement('canvas');
     this.clipGroupCanvas.width = docWidth;
     this.clipGroupCanvas.height = docHeight;
     this.clipGroupCtx = this.clipGroupCanvas.getContext('2d');
+
+    this.singleClipCanvas = document.createElement('canvas');
+    this.singleClipCanvas.width = docWidth;
+    this.singleClipCanvas.height = docHeight;
+    this.singleClipCtx = this.singleClipCanvas.getContext('2d');
 
     this.needsRecomposite = true;
 
@@ -68,6 +73,10 @@ export class LayerManager {
     this.cacheAbove.height = newH;
     this.cachedComposite.width = newW;
     this.cachedComposite.height = newH;
+    this.clipGroupCanvas.width = newW;
+    this.clipGroupCanvas.height = newH;
+    this.singleClipCanvas.width = newW;
+    this.singleClipCanvas.height = newH;
     this.invalidateCaches();
   }
 
@@ -345,22 +354,39 @@ export class LayerManager {
         }
         this.clipGroupCtx.restore();
 
-        // 2. Draw each clipped layer above it with source-atop
+        // 2. Draw each clipped layer above it respecting its own blend mode
         for (let k = i + 1; k < j; k++) {
           const clipL = this.layers[k];
           if (!clipL.visible) continue;
 
-          this.clipGroupCtx.save();
-          this.clipGroupCtx.globalCompositeOperation = 'source-atop';
-          this.clipGroupCtx.globalAlpha = clipL.opacity;
-          this.clipGroupCtx.drawImage(clipL.canvas, 0, 0);
+          // Render clipL into isolated singleClip buffer
+          this.singleClipCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+          this.singleClipCtx.save();
+          this.singleClipCtx.globalAlpha = clipL.opacity;
+          this.singleClipCtx.globalCompositeOperation = 'source-over';
+          this.singleClipCtx.drawImage(clipL.canvas, 0, 0);
 
           if (clipL === active && liveStrokeCanvas) {
-            this.clipGroupCtx.save();
-            this.clipGroupCtx.globalAlpha = liveOpacity;
-            this.clipGroupCtx.drawImage(liveStrokeCanvas, 0, 0);
-            this.clipGroupCtx.restore();
+            this.singleClipCtx.save();
+            this.singleClipCtx.globalAlpha = liveOpacity;
+            this.singleClipCtx.globalCompositeOperation = clipL.alphaLock ? 'source-atop' : getCanvasCompositeOp(liveBlendMode);
+            this.singleClipCtx.drawImage(liveStrokeCanvas, 0, 0);
+            this.singleClipCtx.restore();
           }
+          this.singleClipCtx.restore();
+
+          // Mask clipL to base layer's alpha shape
+          this.singleClipCtx.save();
+          this.singleClipCtx.globalCompositeOperation = 'destination-in';
+          this.singleClipCtx.globalAlpha = 1.0;
+          this.singleClipCtx.drawImage(layer.canvas, 0, 0);
+          this.singleClipCtx.restore();
+
+          // Composite masked clipL into group with its OWN blend mode
+          this.clipGroupCtx.save();
+          this.clipGroupCtx.globalCompositeOperation = getCanvasCompositeOp(clipL.blendMode);
+          this.clipGroupCtx.globalAlpha = 1.0;
+          this.clipGroupCtx.drawImage(this.singleClipCanvas, 0, 0);
           this.clipGroupCtx.restore();
         }
 

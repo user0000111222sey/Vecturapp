@@ -256,4 +256,60 @@ export class CoherentNoise {
     }
     return points;
   }
+
+  /**
+   * Evaluates 2D Perlin-style gradient noise with octaves.
+   * Returns smooth continuous value strictly normalized to [-1.0, +1.0].
+   */
+  static noise2D(x, y, seed = 1337, octaves = 3, persistence = 0.5, lacunarity = 2.0) {
+    let total = 0;
+    let frequency = 1.0;
+    let amplitude = 1.0;
+    let maxValue = 0;
+
+    const smoothstep = (t) => t * t * (3 - 2 * t);
+    const hash = (ix, iy, o) => {
+      let h = Math.imul(ix ^ (seed + o * 1013), 0x45d9f3b);
+      h = Math.imul(h ^ (iy + 0x9e3779b9), 0x27d4eb2d);
+      return h ^ (h >>> 15);
+    };
+
+    const gradDot = (ix, iy, fx, fy, o) => {
+      const h = hash(ix, iy, o) & 7;
+      let u = h < 4 ? fx : fy;
+      let v = h < 4 ? fy : fx;
+      return ((h & 1) ? -u : u) + ((h & 2) ? -2.0 * v : 2.0 * v);
+    };
+
+    const oct = Math.min(6, Math.max(1, octaves));
+    for (let o = 0; o < oct; o++) {
+      const sx = x * frequency;
+      const sy = y * frequency;
+      const x0 = Math.floor(sx);
+      const y0 = Math.floor(sy);
+      const x1 = x0 + 1;
+      const y1 = y0 + 1;
+      const fx = sx - x0;
+      const fy = sy - y0;
+
+      const wx = smoothstep(fx);
+      const wy = smoothstep(fy);
+
+      const d00 = gradDot(x0, y0, fx, fy, o);
+      const d10 = gradDot(x1, y0, fx - 1, fy, o);
+      const d01 = gradDot(x0, y1, fx, fy - 1, o);
+      const d11 = gradDot(x1, y1, fx - 1, fy - 1, o);
+
+      const nx0 = d00 * (1 - wx) + d10 * wx;
+      const nx1 = d01 * (1 - wx) + d11 * wx;
+      const val = nx0 * (1 - wy) + nx1 * wy;
+
+      total += val * amplitude;
+      maxValue += amplitude;
+      amplitude *= persistence;
+      frequency *= lacunarity;
+    }
+
+    return maxValue > 0 ? Math.max(-1.0, Math.min(1.0, total / (maxValue * 1.5))) : 0;
+  }
 }

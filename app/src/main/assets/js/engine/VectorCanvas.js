@@ -54,6 +54,27 @@ export class VectorCanvas {
     this.toolManager = new ToolManager(docWidth, docHeight);
     this.history = null; // Injected from app
 
+    // Soft stamp sprite cache to avoid radial gradient recreation on every stamp
+    this.softStampCache = new Map();
+
+    // Separate eraser state (remembered independently from pen)
+    this.currentEraser = {
+      type: 'hard',
+      size: 28,
+      minSize: 1,
+      maxSize: 500,
+      opacity: 1.0,
+      hardness: 1.0,
+      spacing: 0.05,
+      tipShape: 'round'
+    };
+    try {
+      const savedEraser = localStorage.getItem('vectura_eraser_state');
+      if (savedEraser) {
+        Object.assign(this.currentEraser, JSON.parse(savedEraser));
+      }
+    } catch (_) {}
+
     // Live stroke buffer canvas (uncommitted drawing)
     this.liveCanvas = document.createElement('canvas');
     this.liveCanvas.width = docWidth;
@@ -74,6 +95,8 @@ export class VectorCanvas {
     this.currentBrush = null;
     this.currentColor = '#8b5cf6';
     this.beforeStrokeCanvas = null;
+    this.lastRenderedSampleIndex = 0;
+    this.lastStampRadius = null;
 
     // Active fill animations list (non-blocking)
     this.activeFillAnimations = [];
@@ -128,6 +151,55 @@ export class VectorCanvas {
   render() {
     this.needsRender = true;
     this.layerManager?.invalidateCaches();
+  }
+
+  saveEraserState() {
+    try {
+      localStorage.setItem('vectura_eraser_state', JSON.stringify(this.currentEraser));
+    } catch (_) {}
+  }
+
+  /**
+   * Caches circular soft stamp sprites to eliminate per-stamp radial gradient creation overhead
+   */
+  getSoftStampSprite(color, radius, hardness = 0.8, wetEdge = 0) {
+    const r = Math.max(1, Math.round(radius));
+    const h = Math.round((hardness ?? 0.8) * 100) / 100;
+    const we = Math.round((wetEdge ?? 0) * 100) / 100;
+    const key = `${color}_${r}_${h}_${we}`;
+    let sprite = this.softStampCache.get(key);
+    if (sprite) return { canvas: sprite, radius: r };
+
+    const pad = 2;
+    const size = r * 2 + pad * 2;
+    sprite = document.createElement('canvas');
+    sprite.width = size;
+    sprite.height = size;
+    const sCtx = sprite.getContext('2d');
+    const cx = size / 2;
+    const cy = size / 2;
+
+    const grad = sCtx.createRadialGradient(cx, cy, Math.max(0.01, r * Math.max(0.05, h)), cx, cy, r);
+    grad.addColorStop(0, color);
+    if (we > 0.05) {
+      const rim = Math.max(0.65, Math.min(0.95, 1 - (1 - h) * 0.3));
+      grad.addColorStop(rim, color);
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+    } else {
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+    }
+
+    sCtx.fillStyle = grad;
+    sCtx.beginPath();
+    sCtx.arc(cx, cy, r, 0, Math.PI * 2);
+    sCtx.fill();
+
+    if (this.softStampCache.size > 256) {
+      const firstKey = this.softStampCache.keys().next().value;
+      this.softStampCache.delete(firstKey);
+    }
+    this.softStampCache.set(key, sprite);
+    return { canvas: sprite, radius: r };
   }
 
   setDocumentSize(w, h) {
@@ -315,12 +387,17 @@ export class VectorCanvas {
     // 4. Left click (0) on workspace outside artwork bounds
     const isPanTool = this.toolManager.activeTool === 'pan';
     const isOutsideDoc = world.x < 0 || world.x > this.docWidth || world.y < 0 || world.y > this.docHeight;
-    const isMousePan = (e.pointerType === 'mouse' && (e.button === 1 || e.button === 2 || this.isSpaceDown || e.altKey || isPanTool || (e.button === 0 && isOutsideDoc))) || (isPanTool && e.button === 0);
+    const shouldPan = isPanTool || (e.pointerType === 'mouse' && (e.button === 1 || e.button === 2 || this.isSpaceDown || e.altKey || (e.button === 0 && isOutsideDoc)));
 
-    if (isMousePan) {
+    if (shouldPan) {
+      this.isPanning = true;
       this.isMousePanning = true;
+      this.lastPanPos = { x: pos.x, y: pos.y };
       this.lastMousePanPos = { x: pos.x, y: pos.y };
       this.viewportCanvas.style.cursor = 'grabbing';
+      try {
+        this.viewportCanvas.setPointerCapture(e.pointerId);
+      } catch (_) {}
       return;
     }
 
@@ -343,6 +420,9 @@ export class VectorCanvas {
       if (this.toolManager.symmetry.mode !== 'off' && !this.toolManager.symmetry.locked) {
         if (this.toolManager.symmetry.hitTest(world.x, world.y, this.viewport.zoom)) {
           this.isDraggingSymmetry = true;
+          try {
+            this.viewportCanvas.setPointerCapture(e.pointerId);
+          } catch (_) {}
           this.cancelLongPress();
           this.onHaptic?.();
           return;
@@ -371,7 +451,7 @@ export class VectorCanvas {
         });
         return;
       } else if (this.toolManager.activeTool === 'lasso-fill') {
-        this.toolManager.lassoFill.start(world.x, world.y);
+        this.toolManager.lassoFill.start(world.x, world.y, e.timeStamp || Date.now());
         return;
       } else if (this.toolManager.activeTool === 'selection') {
         this.toolManager.selectionTool.start(world.x, world.y);
@@ -458,6 +538,7 @@ export class VectorCanvas {
       // 2 or more fingers: Cancel any active stroke/tool & initialize Pinch / Pan / Rotate
       this.cancelAllActiveTools();
       this.isNavigating = true;
+      this.navigationGestureOccurred = true;
 
       const pts = Array.from(this.activePointers.values());
       const p1 = pts[0], p2 = pts[1];
@@ -468,7 +549,6 @@ export class VectorCanvas {
       this.initialPinchDist = this.lastPinchDist;
       this.initialPinchAngle = this.lastPinchAngle;
       this.initialPinchCenter = { ...this.lastPinchCenter };
-      this.navigationGestureOccurred = false;
     }
   }
 
@@ -476,13 +556,18 @@ export class VectorCanvas {
     e.preventDefault();
     const pos = this.getPointerPos(e);
 
-    // Mouse Pan Navigation
-    if (this.isMousePanning) {
-      const dx = pos.x - this.lastMousePanPos.x;
-      const dy = pos.y - this.lastMousePanPos.y;
-      this.viewport.panBy(dx, dy);
-      this.viewport.onNavigate?.(this.viewport.zoom, this.viewport.rotation);
-      this.lastMousePanPos = { x: pos.x, y: pos.y };
+    // Pan Navigation (single-touch Pan tool, mouse pan, spacebar pan)
+    if (this.isPanning || this.isMousePanning) {
+      const last = this.lastPanPos || this.lastMousePanPos;
+      if (last) {
+        const dx = pos.x - last.x;
+        const dy = pos.y - last.y;
+        this.viewport.panBy(dx, dy);
+        this.viewport.onNavigate?.(this.viewport.zoom, this.viewport.rotation);
+        this.lastPanPos = { x: pos.x, y: pos.y };
+        this.lastMousePanPos = { x: pos.x, y: pos.y };
+        this.needsRender = true;
+      }
       return;
     }
 
@@ -499,6 +584,46 @@ export class VectorCanvas {
 
     this.activePointers.set(e.pointerId, { x: pos.x, y: pos.y, time: performance.now() });
 
+    // Multi-finger pinch / pan / rotate navigation
+    if (this.activePointers.size >= 2) {
+      this.cancelAllActiveTools();
+      this.isNavigating = true;
+      this.navigationGestureOccurred = true;
+
+      const pts = Array.from(this.activePointers.values());
+      const p1 = pts[0], p2 = pts[1];
+      const curDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const curAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+      const curCenter = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+
+      if (this.lastPinchCenter && this.lastPinchDist > 0) {
+        // Pan
+        const dx = curCenter.x - this.lastPinchCenter.x;
+        const dy = curCenter.y - this.lastPinchCenter.y;
+        this.viewport.panBy(dx, dy);
+
+        // Zoom
+        const factor = curDist / this.lastPinchDist;
+        if (factor > 0.01 && factor < 100) {
+          this.viewport.zoomAt(factor, curCenter.x, curCenter.y);
+        }
+
+        // Rotate
+        let deltaAngle = curAngle - this.lastPinchAngle;
+        while (deltaAngle > Math.PI) deltaAngle -= 2 * Math.PI;
+        while (deltaAngle < -Math.PI) deltaAngle += 2 * Math.PI;
+        this.viewport.rotateAt(deltaAngle, curCenter.x, curCenter.y);
+
+        this.viewport.onNavigate?.(this.viewport.zoom, this.viewport.rotation);
+        this.needsRender = true;
+      }
+
+      this.lastPinchDist = curDist;
+      this.lastPinchAngle = curAngle;
+      this.lastPinchCenter = curCenter;
+      return;
+    }
+
     // Handle Eyedropper sampling if active
     if (this.toolManager.eyedropper.active) {
       const world = this.viewport.screenToWorld(pos.x, pos.y);
@@ -509,7 +634,7 @@ export class VectorCanvas {
     }
 
     // If navigating or multi-touch is active, don't execute any single-pointer tool
-    if (this.isNavigating || this.activePointers.size >= 2 || performance.now() - (this.lastNavigationTime || 0) < 250) {
+    if (this.isNavigating || performance.now() - (this.lastNavigationTime || 0) < 250) {
       this.cancelAllActiveTools();
       return;
     }
@@ -538,7 +663,7 @@ export class VectorCanvas {
       this.needsRender = true;
       return;
     } else if (this.toolManager.activeTool === 'lasso-fill' && this.toolManager.lassoFill.active) {
-      this.toolManager.lassoFill.addPoint(world.x, world.y);
+      this.toolManager.lassoFill.addPoint(world.x, world.y, e.timeStamp || Date.now());
       this.needsRender = true;
       return;
     } else if (this.toolManager.activeTool === 'shape' && this.toolManager.shapeTool.active) {
@@ -579,8 +704,11 @@ export class VectorCanvas {
     this.cancelLongPress();
     if (this.shapeHoldTimer) clearTimeout(this.shapeHoldTimer);
 
-    if (this.isMousePanning) {
+    if (this.isPanning || this.isMousePanning) {
+      this.isPanning = false;
       this.isMousePanning = false;
+      this.lastPanPos = null;
+      this.lastMousePanPos = null;
       const isPan = this.toolManager.activeTool === 'pan' || this.toolManager.activeTool === 'transform';
       this.viewportCanvas.style.cursor = isPan ? 'grab' : (this.isSpaceDown ? 'grab' : 'crosshair');
       return;
@@ -591,6 +719,13 @@ export class VectorCanvas {
     const maxPointers = this.multiTouchTap.maxPointers;
 
     this.activePointers.delete(e.pointerId);
+    if (this.activePointers.size < 2) {
+      this.touchPinchDist = 0;
+      this.touchPinchCenter = null;
+      this.lastPinchDist = 0;
+      this.lastPinchCenter = null;
+      this.lastNavigationTime = performance.now();
+    }
 
     if (this.isDraggingSymmetry) {
       this.isDraggingSymmetry = false;
@@ -682,7 +817,7 @@ export class VectorCanvas {
             height: Math.min(this.docHeight, Math.ceil(maxY - minY + 8))
           } : null;
           const beforeSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
-          this.toolManager.lassoFill.finish(activeLayer, this.currentColor, false);
+          this.toolManager.lassoFill.finish(activeLayer, this.currentColor, this.currentBrush?.opacity ?? 1.0, this.toolManager.selectionTool);
           const afterSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
           this.layerManager.invalidateCaches();
           if (this.history) {
@@ -744,12 +879,18 @@ export class VectorCanvas {
   onPointerCancel(e) {
     this.cancelLongPress();
     if (this.shapeHoldTimer) clearTimeout(this.shapeHoldTimer);
-    if (this.isMousePanning) {
+    if (this.isPanning || this.isMousePanning) {
+      this.isPanning = false;
       this.isMousePanning = false;
+      this.lastPanPos = null;
+      this.lastMousePanPos = null;
+      const isPan = this.toolManager.activeTool === 'pan' || this.toolManager.activeTool === 'transform';
       this.viewportCanvas.style.cursor = this.isSpaceDown ? 'grab' : 'crosshair';
     }
     this.activePointers.delete(e.pointerId);
     this.cancelStroke();
+    this.lastPinchDist = 0;
+    this.lastPinchCenter = null;
     this.lastNavigationTime = performance.now();
     if (this.activePointers.size === 0) {
       this.isNavigating = false;
@@ -806,6 +947,7 @@ export class VectorCanvas {
     this.activePointerId = e.pointerId;
     this.shapeHoldDetected = false;
     this.lastStampRadius = null;
+    this.lastRenderedSampleIndex = 0;
 
     // Snapshot layer canvas before stroke for deterministic raster undo
     this.beforeStrokeCanvas = cloneCanvas(activeLayer.canvas);
@@ -828,13 +970,35 @@ export class VectorCanvas {
     const isEraser = this.toolManager.activeTool === 'eraser' || (this.currentBrush && this.currentBrush.isEraser);
     const strokeSeed = Math.floor(Math.random() * 0xffffff);
 
-    const brushSnapshot = (this.currentBrush && typeof this.currentBrush.createSnapshot === 'function')
-      ? this.currentBrush.createSnapshot()
-      : (this.currentBrush ? JSON.parse(JSON.stringify(this.currentBrush)) : {});
+    // Eraser uses its own dedicated state and does NOT inherit pen min/max limits
+    let brushSnapshot;
+    if (isEraser) {
+      brushSnapshot = {
+        id: 'eraser_' + (this.currentEraser.type || 'hard'),
+        name: 'Eraser',
+        size: Math.max(1, Math.min(500, this.currentEraser.size || 28)),
+        opacity: Math.max(0.01, Math.min(1.0, this.currentEraser.opacity ?? 1.0)),
+        hardness: this.currentEraser.hardness ?? 1.0,
+        spacing: this.currentEraser.spacing ?? 0.05,
+        tipShape: this.currentEraser.tipShape || 'round',
+        minSize: 1,
+        maxSize: 500,
+        dynamics: {
+          pressure: { size: 100, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+          velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+          jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+          noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
+        }
+      };
+    } else {
+      brushSnapshot = (this.currentBrush && typeof this.currentBrush.createSnapshot === 'function')
+        ? this.currentBrush.createSnapshot()
+        : (this.currentBrush ? JSON.parse(JSON.stringify(this.currentBrush)) : {});
+    }
 
     this.currentStroke = {
       id: 'stroke_' + Date.now() + '_' + Math.floor(Math.random() * 10000),
-      brushId: this.currentBrush?.id || 'pencil',
+      brushId: isEraser ? 'eraser' : (this.currentBrush?.id || 'pencil'),
       brushSnapshot: brushSnapshot,
       color: isEraser ? '#000000' : this.currentColor,
       isEraser: isEraser,
@@ -843,11 +1007,14 @@ export class VectorCanvas {
     };
 
     if (isEraser) {
-      this.renderStrokeToLayer(activeLayer, this.currentStroke);
+      this.renderIncrementalStroke(activeLayer.ctx, this.currentStroke);
+      activeLayer.updateThumbnail();
       this.layerManager.invalidateCaches();
+      this.needsRender = true;
     } else {
       this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
-      this.renderLiveStroke();
+      this.renderIncrementalStroke(this.liveCtx, this.currentStroke);
+      this.needsRender = true;
     }
   }
 
@@ -858,13 +1025,11 @@ export class VectorCanvas {
     const rawWorld = this.viewport.screenToWorld(pos.x, pos.y);
     const snapped = this.toolManager.rulerGuides.snapPoint(rawWorld.x, rawWorld.y);
 
-    // Stop emission when finger is still unless brush has build-up enabled
     const pts = this.currentStroke.points;
     if (pts.length > 0) {
       const lastPt = pts[pts.length - 1];
       const distFromLast = Math.hypot(snapped.x - lastPt.x, snapped.y - lastPt.y);
-      const isBuildUp = !!(this.currentBrush?.buildUp || this.currentBrush?.isAirbrushBuildUp);
-      if (distFromLast < 1.8 && !isBuildUp) {
+      if (distFromLast < 1.5) {
         return;
       }
     }
@@ -881,14 +1046,17 @@ export class VectorCanvas {
       this.currentStroke.points.push(stabilized);
       if (this.currentStroke.isEraser) {
         const activeLayer = this.layerManager.getActiveLayer();
-        if (activeLayer && !activeLayer.locked && this.beforeStrokeCanvas) {
-          activeLayer.ctx.clearRect(0, 0, activeLayer.width, activeLayer.height);
-          activeLayer.ctx.drawImage(this.beforeStrokeCanvas, 0, 0);
-          this.renderStrokeToLayer(activeLayer, this.currentStroke);
+        if (activeLayer && !activeLayer.locked) {
+          // Render incrementally directly onto active layer using destination-out
+          this.renderIncrementalStroke(activeLayer.ctx, this.currentStroke);
+          activeLayer.updateThumbnail();
           this.layerManager.invalidateCaches();
+          this.needsRender = true;
         }
       } else {
-        this.renderLiveStroke();
+        // Render incrementally directly into liveCtx
+        this.renderIncrementalStroke(this.liveCtx, this.currentStroke);
+        this.needsRender = true;
       }
     }
   }
@@ -940,6 +1108,10 @@ export class VectorCanvas {
       if (activeLayer && !activeLayer.locked) {
         if (!this.currentStroke.isEraser) {
           this.renderStrokeToLayer(activeLayer, this.currentStroke);
+        } else {
+          this.renderIncrementalStroke(activeLayer.ctx, this.currentStroke);
+          activeLayer.addStroke(this.currentStroke);
+          activeLayer.updateThumbnail();
         }
         const bbox = this.getStrokeBoundingBox(this.currentStroke, this.docWidth, this.docHeight);
         const beforeSnapshot = cropBoundingBox(this.beforeStrokeCanvas, bbox);
@@ -966,6 +1138,7 @@ export class VectorCanvas {
       this.currentStroke = null;
       this.beforeStrokeCanvas = null;
       this.lastStampRadius = null;
+      this.lastRenderedSampleIndex = 0;
       this.layerManager.invalidateCaches();
       this.onStrokeFinished?.();
     }
@@ -986,6 +1159,7 @@ export class VectorCanvas {
       this.currentStroke = null;
       this.beforeStrokeCanvas = null;
       this.lastStampRadius = null;
+      this.lastRenderedSampleIndex = 0;
       this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
       this.layerManager.invalidateCaches();
       this.onStrokeFinished?.();
@@ -1030,18 +1204,57 @@ export class VectorCanvas {
   renderLiveStroke() {
     if (!this.currentStroke) return;
     this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+    this.lastRenderedSampleIndex = 0;
+    this.lastStampRadius = null;
+    this.renderIncrementalStroke(this.liveCtx, this.currentStroke);
+  }
 
-    const pts = this.currentStroke.points;
+  renderIncrementalStroke(ctx, stroke) {
+    const pts = stroke.points;
+    if (!pts || pts.length === 0) return;
+
+    const b = stroke.brushSnapshot || {};
+    const baseSize = Math.max(1, Number.isFinite(b.size) ? b.size : 8);
+    const sp = b.spacingSettings || {};
+    const spacingRatio = Math.max(0.01, Math.min(2.0, sp.spacing ?? b.spacing ?? 0.08));
+    const stepPx = Math.max(sp.minSpacingPx || 0.8, baseSize * spacingRatio);
+
+    const dyn = b.dynamics || {
+      pressure: { size: 100, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
+    };
+
+    const calcStep = (pt) => {
+      const pNorm = Math.max(0, Math.min(1, pt?.pressure ?? 0.5));
+      const pFactor = (pNorm - 0.5) * 2;
+      const speed = Math.max(0, pt?.speed || 0);
+      const vFactor = Math.min(1.5, Math.max(-1.0, (speed - 0.6) / 0.8));
+      let spMod = 1.0;
+      if (dyn.pressure?.spacing) spMod += (dyn.pressure.spacing / 100) * pFactor;
+      if (dyn.velocity?.spacing) spMod += (dyn.velocity.spacing / 100) * vFactor;
+      return Math.max(0.5, stepPx * Math.max(0.1, spMod));
+    };
+
+    const allSamples = this.spline.sampleStroke(pts, calcStep);
+    if (!allSamples || allSamples.length === 0) return;
+
+    const startIdx = this.lastRenderedSampleIndex || 0;
+    if (startIdx >= allSamples.length) return;
+
     if (this.toolManager.symmetry.mode !== 'off' && pts.length > 0) {
       const symmInstances = this.toolManager.symmetry.radialAxes || 4;
       const count = this.toolManager.symmetry.mode === 'radial' ? symmInstances : 2;
       for (let s = 0; s < count; s++) {
-        const mirroredPts = pts.map(p => this.toolManager.symmetry.getSymmetricPoints(p)[s] || p);
-        this.renderStrokeToContext(this.liveCtx, { ...this.currentStroke, points: mirroredPts });
+        const mirroredSamples = allSamples.map(p => this.toolManager.symmetry.getSymmetricPoints(p)[s] || p);
+        this.renderSamplesToContext(ctx, stroke, mirroredSamples, startIdx, allSamples.length);
       }
     } else {
-      this.renderStrokeToContext(this.liveCtx, this.currentStroke);
+      this.renderSamplesToContext(ctx, stroke, allSamples, startIdx, allSamples.length);
     }
+
+    this.lastRenderedSampleIndex = allSamples.length;
   }
 
   renderStrokeToLayer(layer, stroke) {
@@ -1060,30 +1273,20 @@ export class VectorCanvas {
     layer.updateThumbnail();
   }
 
-  /**
-   * Stamping and Ribbon Stroke Render Engine with Ink-Bleed Safeguards & Advanced Spacing/Jitter
-   */
   renderStrokeToContext(ctx, stroke) {
     const b = stroke.brushSnapshot || {};
     const pts = stroke.points;
     if (!pts || pts.length === 0) return;
 
-    ctx.save();
-
-    const activeLayer = this.layerManager.getActiveLayer();
-    if (stroke.isEraser) {
-      ctx.globalCompositeOperation = 'destination-out';
-    } else if (activeLayer && ctx === activeLayer.ctx && activeLayer.alphaLock) {
-      ctx.globalCompositeOperation = 'source-atop';
-    } else {
-      ctx.globalCompositeOperation = b.blendMode || 'source-over';
-    }
-
-    ctx.fillStyle = stroke.color;
-    ctx.strokeStyle = stroke.color;
-
     // Pixel Art Mode: 1px / integer grid
     if (this.pixelArtMode || b.isPixel || b.spacingSettings?.pixelArtMode) {
+      ctx.save();
+      if (stroke.isEraser) {
+        ctx.globalCompositeOperation = 'destination-out';
+      } else {
+        ctx.globalCompositeOperation = b.blendMode || 'source-over';
+      }
+      ctx.fillStyle = stroke.color;
       ctx.imageSmoothingEnabled = false;
       for (let i = 0; i < pts.length - 1; i++) {
         const pixels = bresenhamPixelPerfect(
@@ -1100,59 +1303,107 @@ export class VectorCanvas {
       return;
     }
 
-    // Spacing calculation
     const baseSize = Math.max(1, Number.isFinite(b.size) ? b.size : 8);
     const sp = b.spacingSettings || {};
     const spacingRatio = Math.max(0.01, Math.min(2.0, sp.spacing ?? b.spacing ?? 0.08));
-    let stepPx = Math.max(sp.minSpacingPx || 0.8, baseSize * spacingRatio);
+    const stepPx = Math.max(sp.minSpacingPx || 0.8, baseSize * spacingRatio);
 
-    // Auto-spacing mode: keep strokes smooth at all sizes
-    if (sp.autoSpacing) {
-      stepPx = Math.max(1.0, Math.min(12.0, baseSize * 0.12));
+    const dyn = b.dynamics || {
+      pressure: { size: 100, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
+    };
+
+    const calcStep = (pt) => {
+      const pNorm = Math.max(0, Math.min(1, pt?.pressure ?? 0.5));
+      const pFactor = (pNorm - 0.5) * 2;
+      const speed = Math.max(0, pt?.speed || 0);
+      const vFactor = Math.min(1.5, Math.max(-1.0, (speed - 0.6) / 0.8));
+      let spMod = 1.0;
+      if (dyn.pressure?.spacing) spMod += (dyn.pressure.spacing / 100) * pFactor;
+      if (dyn.velocity?.spacing) spMod += (dyn.velocity.spacing / 100) * vFactor;
+      return Math.max(0.5, stepPx * Math.max(0.1, spMod));
+    };
+
+    const samples = this.spline.sampleStroke(pts, calcStep);
+    if (!samples || samples.length === 0) return;
+
+    this.renderSamplesToContext(ctx, stroke, samples, 0, samples.length);
+  }
+
+  /**
+   * Stamping and Ribbon Stroke Render Engine with Ink-Bleed Safeguards & Advanced Spacing/Jitter
+   */
+  renderSamplesToContext(ctx, stroke, samples, startIdx = 0, endIdx = samples.length) {
+    const b = stroke.brushSnapshot || {};
+    if (!samples || samples.length === 0 || startIdx >= endIdx) return;
+
+    ctx.save();
+
+    const activeLayer = this.layerManager.getActiveLayer();
+    if (stroke.isEraser) {
+      ctx.globalCompositeOperation = 'destination-out';
+    } else if (activeLayer && ctx === activeLayer.ctx && activeLayer.alphaLock) {
+      ctx.globalCompositeOperation = 'source-atop';
+    } else {
+      ctx.globalCompositeOperation = b.blendMode || 'source-over';
     }
 
-    const samples = this.spline.sampleStroke(pts, stepPx);
-    if (samples.length === 0) {
-      ctx.restore();
-      return;
+    ctx.fillStyle = stroke.color;
+    ctx.strokeStyle = stroke.color;
+
+    // Glow width
+    if (b.glowWidth && b.glowWidth > 0 && !stroke.isEraser) {
+      ctx.shadowBlur = b.glowWidth;
+      ctx.shadowColor = stroke.color;
     }
 
+    const baseSize = Math.max(1, Number.isFinite(b.size) ? b.size : 8);
     const baseOpacity = Math.max(0.01, Math.min(1.0, Number.isFinite(b.opacity) ? b.opacity : 1.0));
     const strokeSeed = stroke.seed || 1337;
-    const totalLength = samples[samples.length - 1].distance || 1;
-
-    // INK BLEED & SIZE SAFEGUARDS:
     const brushMinRadius = Math.max(0.25, (b.minSize || 1) / 2);
-    const brushMaxRadius = Math.max(brushMinRadius + 0.5, (b.maxSize || 200) / 2);
-    let lastRadius = null;
+    const brushMaxRadius = Math.max(brushMinRadius + 0.5, (b.maxSize || 500) / 2);
 
-    // Single-stroke opacity capping: when !buildUp, render into stroke buffer
-    // so repeated passes or lingering within the SAME stroke never exceed baseOpacity
-    const useStrokeBuffer = (!b.buildUp && baseOpacity < 0.98 && this.strokeCtx);
-    const targetCtx = useStrokeBuffer ? this.strokeCtx : ctx;
+    // Unified dynamics sources: Pressure, Velocity, Jitter, Noise
+    const dyn = b.dynamics || {
+      pressure: { size: 100, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
+    };
 
-    if (useStrokeBuffer) {
-      this.strokeCtx.clearRect(0, 0, this.docWidth, this.docHeight);
-      this.strokeCtx.save();
-      this.strokeCtx.fillStyle = stroke.color;
-      this.strokeCtx.strokeStyle = stroke.color;
-    }
+    const dP = dyn.pressure || {};
+    const dV = dyn.velocity || {};
+    const dJ = dyn.jitter || {};
+    const dN = dyn.noise || {};
 
-    // Factor Links Matrix from brush
-    const fl = b.factorLinks || {};
-    const vLinks = fl.velocity || {};
-    const jLinks = fl.jitter || {};
-    const nLinks = fl.noise || {};
+    const noiseScale = b.noiseScale || 0.02;
+    const noiseOctaves = b.noiseOctaves || 2;
+    const noiseSeed = (strokeSeed ^ (b.noiseSeed || 42)) & 0xffff;
 
-    // Render individual stamp segments
-    for (let i = 0; i < samples.length; i++) {
+    for (let i = startIdx; i < endIdx; i++) {
       const s = samples[i];
-      if (!Number.isFinite(s.x) || !Number.isFinite(s.y)) continue;
+      if (!s || !Number.isFinite(s.x) || !Number.isFinite(s.y)) continue;
 
-      let pressure = Number.isFinite(s.pressure) ? s.pressure : 0.5;
-      pressure = Math.max(0.01, Math.min(1.0, pressure));
+      const pNorm = Math.max(0, Math.min(1.0, Number.isFinite(s.pressure) ? s.pressure : 0.5));
+      const pFactor = (pNorm - 0.5) * 2.0; // -1 to +1
 
-      let radius = (baseSize * pressure) / 2;
+      const speed = Math.max(0, s.speed || 0);
+      const vFactor = Math.min(1.5, Math.max(-1.0, (speed - 0.6) / 0.8)); // real px/ms speed response
+
+      const jVal = ((Math.abs(Math.sin(strokeSeed * 17 + i * 9301 + 49297)) * 233280) % 1.0) * 2 - 1; // -1 to +1
+
+      const nVal = CoherentNoise.noise2D(s.x * noiseScale, s.y * noiseScale, noiseSeed, noiseOctaves); // -1 to +1
+
+      // Size calculation
+      let sizeMod = 1.0;
+      if (dP.size) sizeMod += (dP.size / 100) * pFactor;
+      if (dV.size) sizeMod += (dV.size / 100) * vFactor;
+      if (dJ.size) sizeMod += (dJ.size / 100) * jVal;
+      if (dN.size) sizeMod += (dN.size / 100) * nVal;
+
+      let radius = (baseSize / 2) * Math.max(0.02, sizeMod);
 
       // Taper at start and end
       if (b.taperStart > 0 && i < b.taperStart) {
@@ -1162,123 +1413,98 @@ export class VectorCanvas {
         radius *= Math.max(0.05, (samples.length - i) / b.taperEnd);
       }
 
-      // 1. Evaluate Factors: velocity, jitter, noise (smoothed limits)
-      const vFactor = Math.min(1.5, Math.max(-1.0, (pressure - 0.5) * 2.0));
-      const jFactor = ((Math.sin(strokeSeed + i * 1337.7) * 43758.5453) % 1.0);
-      const rawNoise = CoherentNoise.computeNoiseSample(b.jitter || { enabled: true }, strokeSeed, s.distance, s.time || 0);
-      const nFactor = Math.max(-1.0, Math.min(1.0, rawNoise * 0.2)); // Reduced 2D noise limit to prevent jitter explosion
+      // Light smoothing on radius (replaces 25% rate limiter so negative velocity factors work)
+      if (this.lastStampRadius !== null) {
+        radius = this.lastStampRadius * 0.2 + radius * 0.8;
+      }
+      // Final hard clamp
+      radius = Math.max(brushMinRadius, Math.min(brushMaxRadius, radius));
+      this.lastStampRadius = radius;
 
-      // 2. Modulate Children (Size, Rotation, Spacing, Opacity, Tip Rotation)
-      // Child: Size
-      let sizeMod = 1.0;
-      if (vLinks.size) sizeMod += (vLinks.size / 100) * vFactor;
-      if (jLinks.size) sizeMod += (jLinks.size / 100) * jFactor * 0.4;
-      if (nLinks.size) sizeMod += (nLinks.size / 100) * nFactor * 0.2;
-      radius = radius * Math.max(0.05, sizeMod);
+      // Opacity calculation
+      let alphaMod = 0.0;
+      if (dP.opacity) alphaMod += (dP.opacity / 100) * pFactor;
+      if (dV.opacity) alphaMod += (dV.opacity / 100) * vFactor;
+      if (dJ.opacity) alphaMod += (dJ.opacity / 100) * jVal;
+      if (dN.opacity) alphaMod += (dN.opacity / 100) * nVal;
 
-      // Child: Opacity
-      let stampAlpha = useStrokeBuffer ? (b.flow ?? 1.0) : (baseOpacity * (b.flow ?? 1.0));
-      let alphaMod = 0;
-      if (vLinks.opacity) alphaMod += (vLinks.opacity / 100) * vFactor;
-      if (jLinks.opacity) alphaMod += (jLinks.opacity / 100) * jFactor * 0.4;
-      if (nLinks.opacity) alphaMod += (nLinks.opacity / 100) * nFactor * 0.2;
-      stampAlpha = Math.max(0.01, Math.min(1.0, stampAlpha * (1.0 + alphaMod)));
+      let stampAlpha = Math.max(0.01, Math.min(1.0, baseOpacity * Math.max(0.0, 1.0 + alphaMod) * (b.flow ?? 1.0)));
 
-      // Child: Rotation & Tip Rotation
+      // Grain texture modulation
+      if (b.grain && b.grain > 0) {
+        const grainNoise = ((Math.abs(Math.sin(s.x * 12.9898 + s.y * 78.233 + strokeSeed)) * 43758.5453) % 1.0);
+        stampAlpha *= (1.0 - (b.grain * 0.5 * grainNoise));
+      }
+
+      // Rotation calculation
       let stampRotation = b.rotation || 0;
-      let rotMod = 0;
-      if (vLinks.rotation) rotMod += (vLinks.rotation / 100) * vFactor * Math.PI;
-      if (jLinks.rotation) rotMod += (jLinks.rotation / 100) * jFactor * Math.PI;
-      if (nLinks.rotation) rotMod += (nLinks.rotation / 100) * nFactor * 0.3 * Math.PI;
-      if (vLinks.tipRotation) rotMod += (vLinks.tipRotation / 100) * vFactor * Math.PI;
-      if (jLinks.tipRotation) rotMod += (jLinks.tipRotation / 100) * jFactor * Math.PI;
-      if (nLinks.tipRotation) rotMod += (nLinks.tipRotation / 100) * nFactor * 0.3 * Math.PI;
+      let rotMod = 0.0;
+      if (dP.rotation) rotMod += (dP.rotation / 100) * pFactor * Math.PI;
+      if (dV.rotation) rotMod += (dV.rotation / 100) * vFactor * Math.PI;
+      if (dJ.rotation) rotMod += (dJ.rotation / 100) * jVal * Math.PI;
+      if (dN.rotation) rotMod += (dN.rotation / 100) * nVal * Math.PI;
       stampRotation += rotMod;
 
+      // Scatter calculation
       let stampX = s.x;
       let stampY = s.y;
+      let scatterMod = b.scatter || 0;
+      if (dP.scatter) scatterMod += (dP.scatter / 100) * Math.abs(pFactor);
+      if (dV.scatter) scatterMod += (dV.scatter / 100) * Math.max(0, vFactor);
+      if (dJ.scatter) scatterMod += (dJ.scatter / 100) * Math.abs(jVal);
+      if (dN.scatter) scatterMod += (dN.scatter / 100) * Math.abs(nVal);
 
-      if (b.jitter && b.jitter.enabled) {
-        const jTargets = CoherentNoise.evaluateAllTargets(
-          b.jitter,
-          strokeSeed,
-          s.distance,
-          s.time,
-          s.speed || 0,
-          totalLength
-        );
-        radius = Math.max(0.25, radius * (1.0 + jTargets.sizeDelta));
-        stampX += jTargets.wobbleX;
-        stampY += jTargets.wobbleY;
-        stampRotation += jTargets.angleDelta;
-        stampAlpha = Math.max(0.01, Math.min(1.0, stampAlpha + jTargets.opacityDelta));
+      if (scatterMod > 0.01) {
+        const scatAngle = ((Math.sin(strokeSeed + i * 7919) * 10000) % 1) * Math.PI * 2;
+        const scatDist = Math.abs(((Math.sin(strokeSeed + i * 4999) * 10000) % 1)) * radius * scatterMod * 2.0;
+        stampX += Math.cos(scatAngle) * scatDist;
+        stampY += Math.sin(scatAngle) * scatDist;
       }
 
-      if (!Number.isFinite(radius)) radius = baseSize / 2;
+      ctx.globalAlpha = Math.max(0.01, Math.min(1.0, stampAlpha));
 
-      // RATE LIMITER: limit how much size can change between two consecutive stamps
-      if (lastRadius !== null) {
-        const maxDelta = Math.max(1.5, lastRadius * 0.25);
-        radius = Math.max(lastRadius - maxDelta, Math.min(lastRadius + maxDelta, radius));
+      ctx.save();
+      ctx.translate(stampX, stampY);
+      if (stampRotation !== 0) ctx.rotate(stampRotation);
+
+      const roundness = b.roundness !== undefined ? Math.max(0.1, b.roundness) : 1.0;
+      const aspect = b.aspectRatio ? Math.max(0.1, b.aspectRatio) : 1.0;
+      if (roundness !== 1.0 || aspect !== 1.0) {
+        ctx.scale(1.0, (1.0 / aspect) * roundness);
       }
 
-      // HARD CLAMP: strictly enforce brush.minSize and brush.maxSize bounds
-      radius = Math.max(brushMinRadius, Math.min(brushMaxRadius, radius));
-      lastRadius = radius;
-
-      targetCtx.globalAlpha = Math.max(0.01, Math.min(1.0, stampAlpha));
-
-      // Custom Stamp Shapes, Aspect Ratio, and Hardness
-      targetCtx.save();
-      targetCtx.translate(stampX, stampY);
-      if (stampRotation !== 0) targetCtx.rotate(stampRotation);
-      if (b.aspectRatio && b.aspectRatio !== 1.0) {
-        targetCtx.scale(1.0, 1.0 / Math.max(0.1, b.aspectRatio));
-      }
-
+      // Stamp shape rendering
       if (b.tipShape === 'square') {
-        targetCtx.fillRect(-radius, -radius, radius * 2, radius * 2);
+        ctx.fillRect(-radius, -radius, radius * 2, radius * 2);
       } else if (b.tipShape === 'chisel') {
-        targetCtx.fillRect(-radius * 1.8, -radius * 0.4, radius * 3.6, radius * 0.8);
+        ctx.fillRect(-radius * 1.8, -radius * 0.4, radius * 3.6, radius * 0.8);
       } else if (b.tipShape === 'star') {
-        targetCtx.beginPath();
+        ctx.beginPath();
         for (let sp = 0; sp < 10; sp++) {
           const a = (sp * Math.PI) / 5 - Math.PI / 2;
           const rad = sp % 2 === 0 ? radius : radius * 0.45;
           const px = Math.cos(a) * rad;
           const py = Math.sin(a) * rad;
-          if (sp === 0) targetCtx.moveTo(px, py);
-          else targetCtx.lineTo(px, py);
+          if (sp === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
         }
-        targetCtx.closePath();
-        targetCtx.fill();
+        ctx.closePath();
+        ctx.fill();
       } else if (b.tipShape === 'bristle') {
         for (let br = -2; br <= 2; br++) {
-          targetCtx.beginPath();
-          targetCtx.arc(br * (radius * 0.35), 0, Math.max(0.4, radius * 0.25), 0, Math.PI * 2);
-          targetCtx.fill();
+          ctx.beginPath();
+          ctx.arc(br * (radius * 0.35), 0, Math.max(0.4, radius * 0.25), 0, Math.PI * 2);
+          ctx.fill();
         }
-      } else if (b.tipShape === 'soft' || b.tipShape === 'gaussian' || (b.hardness !== undefined && b.hardness < 0.6)) {
-        const rad = Math.max(1, radius);
-        const grad = targetCtx.createRadialGradient(0, 0, rad * Math.max(0.05, b.hardness ?? 0.3), 0, 0, rad);
-        grad.addColorStop(0, stroke.color);
-        grad.addColorStop(1, 'rgba(0,0,0,0)');
-        targetCtx.fillStyle = grad;
-        targetCtx.beginPath();
-        targetCtx.arc(0, 0, rad, 0, Math.PI * 2);
-        targetCtx.fill();
+      } else if (b.tipShape === 'soft' || b.tipShape === 'gaussian' || (b.hardness !== undefined && b.hardness < 0.6) || (b.wetEdge && b.wetEdge > 0)) {
+        const { canvas: spriteCanvas } = this.getSoftStampSprite(stroke.color, radius, b.hardness, b.wetEdge);
+        ctx.drawImage(spriteCanvas, -spriteCanvas.width / 2, -spriteCanvas.height / 2);
       } else {
-        targetCtx.beginPath();
-        targetCtx.arc(0, 0, Math.max(0.5, radius), 0, Math.PI * 2);
-        targetCtx.fill();
+        ctx.beginPath();
+        ctx.arc(0, 0, Math.max(0.5, radius), 0, Math.PI * 2);
+        ctx.fill();
       }
-      targetCtx.restore();
-    }
-
-    if (useStrokeBuffer) {
-      this.strokeCtx.restore();
-      ctx.globalAlpha = baseOpacity;
-      ctx.drawImage(this.strokeCanvas, 0, 0);
+      ctx.restore();
     }
 
     ctx.restore();
@@ -1445,7 +1671,7 @@ export class VectorCanvas {
       // Tool live overlays
       try {
         if (this.toolManager.activeTool === 'lasso-fill' && this.toolManager.lassoFill.active) {
-          this.toolManager.lassoFill.renderOverlay(ctx, this.currentColor);
+          this.toolManager.lassoFill.renderOverlay(ctx, this.currentColor, this.currentBrush?.opacity ?? 1.0);
         } else if (this.toolManager.activeTool === 'shape' && this.toolManager.shapeTool.active) {
           this.toolManager.shapeTool.renderOverlay(ctx, this.currentColor, this.currentBrush?.size || 4);
         } else if (this.toolManager.activeTool === 'gradient' && this.toolManager.gradientTool.active) {

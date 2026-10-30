@@ -93,6 +93,9 @@ class CatmullRomSpline {
       const p3 = i + 2 < n ? controlPoints[i + 2] : p2;
 
       const segDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const dt = Math.max(1, (p2.time || 0) - (p1.time || 0));
+      const segSpeed = segDist / dt; // real px/ms speed
+
       const subSteps = Math.max(2, Math.min(16, Math.ceil(segDist / 2)));
       const seg = this.interpolateSegment(p0, p1, p2, p3, subSteps);
       const startIdx = i === 0 ? 0 : 1;
@@ -103,16 +106,17 @@ class CatmullRomSpline {
           totalDist += Math.hypot(pt.x - prev.x, pt.y - prev.y);
         }
         pt.distance = totalDist;
+        pt.speed = segSpeed;
         dense.push(pt);
       }
     }
 
     if (dense.length <= 1) return dense;
 
-    // 2. Uniform Arc-Length Resampling strictly by stepPx
-    const step = Math.max(0.5, stepPx || 4);
+    // 2. Uniform or Variable Arc-Length Resampling strictly by step distance
+    const initialStep = (typeof stepPx === 'function') ? Math.max(0.5, stepPx(dense[0])) : Math.max(0.5, stepPx || 4);
     const samples = [dense[0]];
-    let nextDist = step;
+    let nextDist = initialStep;
     let dIdx = 0;
 
     while (nextDist <= totalDist && dIdx < dense.length - 1) {
@@ -126,19 +130,26 @@ class CatmullRomSpline {
       const span = pB.distance - pA.distance;
       const u = span > 0.0001 ? (nextDist - pA.distance) / span : 0;
 
-      samples.push({
+      const interpolatedSample = {
         x: pA.x + u * (pB.x - pA.x),
         y: pA.y + u * (pB.y - pA.y),
         pressure: pA.pressure + u * (pB.pressure - pA.pressure),
         time: pA.time + u * (pB.time - pA.time),
+        speed: (pA.speed || 0) + u * ((pB.speed || 0) - (pA.speed || 0)),
         distance: nextDist
-      });
+      };
+      samples.push(interpolatedSample);
 
-      nextDist += step;
+      const dynamicStep = (typeof stepPx === 'function')
+        ? Math.max(0.5, stepPx(interpolatedSample))
+        : Math.max(0.5, stepPx || 4);
+
+      nextDist += dynamicStep;
     }
 
     const lastDense = dense[dense.length - 1];
-    if (samples.length === 1 || Math.hypot(lastDense.x - samples[samples.length - 1].x, lastDense.y - samples[samples.length - 1].y) > step * 0.4) {
+    const finalStep = (typeof stepPx === 'function') ? Math.max(0.5, stepPx(lastDense)) : Math.max(0.5, stepPx || 4);
+    if (samples.length === 1 || Math.hypot(lastDense.x - samples[samples.length - 1].x, lastDense.y - samples[samples.length - 1].y) > finalStep * 0.4) {
       samples.push(lastDense);
     }
 
@@ -870,6 +881,62 @@ class CoherentNoise {
     }
     return points;
   }
+
+  /**
+   * Evaluates 2D Perlin-style gradient noise with octaves.
+   * Returns smooth continuous value strictly normalized to [-1.0, +1.0].
+   */
+  static noise2D(x, y, seed = 1337, octaves = 3, persistence = 0.5, lacunarity = 2.0) {
+    let total = 0;
+    let frequency = 1.0;
+    let amplitude = 1.0;
+    let maxValue = 0;
+
+    const smoothstep = (t) => t * t * (3 - 2 * t);
+    const hash = (ix, iy, o) => {
+      let h = Math.imul(ix ^ (seed + o * 1013), 0x45d9f3b);
+      h = Math.imul(h ^ (iy + 0x9e3779b9), 0x27d4eb2d);
+      return h ^ (h >>> 15);
+    };
+
+    const gradDot = (ix, iy, fx, fy, o) => {
+      const h = hash(ix, iy, o) & 7;
+      let u = h < 4 ? fx : fy;
+      let v = h < 4 ? fy : fx;
+      return ((h & 1) ? -u : u) + ((h & 2) ? -2.0 * v : 2.0 * v);
+    };
+
+    const oct = Math.min(6, Math.max(1, octaves));
+    for (let o = 0; o < oct; o++) {
+      const sx = x * frequency;
+      const sy = y * frequency;
+      const x0 = Math.floor(sx);
+      const y0 = Math.floor(sy);
+      const x1 = x0 + 1;
+      const y1 = y0 + 1;
+      const fx = sx - x0;
+      const fy = sy - y0;
+
+      const wx = smoothstep(fx);
+      const wy = smoothstep(fy);
+
+      const d00 = gradDot(x0, y0, fx, fy, o);
+      const d10 = gradDot(x1, y0, fx - 1, fy, o);
+      const d01 = gradDot(x0, y1, fx, fy - 1, o);
+      const d11 = gradDot(x1, y1, fx - 1, fy - 1, o);
+
+      const nx0 = d00 * (1 - wx) + d10 * wx;
+      const nx1 = d01 * (1 - wx) + d11 * wx;
+      const val = nx0 * (1 - wy) + nx1 * wy;
+
+      total += val * amplitude;
+      maxValue += amplitude;
+      amplitude *= persistence;
+      frequency *= lacunarity;
+    }
+
+    return maxValue > 0 ? Math.max(-1.0, Math.min(1.0, total / (maxValue * 1.5))) : 0;
+  }
 }
 
 /* --- Viewport.js --- */
@@ -1253,11 +1320,16 @@ class LayerManager {
     this.cachedComposite.height = docHeight;
     this.cachedCompositeCtx = this.cachedComposite.getContext('2d');
 
-    // Clipping group offscreen buffer
+    // Clipping group offscreen buffers
     this.clipGroupCanvas = document.createElement('canvas');
     this.clipGroupCanvas.width = docWidth;
     this.clipGroupCanvas.height = docHeight;
     this.clipGroupCtx = this.clipGroupCanvas.getContext('2d');
+
+    this.singleClipCanvas = document.createElement('canvas');
+    this.singleClipCanvas.width = docWidth;
+    this.singleClipCanvas.height = docHeight;
+    this.singleClipCtx = this.singleClipCanvas.getContext('2d');
 
     this.needsRecomposite = true;
 
@@ -1289,6 +1361,10 @@ class LayerManager {
     this.cacheAbove.height = newH;
     this.cachedComposite.width = newW;
     this.cachedComposite.height = newH;
+    this.clipGroupCanvas.width = newW;
+    this.clipGroupCanvas.height = newH;
+    this.singleClipCanvas.width = newW;
+    this.singleClipCanvas.height = newH;
     this.invalidateCaches();
   }
 
@@ -1566,22 +1642,39 @@ class LayerManager {
         }
         this.clipGroupCtx.restore();
 
-        // 2. Draw each clipped layer above it with source-atop
+        // 2. Draw each clipped layer above it respecting its own blend mode
         for (let k = i + 1; k < j; k++) {
           const clipL = this.layers[k];
           if (!clipL.visible) continue;
 
-          this.clipGroupCtx.save();
-          this.clipGroupCtx.globalCompositeOperation = 'source-atop';
-          this.clipGroupCtx.globalAlpha = clipL.opacity;
-          this.clipGroupCtx.drawImage(clipL.canvas, 0, 0);
+          // Render clipL into isolated singleClip buffer
+          this.singleClipCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+          this.singleClipCtx.save();
+          this.singleClipCtx.globalAlpha = clipL.opacity;
+          this.singleClipCtx.globalCompositeOperation = 'source-over';
+          this.singleClipCtx.drawImage(clipL.canvas, 0, 0);
 
           if (clipL === active && liveStrokeCanvas) {
-            this.clipGroupCtx.save();
-            this.clipGroupCtx.globalAlpha = liveOpacity;
-            this.clipGroupCtx.drawImage(liveStrokeCanvas, 0, 0);
-            this.clipGroupCtx.restore();
+            this.singleClipCtx.save();
+            this.singleClipCtx.globalAlpha = liveOpacity;
+            this.singleClipCtx.globalCompositeOperation = clipL.alphaLock ? 'source-atop' : getCanvasCompositeOp(liveBlendMode);
+            this.singleClipCtx.drawImage(liveStrokeCanvas, 0, 0);
+            this.singleClipCtx.restore();
           }
+          this.singleClipCtx.restore();
+
+          // Mask clipL to base layer's alpha shape
+          this.singleClipCtx.save();
+          this.singleClipCtx.globalCompositeOperation = 'destination-in';
+          this.singleClipCtx.globalAlpha = 1.0;
+          this.singleClipCtx.drawImage(layer.canvas, 0, 0);
+          this.singleClipCtx.restore();
+
+          // Composite masked clipL into group with its OWN blend mode
+          this.clipGroupCtx.save();
+          this.clipGroupCtx.globalCompositeOperation = getCanvasCompositeOp(clipL.blendMode);
+          this.clipGroupCtx.globalAlpha = 1.0;
+          this.clipGroupCtx.drawImage(this.singleClipCanvas, 0, 0);
           this.clipGroupCtx.restore();
         }
 
@@ -1670,2706 +1763,352 @@ class LayerManager {
 /* --- BrushPresets.js --- */
 /**
  * Vectura Brush Presets Library
- * Production-tuned raster brushes driven purely by finger velocity dynamics.
+ * Streamlined 14 distinct production-grade brushes using unified dynamics.
  */
 
 const BRUSH_CATEGORIES = [
-  {
-    "id": "ink",
-    "name": "Inking & Sketch"
-  },
-  {
-    "id": "paint",
-    "name": "Painting & Shading"
-  },
-  {
-    "id": "texture",
-    "name": "Texture & FX"
-  },
-  {
-    "id": "eraser",
-    "name": "Erasers"
-  },
-  {
-    "id": "pixel",
-    "name": "Pixel Art"
-  }
+  { id: 'ink', name: 'Inking & Sketch' },
+  { id: 'paint', name: 'Painting & Shading' },
+  { id: 'texture', name: 'Texture & FX' },
+  { id: 'pixel', name: 'Pixel Art' }
 ];
 
 const DEFAULT_BRUSH_PRESETS = [
+  // 1. Inking & Sketch
   {
-    "id": "pencil",
-    "category": "ink",
-    "name": "Pencil",
-    "size": 6,
-    "minSize": 1,
-    "maxSize": 100,
-    "opacity": 0.85,
-    "flow": 0.8,
-    "hardness": 0.7,
-    "spacing": 0.1,
-    "roundness": 0.85,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "tipShape": "round",
-    "grain": 0.4,
-    "taperStart": 12,
-    "taperEnd": 18,
-    "velocityDynamics": {
-      "factor": 39,
-      "minSpeed": 0,
-      "maxSpeed": 3.2,
-      "curve": [
-        0.25,
-        0.1,
-        0.25,
-        1
-      ],
-      "smoothing": 0.35,
-      "minOutput": 0.15,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 1,
-        "useCurve": true
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 0.8,
-        "useCurve": true
-      },
-      "flow": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": true,
-        "factor": 0.5,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": true,
-        "factor": 0.6,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": true,
-      "amplitude": 0.15,
-      "frequency": 0.08,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 1337,
-      "noiseType": "perlin",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 20,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 30,
-    "spacingSettings": {
-      "spacing": 0.1,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": true,
-      "pixelArtMode": false
+    id: 'pencil',
+    category: 'ink',
+    name: 'Graphite Pencil',
+    size: 8,
+    minSize: 1,
+    maxSize: 100,
+    opacity: 0.88,
+    flow: 0.85,
+    hardness: 0.7,
+    grain: 0.45,
+    roundness: 0.85,
+    aspectRatio: 1.0,
+    rotation: 0,
+    tipShape: 'round',
+    spacing: 0.08,
+    taperStart: 8,
+    taperEnd: 12,
+    dynamics: {
+      pressure: { size: 60, opacity: 30, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: -25, opacity: -10, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 10, opacity: 10, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
     }
   },
   {
-    "id": "mechanical_pencil",
-    "category": "ink",
-    "name": "Mechanical Pencil",
-    "size": 2,
-    "minSize": 1,
-    "maxSize": 30,
-    "opacity": 0.9,
-    "flow": 0.95,
-    "hardness": 0.95,
-    "spacing": 0.08,
-    "roundness": 1,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "tipShape": "round",
-    "grain": 0.15,
-    "taperStart": 4,
-    "taperEnd": 6,
-    "velocityDynamics": {
-      "factor": 25,
-      "minSpeed": 0,
-      "maxSpeed": 4,
-      "curve": [
-        0.2,
-        0.2,
-        0.4,
-        0.9
-      ],
-      "smoothing": 0.4,
-      "minOutput": 0.5,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.4,
-        "useCurve": false
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 0.5,
-        "useCurve": true
-      },
-      "flow": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 1416,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 20,
-    "spacingSettings": {
-      "spacing": 0.08,
-      "minSpacingPx": 0.8,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": true,
-      "pixelArtMode": false
+    id: 'technical_pen',
+    category: 'ink',
+    name: 'Technical Pen',
+    size: 4,
+    minSize: 1,
+    maxSize: 60,
+    opacity: 1.0,
+    flow: 1.0,
+    hardness: 0.95,
+    grain: 0.0,
+    roundness: 1.0,
+    aspectRatio: 1.0,
+    rotation: 0,
+    tipShape: 'round',
+    spacing: 0.05,
+    dynamics: {
+      pressure: { size: 20, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
     }
   },
   {
-    "id": "technical_pen",
-    "category": "ink",
-    "name": "Technical Pen",
-    "size": 4,
-    "minSize": 1,
-    "maxSize": 150,
-    "opacity": 1,
-    "flow": 1,
-    "hardness": 1,
-    "spacing": 0.06,
-    "roundness": 1,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "tipShape": "round",
-    "grain": 0,
-    "taperStart": 0,
-    "taperEnd": 0,
-    "velocityDynamics": {
-      "factor": 11,
-      "minSpeed": 0,
-      "maxSpeed": 3,
-      "curve": [
-        0.3,
-        0.3,
-        0.7,
-        0.7
-      ],
-      "smoothing": 0.5,
-      "minOutput": 0.85,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.15,
-        "useCurve": false
-      },
-      "opacity": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 1495,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 40,
-    "spacingSettings": {
-      "spacing": 0.06,
-      "minSpacingPx": 0.8,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": true,
-      "pixelArtMode": false
+    id: 'g_pen',
+    category: 'ink',
+    name: 'G-Pen',
+    size: 10,
+    minSize: 1,
+    maxSize: 120,
+    opacity: 1.0,
+    flow: 1.0,
+    hardness: 0.9,
+    grain: 0.0,
+    roundness: 1.0,
+    aspectRatio: 1.0,
+    rotation: 0,
+    tipShape: 'round',
+    spacing: 0.06,
+    taperStart: 10,
+    taperEnd: 16,
+    dynamics: {
+      pressure: { size: 85, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: -50, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
     }
   },
   {
-    "id": "g_pen",
-    "category": "ink",
-    "name": "G-Pen",
-    "size": 8,
-    "minSize": 1,
-    "maxSize": 200,
-    "opacity": 1,
-    "flow": 1,
-    "hardness": 0.98,
-    "spacing": 0.05,
-    "roundness": 1,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "tipShape": "round",
-    "grain": 0,
-    "taperStart": 25,
-    "taperEnd": 35,
-    "velocityDynamics": {
-      "factor": 49,
-      "minSpeed": 0,
-      "maxSpeed": 2.8,
-      "curve": [
-        0.15,
-        0.05,
-        0.35,
-        1
-      ],
-      "smoothing": 0.3,
-      "minOutput": 0.08,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 1.3,
-        "useCurve": true
-      },
-      "opacity": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": true,
-        "factor": 0.7,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": true,
-        "factor": 1,
-        "useCurve": true
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 1574,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 40,
-    "spacingSettings": {
-      "spacing": 0.05,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": true,
-      "pixelArtMode": false
+    id: 'brush_pen',
+    category: 'ink',
+    name: 'Bristle Brush Pen',
+    size: 16,
+    minSize: 2,
+    maxSize: 150,
+    opacity: 0.95,
+    flow: 0.9,
+    hardness: 0.8,
+    grain: 0.2,
+    roundness: 0.9,
+    aspectRatio: 1.2,
+    rotation: 0.2,
+    tipShape: 'bristle',
+    spacing: 0.06,
+    dynamics: {
+      pressure: { size: 70, opacity: 25, rotation: 10, spacing: 0, scatter: 0 },
+      velocity: { size: -35, opacity: -15, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 15, opacity: 0, rotation: 15, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
     }
   },
   {
-    "id": "ink_pen",
-    "category": "ink",
-    "name": "Ink Fountain Pen",
-    "size": 5,
-    "minSize": 1,
-    "maxSize": 80,
-    "opacity": 0.96,
-    "flow": 0.9,
-    "hardness": 0.9,
-    "spacing": 0.06,
-    "roundness": 0.9,
-    "aspectRatio": 1.1,
-    "rotation": 0.4,
-    "tipShape": "round",
-    "grain": 0.05,
-    "taperStart": 10,
-    "taperEnd": 20,
-    "velocityDynamics": {
-      "factor": -46,
-      "minSpeed": 0.1,
-      "maxSpeed": 3.5,
-      "curve": [
-        0.35,
-        0.05,
-        0.5,
-        0.95
-      ],
-      "smoothing": 0.35,
-      "minOutput": 0.2,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 1,
-        "useCurve": true
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 0.6,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": true,
-        "factor": 0.9,
-        "useCurve": true
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": true,
-        "factor": 0.8,
-        "useCurve": true
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 1653,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 35,
-    "spacingSettings": {
-      "spacing": 0.06,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": true,
-      "pixelArtMode": false
+    id: 'calligraphy',
+    category: 'ink',
+    name: 'Calligraphy Chisel',
+    size: 22,
+    minSize: 4,
+    maxSize: 180,
+    opacity: 1.0,
+    flow: 1.0,
+    hardness: 0.9,
+    grain: 0.0,
+    roundness: 0.4,
+    aspectRatio: 2.5,
+    rotation: 0.785, // 45 degrees
+    tipShape: 'chisel',
+    spacing: 0.05,
+    dynamics: {
+      pressure: { size: 40, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: -15, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
+    }
+  },
+
+  // 2. Painting & Shading
+  {
+    id: 'marker',
+    category: 'paint',
+    name: 'Felt Marker',
+    size: 26,
+    minSize: 4,
+    maxSize: 200,
+    opacity: 0.8,
+    flow: 0.85,
+    hardness: 0.8,
+    grain: 0.1,
+    roundness: 0.7,
+    aspectRatio: 1.8,
+    rotation: 0.4,
+    tipShape: 'chisel',
+    spacing: 0.07,
+    dynamics: {
+      pressure: { size: 30, opacity: 20, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: -15, opacity: -10, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
     }
   },
   {
-    "id": "calligraphy",
-    "category": "ink",
-    "name": "Calligraphy Chisel",
-    "size": 14,
-    "minSize": 2,
-    "maxSize": 120,
-    "opacity": 1,
-    "flow": 1,
-    "hardness": 1,
-    "spacing": 0.04,
-    "roundness": 0.2,
-    "aspectRatio": 4,
-    "rotation": 0.785,
-    "tipShape": "chisel",
-    "grain": 0,
-    "taperStart": 8,
-    "taperEnd": 12,
-    "velocityDynamics": {
-      "factor": 35,
-      "minSpeed": 0,
-      "maxSpeed": 3,
-      "curve": [
-        0.25,
-        0.1,
-        0.25,
-        1
-      ],
-      "smoothing": 0.35,
-      "minOutput": 0.2,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.8,
-        "useCurve": true
-      },
-      "opacity": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": true,
-        "factor": 0.5,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": true,
-        "factor": 0.4,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": true,
-        "factor": 0.7,
-        "useCurve": true
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 1732,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 30,
-    "spacingSettings": {
-      "spacing": 0.04,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": true,
-      "pixelArtMode": false
+    id: 'highlighter',
+    category: 'paint',
+    name: 'Highlighter',
+    size: 34,
+    minSize: 6,
+    maxSize: 240,
+    opacity: 0.55,
+    flow: 0.75,
+    hardness: 0.85,
+    grain: 0.0,
+    roundness: 0.45,
+    aspectRatio: 2.2,
+    rotation: 0.785,
+    tipShape: 'chisel',
+    blendMode: 'multiply',
+    spacing: 0.06,
+    dynamics: {
+      pressure: { size: 15, opacity: 10, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
     }
   },
   {
-    "id": "brush_pen",
-    "category": "ink",
-    "name": "Bristle Brush Pen",
-    "size": 12,
-    "minSize": 1,
-    "maxSize": 180,
-    "opacity": 0.95,
-    "flow": 0.85,
-    "hardness": 0.8,
-    "spacing": 0.05,
-    "roundness": 0.9,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "tipShape": "rough",
-    "grain": 0.2,
-    "taperStart": 18,
-    "taperEnd": 30,
-    "velocityDynamics": {
-      "factor": 44,
-      "minSpeed": 0,
-      "maxSpeed": 3,
-      "curve": [
-        0.2,
-        0.1,
-        0.3,
-        1
-      ],
-      "smoothing": 0.3,
-      "minOutput": 0.1,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 1.2,
-        "useCurve": true
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 0.6,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": true,
-        "factor": 0.8,
-        "useCurve": true
-      },
-      "spacing": {
-        "enabled": true,
-        "factor": 0.5,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": true,
-        "factor": 0.3,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": true,
-        "factor": 0.4,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": true,
-        "factor": 1,
-        "useCurve": true
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 1811,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 28,
-    "spacingSettings": {
-      "spacing": 0.05,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": true,
-      "pixelArtMode": false
+    id: 'airbrush',
+    category: 'paint',
+    name: 'Soft Airbrush',
+    size: 42,
+    minSize: 6,
+    maxSize: 320,
+    opacity: 0.65,
+    flow: 0.5,
+    hardness: 0.15,
+    grain: 0.0,
+    roundness: 1.0,
+    aspectRatio: 1.0,
+    rotation: 0,
+    tipShape: 'soft',
+    spacing: 0.04,
+    dynamics: {
+      pressure: { size: 35, opacity: 40, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: -25, opacity: -25, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
     }
   },
   {
-    "id": "marker",
-    "category": "ink",
-    "name": "Felt Marker",
-    "size": 16,
-    "minSize": 3,
-    "maxSize": 150,
-    "opacity": 0.88,
-    "flow": 0.92,
-    "hardness": 0.88,
-    "spacing": 0.08,
-    "roundness": 0.85,
-    "aspectRatio": 1.2,
-    "rotation": 0.3,
-    "tipShape": "round",
-    "grain": 0.08,
-    "taperStart": 0,
-    "taperEnd": 0,
-    "velocityDynamics": {
-      "factor": -28,
-      "minSpeed": 0,
-      "maxSpeed": 3.5,
-      "curve": [
-        0.3,
-        0.2,
-        0.4,
-        0.8
-      ],
-      "smoothing": 0.4,
-      "minOutput": 0.6,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.5,
-        "useCurve": false
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 0.4,
-        "useCurve": true
-      },
-      "flow": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 1890,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 25,
-    "spacingSettings": {
-      "spacing": 0.08,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": true,
-      "pixelArtMode": false
+    id: 'watercolor',
+    category: 'paint',
+    name: 'Watercolor Wash',
+    size: 36,
+    minSize: 6,
+    maxSize: 260,
+    opacity: 0.55,
+    flow: 0.6,
+    hardness: 0.4,
+    wetEdge: 0.65,
+    grain: 0.35,
+    roundness: 0.9,
+    aspectRatio: 1.1,
+    rotation: 0,
+    tipShape: 'soft',
+    spacing: 0.08,
+    dynamics: {
+      pressure: { size: 50, opacity: 35, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: -20, opacity: -15, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 10, opacity: 15, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 15, opacity: 10, rotation: 0, spacing: 0, scatter: 0 }
     }
   },
   {
-    "id": "highlighter",
-    "category": "ink",
-    "name": "Highlighter",
-    "size": 24,
-    "minSize": 5,
-    "maxSize": 180,
-    "opacity": 0.45,
-    "flow": 0.7,
-    "hardness": 0.95,
-    "spacing": 0.05,
-    "roundness": 0.35,
-    "aspectRatio": 3,
-    "rotation": 0,
-    "tipShape": "square",
-    "grain": 0,
-    "taperStart": 0,
-    "taperEnd": 0,
-    "velocityDynamics": {
-      "factor": 18,
-      "minSpeed": 0,
-      "maxSpeed": 4,
-      "curve": [
-        0.4,
-        0.2,
-        0.6,
-        0.8
-      ],
-      "smoothing": 0.45,
-      "minOutput": 0.8,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.2,
-        "useCurve": false
-      },
-      "opacity": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 1969,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "multiply",
-    "stabilizer": 20,
-    "spacingSettings": {
-      "spacing": 0.05,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": true,
-      "pixelArtMode": false
+    id: 'oil_paint',
+    category: 'paint',
+    name: 'Oil Paint',
+    size: 26,
+    minSize: 4,
+    maxSize: 220,
+    opacity: 0.95,
+    flow: 0.9,
+    hardness: 0.85,
+    grain: 0.25,
+    roundness: 0.85,
+    aspectRatio: 1.3,
+    rotation: 0.3,
+    tipShape: 'bristle',
+    spacing: 0.06,
+    dynamics: {
+      pressure: { size: 60, opacity: 20, rotation: 10, spacing: 0, scatter: 0 },
+      velocity: { size: -30, opacity: -10, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 10, opacity: 0, rotation: 10, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
+    }
+  },
+
+  // 3. Texture & FX
+  {
+    id: 'charcoal',
+    category: 'texture',
+    name: 'Vine Charcoal',
+    size: 22,
+    minSize: 2,
+    maxSize: 180,
+    opacity: 0.85,
+    flow: 0.8,
+    hardness: 0.7,
+    grain: 0.8,
+    roundness: 0.85,
+    aspectRatio: 1.0,
+    rotation: 0,
+    tipShape: 'round',
+    scatter: 0.35,
+    spacing: 0.1,
+    dynamics: {
+      pressure: { size: 50, opacity: 40, rotation: 0, spacing: 0, scatter: 25 },
+      velocity: { size: -30, opacity: -20, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 15, opacity: 15, rotation: 20, spacing: 0, scatter: 30 },
+      noise: { size: 15, opacity: 10, rotation: 0, spacing: 0, scatter: 20 }
     }
   },
   {
-    "id": "watercolor",
-    "category": "paint",
-    "name": "Watercolor Wash",
-    "size": 28,
-    "minSize": 4,
-    "maxSize": 250,
-    "opacity": 0.4,
-    "flow": 0.5,
-    "hardness": 0.4,
-    "spacing": 0.06,
-    "roundness": 1,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "tipShape": "gaussian",
-    "grain": 0.25,
-    "wetEdge": 0.35,
-    "taperStart": 15,
-    "taperEnd": 25,
-    "velocityDynamics": {
-      "factor": -42,
-      "minSpeed": 0.1,
-      "maxSpeed": 3,
-      "curve": [
-        0.3,
-        0.1,
-        0.4,
-        0.9
-      ],
-      "smoothing": 0.35,
-      "minOutput": 0.2,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.9,
-        "useCurve": true
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 0.8,
-        "useCurve": true
-      },
-      "flow": {
-        "enabled": true,
-        "factor": 1,
-        "useCurve": true
-      },
-      "spacing": {
-        "enabled": true,
-        "factor": 0.3,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": true,
-        "factor": 0.8,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 2048,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "multiply",
-    "stabilizer": 35,
-    "spacingSettings": {
-      "spacing": 0.06,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": true,
-      "pixelArtMode": false
+    id: 'stipple',
+    category: 'texture',
+    name: 'Stipple Dots',
+    size: 14,
+    minSize: 2,
+    maxSize: 120,
+    opacity: 0.9,
+    flow: 1.0,
+    hardness: 0.9,
+    grain: 0.1,
+    roundness: 1.0,
+    aspectRatio: 1.0,
+    rotation: 0,
+    tipShape: 'round',
+    spacing: 0.35,
+    scatter: 0.8,
+    dynamics: {
+      pressure: { size: 40, opacity: 0, rotation: 0, spacing: -35, scatter: 40 },
+      velocity: { size: 0, opacity: 0, rotation: 0, spacing: 20, scatter: 20 },
+      jitter: { size: 25, opacity: 0, rotation: 0, spacing: 15, scatter: 45 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
     }
   },
   {
-    "id": "airbrush_soft",
-    "category": "paint",
-    "name": "Soft Airbrush",
-    "size": 40,
-    "minSize": 5,
-    "maxSize": 300,
-    "opacity": 0.5,
-    "flow": 0.35,
-    "hardness": 0.15,
-    "spacing": 0.04,
-    "roundness": 1,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "tipShape": "gaussian",
-    "grain": 0,
-    "taperStart": 0,
-    "taperEnd": 0,
-    "velocityDynamics": {
-      "factor": 35,
-      "minSpeed": 0,
-      "maxSpeed": 3.5,
-      "curve": [
-        0.25,
-        0.1,
-        0.25,
-        1
-      ],
-      "smoothing": 0.3,
-      "minOutput": 0.2,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.6,
-        "useCurve": true
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 1,
-        "useCurve": true
-      },
-      "flow": {
-        "enabled": true,
-        "factor": 1,
-        "useCurve": true
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 2127,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 20,
-    "spacingSettings": {
-      "spacing": 0.04,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": true,
-      "pixelArtMode": false
+    id: 'neon_glow',
+    category: 'texture',
+    name: 'Neon Tube',
+    size: 16,
+    minSize: 2,
+    maxSize: 140,
+    opacity: 1.0,
+    flow: 1.0,
+    hardness: 0.9,
+    glowWidth: 0.75,
+    roundness: 1.0,
+    aspectRatio: 1.0,
+    rotation: 0,
+    tipShape: 'round',
+    spacing: 0.05,
+    dynamics: {
+      pressure: { size: 35, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: -15, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
     }
   },
+
+  // 4. Pixel Art
   {
-    "id": "chalk",
-    "category": "paint",
-    "name": "Chalk Pastel",
-    "size": 18,
-    "minSize": 3,
-    "maxSize": 150,
-    "opacity": 0.8,
-    "flow": 0.85,
-    "hardness": 0.6,
-    "spacing": 0.1,
-    "roundness": 0.7,
-    "aspectRatio": 1.4,
-    "rotation": 0.5,
-    "tipShape": "rough",
-    "grain": 0.7,
-    "taperStart": 6,
-    "taperEnd": 10,
-    "velocityDynamics": {
-      "factor": 39,
-      "minSpeed": 0,
-      "maxSpeed": 3,
-      "curve": [
-        0.25,
-        0.1,
-        0.25,
-        1
-      ],
-      "smoothing": 0.35,
-      "minOutput": 0.25,
-      "maxOutput": 1
+    id: 'pixel_pen',
+    category: 'pixel',
+    name: '1px Pixel Pen',
+    size: 1,
+    minSize: 1,
+    maxSize: 24,
+    opacity: 1.0,
+    flow: 1.0,
+    hardness: 1.0,
+    isPixel: true,
+    spacingSettings: {
+      pixelArtMode: true,
+      spacing: 0.01,
+      minSpacingPx: 1.0
     },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.8,
-        "useCurve": true
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 0.7,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": true,
-        "factor": 0.5,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": true,
-        "factor": 0.6,
-        "useCurve": true
-      },
-      "taper": {
-        "enabled": true,
-        "factor": 0.5,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": true,
-      "amplitude": 0.25,
-      "frequency": 0.15,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 2206,
-      "noiseType": "perlin",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 20,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 25,
-    "spacingSettings": {
-      "spacing": 0.1,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": true,
-      "pixelArtMode": false
-    }
-  },
-  {
-    "id": "charcoal",
-    "category": "paint",
-    "name": "Vine Charcoal",
-    "size": 15,
-    "minSize": 2,
-    "maxSize": 160,
-    "opacity": 0.85,
-    "flow": 0.8,
-    "hardness": 0.65,
-    "spacing": 0.09,
-    "roundness": 0.75,
-    "aspectRatio": 1.3,
-    "rotation": 0.2,
-    "tipShape": "rough",
-    "grain": 0.6,
-    "taperStart": 10,
-    "taperEnd": 15,
-    "velocityDynamics": {
-      "factor": 42,
-      "minSpeed": 0,
-      "maxSpeed": 3.2,
-      "curve": [
-        0.2,
-        0.1,
-        0.3,
-        1
-      ],
-      "smoothing": 0.3,
-      "minOutput": 0.15,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 1,
-        "useCurve": true
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 0.9,
-        "useCurve": true
-      },
-      "flow": {
-        "enabled": true,
-        "factor": 0.5,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": true,
-        "factor": 0.7,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": true,
-        "factor": 0.3,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": true,
-        "factor": 0.8,
-        "useCurve": true
-      },
-      "taper": {
-        "enabled": true,
-        "factor": 0.8,
-        "useCurve": true
-      }
-    },
-    "jitter": {
-      "enabled": true,
-      "amplitude": 0.2,
-      "frequency": 0.12,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 2285,
-      "noiseType": "perlin",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 20,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 25,
-    "spacingSettings": {
-      "spacing": 0.09,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": true,
-      "pixelArtMode": false
-    }
-  },
-  {
-    "id": "oil_pastel",
-    "category": "paint",
-    "name": "Oil Pastel",
-    "size": 20,
-    "minSize": 4,
-    "maxSize": 180,
-    "opacity": 0.92,
-    "flow": 0.9,
-    "hardness": 0.85,
-    "spacing": 0.07,
-    "roundness": 0.8,
-    "aspectRatio": 1.2,
-    "rotation": 0.4,
-    "tipShape": "rough",
-    "grain": 0.45,
-    "taperStart": 8,
-    "taperEnd": 14,
-    "velocityDynamics": {
-      "factor": 39,
-      "minSpeed": 0,
-      "maxSpeed": 3,
-      "curve": [
-        0.25,
-        0.15,
-        0.35,
-        0.95
-      ],
-      "smoothing": 0.35,
-      "minOutput": 0.3,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.9,
-        "useCurve": true
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 0.5,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": true,
-        "factor": 0.7,
-        "useCurve": true
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": true,
-        "factor": 0.4,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": true,
-        "factor": 0.4,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": true,
-        "factor": 0.6,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 2364,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 20,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 30,
-    "spacingSettings": {
-      "spacing": 0.07,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": true,
-      "pixelArtMode": false
-    }
-  },
-  {
-    "id": "stipple",
-    "category": "texture",
-    "name": "Stipple Dots",
-    "size": 16,
-    "minSize": 2,
-    "maxSize": 120,
-    "opacity": 0.9,
-    "flow": 0.85,
-    "hardness": 0.9,
-    "spacing": 0.35,
-    "scatter": 1.2,
-    "roundness": 1,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "tipShape": "round",
-    "grain": 0.3,
-    "taperStart": 0,
-    "taperEnd": 0,
-    "velocityDynamics": {
-      "factor": 46,
-      "minSpeed": 0.1,
-      "maxSpeed": 3.5,
-      "curve": [
-        0.3,
-        0.1,
-        0.4,
-        0.9
-      ],
-      "smoothing": 0.25,
-      "minOutput": 0.2,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.6,
-        "useCurve": false
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 0.5,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": true,
-        "factor": 1.2,
-        "useCurve": true
-      },
-      "scatter": {
-        "enabled": true,
-        "factor": 1.5,
-        "useCurve": true
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 2443,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 15,
-    "spacingSettings": {
-      "spacing": 0.35,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": false,
-      "pixelArtMode": false
-    }
-  },
-  {
-    "id": "dashed_line",
-    "category": "texture",
-    "name": "Dashed Stitch",
-    "size": 4,
-    "minSize": 1,
-    "maxSize": 50,
-    "opacity": 1,
-    "flow": 1,
-    "hardness": 1,
-    "spacing": 0.3,
-    "roundness": 0.3,
-    "aspectRatio": 3.5,
-    "rotation": 0,
-    "tipShape": "square",
-    "grain": 0,
-    "taperStart": 0,
-    "taperEnd": 0,
-    "velocityDynamics": {
-      "factor": 28,
-      "minSpeed": 0,
-      "maxSpeed": 3,
-      "curve": [
-        0.25,
-        0.1,
-        0.25,
-        1
-      ],
-      "smoothing": 0.4,
-      "minOutput": 0.5,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.4,
-        "useCurve": false
-      },
-      "opacity": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": true,
-        "factor": 0.8,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": true,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 2522,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 30,
-    "spacingSettings": {
-      "spacing": 0.3,
-      "minSpacingPx": 0.8,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": false,
-      "pixelArtMode": false
-    }
-  },
-  {
-    "id": "neon_glow",
-    "category": "texture",
-    "name": "Neon Tube",
-    "size": 10,
-    "minSize": 2,
-    "maxSize": 150,
-    "opacity": 1,
-    "flow": 1,
-    "hardness": 0.95,
-    "spacing": 0.05,
-    "roundness": 1,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "tipShape": "round",
-    "grain": 0,
-    "glowWidth": 2.8,
-    "taperStart": 8,
-    "taperEnd": 14,
-    "velocityDynamics": {
-      "factor": 35,
-      "minSpeed": 0,
-      "maxSpeed": 3,
-      "curve": [
-        0.2,
-        0.1,
-        0.3,
-        1
-      ],
-      "smoothing": 0.3,
-      "minOutput": 0.3,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.8,
-        "useCurve": true
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 0.5,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": true,
-        "factor": 0.7,
-        "useCurve": true
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 2601,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "screen",
-    "stabilizer": 35,
-    "spacingSettings": {
-      "spacing": 0.05,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": false,
-      "pixelArtMode": false
-    }
-  },
-  {
-    "id": "stamp_stars",
-    "category": "texture",
-    "name": "Starfield Stamp",
-    "size": 22,
-    "minSize": 4,
-    "maxSize": 180,
-    "opacity": 0.9,
-    "flow": 0.9,
-    "hardness": 1,
-    "spacing": 0.45,
-    "scatter": 1.8,
-    "roundness": 1,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "angleJitter": 1,
-    "tipShape": "star",
-    "grain": 0,
-    "taperStart": 0,
-    "taperEnd": 0,
-    "velocityDynamics": {
-      "factor": 46,
-      "minSpeed": 0.1,
-      "maxSpeed": 3.5,
-      "curve": [
-        0.25,
-        0.1,
-        0.25,
-        1
-      ],
-      "smoothing": 0.25,
-      "minOutput": 0.2,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.9,
-        "useCurve": true
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 0.6,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": true,
-        "factor": 1,
-        "useCurve": true
-      },
-      "scatter": {
-        "enabled": true,
-        "factor": 1.8,
-        "useCurve": true
-      },
-      "angle": {
-        "enabled": true,
-        "factor": 1.5,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 2680,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 15,
-    "spacingSettings": {
-      "spacing": 0.45,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": false,
-      "pixelArtMode": false
-    }
-  },
-  {
-    "id": "crosshatch",
-    "category": "texture",
-    "name": "Crosshatch Shading",
-    "size": 8,
-    "minSize": 2,
-    "maxSize": 80,
-    "opacity": 0.85,
-    "flow": 0.8,
-    "hardness": 0.9,
-    "spacing": 0.15,
-    "roundness": 0.4,
-    "aspectRatio": 2.5,
-    "rotation": 0.785,
-    "tipShape": "hatch",
-    "grain": 0.2,
-    "taperStart": 4,
-    "taperEnd": 8,
-    "velocityDynamics": {
-      "factor": 39,
-      "minSpeed": 0,
-      "maxSpeed": 3.2,
-      "curve": [
-        0.3,
-        0.1,
-        0.3,
-        1
-      ],
-      "smoothing": 0.35,
-      "minOutput": 0.2,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.7,
-        "useCurve": true
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 0.8,
-        "useCurve": true
-      },
-      "flow": {
-        "enabled": true,
-        "factor": 0.5,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": true,
-        "factor": 0.6,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": true,
-        "factor": 0.5,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": true,
-        "factor": 0.4,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": true,
-        "factor": 0.6,
-        "useCurve": true
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 2759,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 30,
-    "spacingSettings": {
-      "spacing": 0.15,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": false,
-      "pixelArtMode": false
-    }
-  },
-  {
-    "id": "hard_eraser",
-    "category": "eraser",
-    "name": "Hard Eraser",
-    "size": 20,
-    "minSize": 2,
-    "maxSize": 250,
-    "opacity": 1,
-    "flow": 1,
-    "hardness": 1,
-    "spacing": 0.06,
-    "roundness": 1,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "tipShape": "round",
-    "grain": 0,
-    "taperStart": 0,
-    "taperEnd": 0,
-    "isEraser": true,
-    "velocityDynamics": {
-      "factor": 21,
-      "minSpeed": 0,
-      "maxSpeed": 3.5,
-      "curve": [
-        0.25,
-        0.1,
-        0.25,
-        1
-      ],
-      "smoothing": 0.4,
-      "minOutput": 0.6,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.5,
-        "useCurve": false
-      },
-      "opacity": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 2838,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "destination-out",
-    "stabilizer": 20,
-    "spacingSettings": {
-      "spacing": 0.06,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": false,
-      "pixelArtMode": false
-    }
-  },
-  {
-    "id": "soft_eraser",
-    "category": "eraser",
-    "name": "Soft Kneaded Eraser",
-    "size": 32,
-    "minSize": 4,
-    "maxSize": 300,
-    "opacity": 0.65,
-    "flow": 0.55,
-    "hardness": 0.25,
-    "spacing": 0.05,
-    "roundness": 1,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "tipShape": "gaussian",
-    "grain": 0.1,
-    "taperStart": 0,
-    "taperEnd": 0,
-    "isEraser": true,
-    "velocityDynamics": {
-      "factor": 35,
-      "minSpeed": 0,
-      "maxSpeed": 3,
-      "curve": [
-        0.25,
-        0.1,
-        0.25,
-        1
-      ],
-      "smoothing": 0.35,
-      "minOutput": 0.25,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.7,
-        "useCurve": true
-      },
-      "opacity": {
-        "enabled": true,
-        "factor": 0.9,
-        "useCurve": true
-      },
-      "flow": {
-        "enabled": true,
-        "factor": 0.8,
-        "useCurve": true
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 2917,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "destination-out",
-    "stabilizer": 25,
-    "spacingSettings": {
-      "spacing": 0.05,
-      "minSpacingPx": 1.5,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": false,
-      "pixelArtMode": false
-    }
-  },
-  {
-    "id": "pixel_pen",
-    "category": "pixel",
-    "name": "1px Pixel Pen",
-    "size": 1,
-    "minSize": 1,
-    "maxSize": 16,
-    "opacity": 1,
-    "flow": 1,
-    "hardness": 1,
-    "spacing": 0.1,
-    "roundness": 1,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "tipShape": "square",
-    "grain": 0,
-    "taperStart": 0,
-    "taperEnd": 0,
-    "isPixel": true,
-    "velocityDynamics": {
-      "factor": 0,
-      "minSpeed": 0,
-      "maxSpeed": 4,
-      "curve": [
-        0.3,
-        0.3,
-        0.7,
-        0.7
-      ],
-      "smoothing": 0.5,
-      "minOutput": 1,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "opacity": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 2996,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 0,
-    "spacingSettings": {
-      "spacing": 0.1,
-      "minSpacingPx": 1,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": false,
-      "pixelArtMode": true
-    }
-  },
-  {
-    "id": "pixel_eraser",
-    "category": "pixel",
-    "name": "Pixel Eraser",
-    "size": 1,
-    "minSize": 1,
-    "maxSize": 20,
-    "opacity": 1,
-    "flow": 1,
-    "hardness": 1,
-    "spacing": 0.1,
-    "roundness": 1,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "tipShape": "square",
-    "grain": 0,
-    "taperStart": 0,
-    "taperEnd": 0,
-    "isPixel": true,
-    "isEraser": true,
-    "velocityDynamics": {
-      "factor": 0,
-      "minSpeed": 0,
-      "maxSpeed": 4,
-      "curve": [
-        0.3,
-        0.3,
-        0.7,
-        0.7
-      ],
-      "smoothing": 0.5,
-      "minOutput": 1,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "opacity": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 3075,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "destination-out",
-    "stabilizer": 0,
-    "spacingSettings": {
-      "spacing": 0.1,
-      "minSpacingPx": 1,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": false,
-      "pixelArtMode": true
-    }
-  },
-  {
-    "id": "pixel_dither",
-    "category": "pixel",
-    "name": "Checker Dither",
-    "size": 4,
-    "minSize": 2,
-    "maxSize": 24,
-    "opacity": 1,
-    "flow": 1,
-    "hardness": 1,
-    "spacing": 0.12,
-    "roundness": 1,
-    "aspectRatio": 1,
-    "rotation": 0,
-    "tipShape": "checker",
-    "grain": 0,
-    "taperStart": 0,
-    "taperEnd": 0,
-    "isPixel": true,
-    "velocityDynamics": {
-      "factor": 0,
-      "minSpeed": 0,
-      "maxSpeed": 3,
-      "curve": [
-        0.3,
-        0.3,
-        0.7,
-        0.7
-      ],
-      "smoothing": 0.4,
-      "minOutput": 0.7,
-      "maxOutput": 1
-    },
-    "velocityTargets": {
-      "size": {
-        "enabled": true,
-        "factor": 0.3,
-        "useCurve": false
-      },
-      "opacity": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "flow": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "spacing": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "scatter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "angle": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "jitter": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      },
-      "taper": {
-        "enabled": false,
-        "factor": 1,
-        "useCurve": false
-      }
-    },
-    "jitter": {
-      "enabled": false,
-      "amplitude": 1,
-      "frequency": 0.05,
-      "octaves": 3,
-      "persistence": 0.5,
-      "lacunarity": 2,
-      "seed": 3154,
-      "noiseType": "sines",
-      "basis": "distance",
-      "phaseOffset": 0,
-      "fadeIn": 0,
-      "fadeOut": 0,
-      "velocityLink": 0,
-      "targets": {
-        "size": 30,
-        "opacity": 0,
-        "flow": 0,
-        "angle": 0,
-        "positionWobble": 0,
-        "hue": 0,
-        "saturation": 0,
-        "brightness": 0,
-        "spacing": 0
-      }
-    },
-    "blendMode": "source-over",
-    "stabilizer": 0,
-    "spacingSettings": {
-      "spacing": 0.12,
-      "minSpacingPx": 1,
-      "spacingJitter": 0,
-      "speedFactor": 0,
-      "autoSpacing": false,
-      "pixelArtMode": true
+    dynamics: {
+      pressure: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
     }
   }
 ];
@@ -4407,39 +2146,48 @@ class Brush {
     this.aspectRatio = data.aspectRatio ?? 1.0;
     this.rotation = data.rotation ?? 0.0;
     this.tipShape = data.tipShape || 'round'; // 'round' | 'square' | 'chisel' | 'calligraphy' | 'soft' | 'star' | 'bristle'
-    this.buildUp = data.buildUp ?? (data.id?.includes('airbrush') || false);
-
     // 2D Noise Settings
     this.noiseScale = data.noiseScale ?? 20;
     this.noiseIntensity = data.noiseIntensity ?? 50;
     this.noiseSeed = data.noiseSeed ?? 1337;
     this.noiseOctaves = data.noiseOctaves ?? 3;
 
-    // Factor & Child Dynamic System
-    // Factors (Inputs): velocity, jitter, noise
-    // Children (Outputs): size, rotation, spacing, opacity, tipRotation
+    // ONE Clean Dynamics System:
+    // Sources: pressure, velocity, jitter, noise
+    // Targets: size, opacity, rotation, spacing, scatter (-100 to +100)
+    const d = data.dynamics || {};
     const fl = data.factorLinks || {};
-    this.factorLinks = {
+    const vd = data.velocityDynamics || {};
+    const jt = data.jitter || {};
+
+    this.dynamics = {
+      pressure: {
+        size: d.pressure?.size ?? 50,
+        opacity: d.pressure?.opacity ?? 0,
+        rotation: d.pressure?.rotation ?? 0,
+        spacing: d.pressure?.spacing ?? 0,
+        scatter: d.pressure?.scatter ?? 0
+      },
       velocity: {
-        size: fl.velocity?.size ?? (data.velocityDynamics?.factor ?? 0),
-        opacity: fl.velocity?.opacity ?? 0,
-        rotation: fl.velocity?.rotation ?? 0,
-        spacing: fl.velocity?.spacing ?? 0,
-        tipRotation: fl.velocity?.tipRotation ?? 0
+        size: d.velocity?.size ?? fl.velocity?.size ?? (vd.factor ?? 0),
+        opacity: d.velocity?.opacity ?? fl.velocity?.opacity ?? 0,
+        rotation: d.velocity?.rotation ?? fl.velocity?.rotation ?? fl.velocity?.tipRotation ?? 0,
+        spacing: d.velocity?.spacing ?? fl.velocity?.spacing ?? 0,
+        scatter: d.velocity?.scatter ?? 0
       },
       jitter: {
-        size: fl.jitter?.size ?? (data.jitter?.size ?? 0),
-        opacity: fl.jitter?.opacity ?? 0,
-        rotation: fl.jitter?.rotation ?? 0,
-        spacing: fl.jitter?.spacing ?? 0,
-        tipRotation: fl.jitter?.tipRotation ?? 0
+        size: d.jitter?.size ?? fl.jitter?.size ?? (jt.enabled ? (jt.targets?.size ?? 0) : 0),
+        opacity: d.jitter?.opacity ?? fl.jitter?.opacity ?? (jt.enabled ? (jt.targets?.opacity ?? 0) : 0),
+        rotation: d.jitter?.rotation ?? fl.jitter?.rotation ?? fl.jitter?.tipRotation ?? 0,
+        spacing: d.jitter?.spacing ?? fl.jitter?.spacing ?? 0,
+        scatter: d.jitter?.scatter ?? (jt.enabled ? (jt.targets?.positionWobble ?? 0) : 0)
       },
       noise: {
-        size: fl.noise?.size ?? 0,
-        opacity: fl.noise?.opacity ?? 0,
-        rotation: fl.noise?.rotation ?? 0,
-        spacing: fl.noise?.spacing ?? 0,
-        tipRotation: fl.noise?.tipRotation ?? 0
+        size: d.noise?.size ?? fl.noise?.size ?? 0,
+        opacity: d.noise?.opacity ?? fl.noise?.opacity ?? 0,
+        rotation: d.noise?.rotation ?? fl.noise?.rotation ?? fl.noise?.tipRotation ?? 0,
+        spacing: d.noise?.spacing ?? fl.noise?.spacing ?? 0,
+        scatter: d.noise?.scatter ?? 0
       }
     };
 
@@ -4448,69 +2196,13 @@ class Brush {
     this.spacingSettings = {
       spacing: sp.spacing ?? data.spacing ?? 0.08,    // 0.01 to 2.0 (1% to 200%)
       minSpacingPx: sp.minSpacingPx ?? 1.0,           // minimum spacing in pixels
-      spacingJitter: sp.spacingJitter ?? 0,           // 0 to 100%
-      speedFactor: sp.speedFactor ?? 0,               // -100 to +100 linked to speed
       autoSpacing: sp.autoSpacing ?? false,           // adaptively maintain smoothness
       pixelArtMode: sp.pixelArtMode ?? false          // fixed exact pixel steps
     };
     this.spacing = this.spacingSettings.spacing;
     this.scatter = data.scatter ?? 0.0;
 
-    // 3. Velocity Dynamics Group (-100 to +100 factor)
-    const vd = data.velocityDynamics || {};
-    this.velocityDynamics = {
-      factor: vd.factor ?? 0,                                 // Integer -100 to +100 (0 = neutral)
-      minSpeed: vd.minSpeed ?? 0.0,                           // px/ms
-      maxSpeed: vd.maxSpeed ?? 3.0,                           // px/ms
-      curve: vd.curve ? [...vd.curve] : [0.25, 0.1, 0.25, 1.0], // draggable cubic bezier
-      smoothing: vd.smoothing ?? 0.35,                        // EMA smoothing factor
-      minOutput: vd.minOutput ?? 0.1,                         // minimum output
-      maxOutput: vd.maxOutput ?? 1.0                          // maximum output
-    };
-
-    // Velocity Targets Modulation
-    const vt = data.velocityTargets || {};
-    this.velocityTargets = {
-      size: { enabled: vt.size?.enabled ?? true, factor: vt.size?.factor ?? 1.0, useCurve: vt.size?.useCurve ?? true },
-      opacity: { enabled: vt.opacity?.enabled ?? true, factor: vt.opacity?.factor ?? 1.0, useCurve: vt.opacity?.useCurve ?? true },
-      flow: { enabled: vt.flow?.enabled ?? false, factor: vt.flow?.factor ?? 1.0, useCurve: vt.flow?.useCurve ?? false },
-      spacing: { enabled: vt.spacing?.enabled ?? false, factor: vt.spacing?.factor ?? 1.0, useCurve: vt.spacing?.useCurve ?? false },
-      scatter: { enabled: vt.scatter?.enabled ?? false, factor: vt.scatter?.factor ?? 1.0, useCurve: vt.scatter?.useCurve ?? false },
-      angle: { enabled: vt.angle?.enabled ?? false, factor: vt.angle?.factor ?? 1.0, useCurve: vt.angle?.useCurve ?? false },
-      jitter: { enabled: vt.jitter?.enabled ?? false, factor: vt.jitter?.factor ?? 1.0, useCurve: vt.jitter?.useCurve ?? false },
-      taper: { enabled: vt.taper?.enabled ?? false, factor: vt.taper?.factor ?? 1.0, useCurve: vt.taper?.useCurve ?? false }
-    };
-
-    // 4. Smooth Coherent Jitter
-    const jt = data.jitter || {};
-    this.jitter = {
-      enabled: jt.enabled ?? false,
-      amplitude: jt.amplitude ?? 1.0,                 // 0 to 200
-      frequency: jt.frequency ?? 0.05,                // 0.01 to 10.0
-      octaves: jt.octaves ?? 3,                       // 1 to 8
-      persistence: jt.persistence ?? 0.5,             // 0.1 to 1.0
-      lacunarity: jt.lacunarity ?? 2.0,               // 1.5 to 4.0
-      seed: jt.seed ?? 1337,                          // PRNG seed
-      noiseType: jt.noiseType || 'sines',             // 'sines' | 'perlin' | 'keyframes'
-      basis: jt.basis || 'distance',                  // 'distance' | 'time'
-      phaseOffset: jt.phaseOffset ?? 0,               // 0 to 360 deg
-      fadeIn: jt.fadeIn ?? 0,                         // px
-      fadeOut: jt.fadeOut ?? 0,                       // px
-      velocityLink: jt.velocityLink ?? 0,             // -100 to +100
-      targets: {
-        size: jt.targets?.size ?? 30,                 // 0 to 100%
-        opacity: jt.targets?.opacity ?? 0,            // 0 to 100%
-        flow: jt.targets?.flow ?? 0,
-        angle: jt.targets?.angle ?? 0,
-        positionWobble: jt.targets?.positionWobble ?? 0,
-        hue: jt.targets?.hue ?? 0,
-        saturation: jt.targets?.saturation ?? 0,
-        brightness: jt.targets?.brightness ?? 0,
-        spacing: jt.targets?.spacing ?? 0
-      }
-    };
-
-    // 5. Texture & Wet Edge
+    // 5. Texture & Wet Edge & Quality
     this.grain = data.grain ?? 0.0;
     this.wetEdge = data.wetEdge ?? 0.0;
     this.glowWidth = data.glowWidth ?? 0.0;
@@ -4540,6 +2232,14 @@ class Brush {
     this._stampCacheKey = '';
   }
 
+  // Backward compatibility alias for factorLinks
+  get factorLinks() {
+    return this.dynamics;
+  }
+  set factorLinks(val) {
+    if (val) this.dynamics = val;
+  }
+
   createSnapshot() {
     return JSON.parse(JSON.stringify({
       id: this.id,
@@ -4558,9 +2258,11 @@ class Brush {
       spacingSettings: this.spacingSettings,
       spacing: this.spacingSettings.spacing,
       scatter: this.scatter,
-      velocityDynamics: this.velocityDynamics,
-      velocityTargets: this.velocityTargets,
-      jitter: this.jitter,
+      dynamics: this.dynamics,
+      noiseScale: this.noiseScale,
+      noiseIntensity: this.noiseIntensity,
+      noiseSeed: this.noiseSeed,
+      noiseOctaves: this.noiseOctaves,
       grain: this.grain,
       wetEdge: this.wetEdge,
       glowWidth: this.glowWidth,
@@ -4569,8 +2271,6 @@ class Brush {
       taperEnd: this.taperEnd,
       blendMode: this.blendMode,
       stabilizer: this.stabilizer,
-      factorLinks: this.factorLinks,
-      buildUp: this.buildUp,
       isEraser: this.isEraser,
       isPixel: this.isPixel
     }));
@@ -5152,119 +2852,569 @@ class FillBucket {
 
 /* --- LassoFill.js --- */
 /**
- * Vectura Lasso Fill & Lasso Erase Tool
- * Supports real-time animated preview hint during drag.
+ * Vectura Lasso Engine (LassoFill.js)
+ * High-performance interconnected polygon lasso engine with:
+ * - Real-time polygon simplification with sharp-turn anchor preservation
+ * - Dynamic velocity point density (speed-dependent vertex count)
+ * - 4 Pre-made Lasso Brushes (Precise, Smooth, Angular, Loose)
+ * - Color and Pattern Fill modes (Dots, Squares, Vertical Lines, Horizontal Lines, Crosshatch)
+ * - Live non-destructive overlay preview
+ * - Alpha lock and Layer lock awareness
  */
+
+const LASSO_PRESETS = [
+  {
+    id: 'precise',
+    name: 'Precise',
+    description: 'Pixel-exact contour tracing with maximum vertex density and sharp corner retention.',
+    polyCount: 92, // High polygon count
+    sharpTurnAngle: 35, // Degrees threshold for sharp turn
+    velocityEnabled: false,
+    velocityAmount: 0,
+    fillMode: 'color',
+    pattern: {
+      type: 'dots',
+      size: 6,
+      spacing: 16,
+      lineWidth: 2,
+      angle: 0
+    }
+  },
+  {
+    id: 'smooth',
+    name: 'Smooth',
+    description: 'Curvature-smoothed organic contours with gentle velocity-based point tapering.',
+    polyCount: 65, // Balanced polygon count
+    sharpTurnAngle: 48,
+    velocityEnabled: true,
+    velocityAmount: 45,
+    fillMode: 'color',
+    pattern: {
+      type: 'crosshatch',
+      size: 8,
+      spacing: 20,
+      lineWidth: 2,
+      angle: 45
+    }
+  },
+  {
+    id: 'angular',
+    name: 'Angular',
+    description: 'Low-poly geometric silhouette that snaps aggressively to sharp corner angles.',
+    polyCount: 22, // Low polygon count
+    sharpTurnAngle: 28, // Sensitive to sharp turns
+    velocityEnabled: false,
+    velocityAmount: 0,
+    fillMode: 'color',
+    pattern: {
+      type: 'squares',
+      size: 8,
+      spacing: 22,
+      lineWidth: 2,
+      angle: 0
+    }
+  },
+  {
+    id: 'loose',
+    name: 'Loose',
+    description: 'Expressive gestural lasso that simplifies fast strokes into bold, economical facets.',
+    polyCount: 12, // Very low polygon count
+    sharpTurnAngle: 65,
+    velocityEnabled: true,
+    velocityAmount: 85,
+    fillMode: 'color',
+    pattern: {
+      type: 'horizontal-lines',
+      size: 8,
+      spacing: 18,
+      lineWidth: 3,
+      angle: 0
+    }
+  }
+];
+
+function perpendicularDistance(p, a, b) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const mag = Math.hypot(dx, dy);
+  if (mag === 0) return Math.hypot(p.x - a.x, p.y - a.y);
+  return Math.abs(dy * p.x - dx * p.y + b.x * a.y - b.y * a.x) / mag;
+}
+
+function douglasPeucker(points, epsilon) {
+  if (points.length <= 2) return points;
+  let dmax = 0;
+  let index = 0;
+  const end = points.length - 1;
+  for (let i = 1; i < end; i++) {
+    const d = perpendicularDistance(points[i], points[0], points[end]);
+    if (d > dmax) {
+      index = i;
+      dmax = d;
+    }
+  }
+  if (dmax > epsilon) {
+    const rec1 = douglasPeucker(points.slice(0, index + 1), epsilon);
+    const rec2 = douglasPeucker(points.slice(index), epsilon);
+    return rec1.slice(0, rec1.length - 1).concat(rec2);
+  } else {
+    return [points[0], points[end]];
+  }
+}
+
+/**
+ * Simplifies a polyline while guaranteeing that all points marked isCritical are preserved.
+ */
+function simplifyWithAnchors(points, epsilon) {
+  if (points.length <= 2) return points;
+  const criticalIndices = [0];
+  for (let i = 1; i < points.length - 1; i++) {
+    if (points[i].isCritical) criticalIndices.push(i);
+  }
+  criticalIndices.push(points.length - 1);
+
+  let result = [];
+  for (let k = 0; k < criticalIndices.length - 1; k++) {
+    const startIdx = criticalIndices[k];
+    const endIdx = criticalIndices[k + 1];
+    const segment = points.slice(startIdx, endIdx + 1);
+    const simplifiedSegment = douglasPeucker(segment, epsilon);
+    if (k === 0) {
+      result = simplifiedSegment;
+    } else {
+      result = result.concat(simplifiedSegment.slice(1));
+    }
+  }
+  return result;
+}
+
+/**
+ * Generates an offscreen tile canvas for repeating patterns.
+ */
+function createPatternTileCanvas(pattern, colorHex, opacity = 1.0) {
+  const type = pattern?.type || 'dots';
+  const size = Math.max(2, Math.min(64, pattern?.size || 8));
+  const spacing = Math.max(size + 2, Math.min(80, pattern?.spacing || 18));
+  const lineWidth = Math.max(1, Math.min(24, pattern?.lineWidth || 2));
+
+  const canvas = document.createElement('canvas');
+  const w = spacing;
+  const h = spacing;
+  canvas.width = w;
+  canvas.height = h;
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  ctx.fillStyle = colorHex;
+  ctx.strokeStyle = colorHex;
+  ctx.globalAlpha = Math.max(0.01, Math.min(1.0, opacity));
+  ctx.lineCap = 'square';
+  ctx.lineJoin = 'miter';
+
+  switch (type) {
+    case 'dots': {
+      ctx.beginPath();
+      ctx.arc(w / 2, h / 2, size / 2, 0, Math.PI * 2);
+      ctx.fill();
+      break;
+    }
+    case 'squares': {
+      const offset = (spacing - size) / 2;
+      ctx.fillRect(offset, offset, size, size);
+      break;
+    }
+    case 'vertical-lines': {
+      ctx.lineWidth = lineWidth;
+      ctx.beginPath();
+      ctx.moveTo(w / 2, 0);
+      ctx.lineTo(w / 2, h);
+      ctx.stroke();
+      break;
+    }
+    case 'horizontal-lines': {
+      ctx.lineWidth = lineWidth;
+      ctx.beginPath();
+      ctx.moveTo(0, h / 2);
+      ctx.lineTo(w, h / 2);
+      ctx.stroke();
+      break;
+    }
+    case 'crosshatch': {
+      ctx.lineWidth = lineWidth;
+      ctx.beginPath();
+      ctx.moveTo(w / 2, 0);
+      ctx.lineTo(w / 2, h);
+      ctx.moveTo(0, h / 2);
+      ctx.lineTo(w, h / 2);
+      ctx.stroke();
+      break;
+    }
+  }
+
+  return canvas;
+}
+
 class LassoFill {
   constructor() {
-    this.mode = 'fill'; // 'fill' | 'erase'
-    this.points = [];
     this.active = false;
+    this.rawPoints = [];
+    this.polygonPoints = [];
+
+    // Speed tracking
+    this.lastSampleTime = 0;
+    this.smoothedSpeed = 0;
+
+    // Presets & Active Brush State
+    this.presets = JSON.parse(JSON.stringify(LASSO_PRESETS));
+    this.activePresetId = 'precise';
+
+    // Current configurable parameters
+    this.polyCount = 92;
+    this.sharpTurnAngle = 35;
+    this.velocityEnabled = false;
+    this.velocityAmount = 0;
+    this.fillMode = 'color'; // 'color' | 'pattern'
+    this.pattern = {
+      type: 'dots',
+      size: 6,
+      spacing: 16,
+      lineWidth: 2,
+      angle: 0
+    };
+
+    this.loadSavedSettings();
   }
 
-  start(x, y) {
-    this.active = true;
-    this.points = [{ x, y }];
+  loadSavedSettings() {
+    try {
+      const savedPresetId = localStorage.getItem('vectura_lasso_active_preset');
+      if (savedPresetId && this.presets.some(p => p.id === savedPresetId)) {
+        this.activePresetId = savedPresetId;
+      }
+
+      // Restore saved per-preset adjustments
+      for (const p of this.presets) {
+        const stored = localStorage.getItem(`vectura_lasso_preset_${p.id}`);
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          Object.assign(p, parsed);
+        }
+      }
+
+      this.applyPreset(this.activePresetId, false);
+    } catch (_) {}
   }
 
-  addPoint(x, y) {
-    if (!this.active) return;
-    const last = this.points[this.points.length - 1];
-    if (!last || Math.hypot(x - last.x, y - last.y) > 3) {
-      this.points.push({ x, y });
+  applyPreset(presetId, persist = true) {
+    const p = this.presets.find(item => item.id === presetId) || this.presets[0];
+    this.activePresetId = p.id;
+    this.polyCount = p.polyCount ?? 92;
+    this.sharpTurnAngle = p.sharpTurnAngle ?? 35;
+    this.velocityEnabled = p.velocityEnabled ?? false;
+    this.velocityAmount = p.velocityAmount ?? 0;
+    this.fillMode = p.fillMode || 'color';
+    this.pattern = Object.assign({
+      type: 'dots',
+      size: 6,
+      spacing: 16,
+      lineWidth: 2,
+      angle: 0
+    }, p.pattern);
+
+    if (persist) {
+      try {
+        localStorage.setItem('vectura_lasso_active_preset', this.activePresetId);
+        this.persistActivePresetSettings();
+      } catch (_) {}
     }
+  }
+
+  persistActivePresetSettings() {
+    try {
+      const cur = this.presets.find(p => p.id === this.activePresetId);
+      if (cur) {
+        cur.polyCount = this.polyCount;
+        cur.sharpTurnAngle = this.sharpTurnAngle;
+        cur.velocityEnabled = this.velocityEnabled;
+        cur.velocityAmount = this.velocityAmount;
+        cur.fillMode = this.fillMode;
+        cur.pattern = { ...this.pattern };
+        localStorage.setItem(`vectura_lasso_preset_${cur.id}`, JSON.stringify({
+          polyCount: this.polyCount,
+          sharpTurnAngle: this.sharpTurnAngle,
+          velocityEnabled: this.velocityEnabled,
+          velocityAmount: this.velocityAmount,
+          fillMode: this.fillMode,
+          pattern: { ...this.pattern }
+        }));
+      }
+    } catch (_) {}
+  }
+
+  // --- Drawing Lifecycle ---
+
+  start(x, y, timestamp = Date.now()) {
+    this.active = true;
+    this.rawPoints = [{ x, y, t: timestamp, isCritical: true }];
+    this.polygonPoints = [{ x, y, isCritical: true }];
+    this.lastSampleTime = timestamp;
+    this.smoothedSpeed = 0;
+  }
+
+  addPoint(x, y, timestamp = Date.now()) {
+    if (!this.active) return;
+    const len = this.rawPoints.length;
+    const last = this.rawPoints[len - 1];
+    if (!last) return;
+
+    const dx = x - last.x;
+    const dy = y - last.y;
+    const dist = Math.hypot(dx, dy);
+
+    // Compute stroke velocity (px/ms)
+    const dt = Math.max(1, timestamp - (last.t || this.lastSampleTime || timestamp));
+    this.lastSampleTime = timestamp;
+    const instSpeed = dist / dt;
+    this.smoothedSpeed = this.smoothedSpeed * 0.75 + instSpeed * 0.25;
+    const normSpeed = Math.min(1.0, this.smoothedSpeed / 2.5);
+
+    // Minimum distance threshold with optional velocity modulation
+    let minDist = 2.5;
+    if (this.velocityEnabled && this.velocityAmount > 0) {
+      // Fast speed = larger step (fewer points), slow speed = smaller step (more points)
+      minDist = 2.5 * (1 + (this.velocityAmount / 100) * normSpeed * 3.5);
+    }
+
+    if (dist < minDist) return;
+
+    const newPoint = { x, y, t: timestamp, isCritical: false };
+    this.rawPoints.push(newPoint);
+
+    // Sharp turn detection on last 3 samples
+    const updatedLen = this.rawPoints.length;
+    if (updatedLen >= 3) {
+      const pPrev = this.rawPoints[updatedLen - 3];
+      const pMid = this.rawPoints[updatedLen - 2];
+      const pCur = newPoint;
+
+      const v1x = pMid.x - pPrev.x;
+      const v1y = pMid.y - pPrev.y;
+      const v2x = pCur.x - pMid.x;
+      const v2y = pCur.y - pMid.y;
+      const m1 = Math.hypot(v1x, v1y);
+      const m2 = Math.hypot(v2x, v2y);
+
+      if (m1 > 1.5 && m2 > 1.5) {
+        const dot = v1x * v2x + v1y * v2y;
+        const cosAngle = Math.max(-1, Math.min(1, dot / (m1 * m2)));
+        const turnAngleDeg = Math.acos(cosAngle) * (180 / Math.PI);
+
+        if (turnAngleDeg >= this.sharpTurnAngle) {
+          pMid.isCritical = true; // Mark as non-negotiable anchor point
+        }
+      }
+    }
+
+    this.updatePolygon();
+  }
+
+  updatePolygon() {
+    if (this.rawPoints.length <= 2) {
+      this.polygonPoints = [...this.rawPoints];
+      return;
+    }
+
+    // Map polyCount (1..100) to Douglas-Peucker epsilon (e.g. 24px down to 0.5px)
+    // 1 = Very Low (large epsilon, highly simplified), 100 = Very High (fine epsilon)
+    const normalizedCount = Math.max(1, Math.min(100, this.polyCount));
+    let epsilon = 24 * Math.pow(1 - (normalizedCount - 1) / 99, 1.8) + 0.45;
+
+    // Apply velocity influence to epsilon if enabled
+    if (this.velocityEnabled && this.velocityAmount > 0) {
+      const normSpeed = Math.min(1.0, this.smoothedSpeed / 2.5);
+      epsilon *= (1 + (this.velocityAmount / 100) * normSpeed * 1.5);
+    }
+
+    this.polygonPoints = simplifyWithAnchors(this.rawPoints, epsilon);
+  }
+
+  get points() {
+    return this.polygonPoints;
   }
 
   /**
-   * Draws a live hint while dragging lasso loop
+   * Optimized live overlay rendering:
+   * Displays the preview on the ephemeral canvas overlay without touching layer bitmaps.
    */
-  drawLive(ctx, colorHex) {
-    if (!this.active || this.points.length < 2) return;
+  renderOverlay(ctx, colorHex, opacity = 1.0) {
+    if (!this.active || this.polygonPoints.length < 2) return;
+    const pts = this.polygonPoints;
+
     ctx.save();
 
-    // 1. Fill translucent hint
+    // 1. Live Polygon Fill Preview
     ctx.beginPath();
-    ctx.moveTo(this.points[0].x, this.points[0].y);
-    for (let i = 1; i < this.points.length; i++) {
-      ctx.lineTo(this.points[i].x, this.points[i].y);
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) {
+      ctx.lineTo(pts[i].x, pts[i].y);
     }
     ctx.closePath();
 
-    if (this.mode === 'erase') {
-      ctx.fillStyle = 'rgba(239, 68, 68, 0.25)'; // Reddish erase preview
-      ctx.fill();
-      ctx.strokeStyle = '#ef4444';
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([5, 5]);
-      ctx.stroke();
+    if (this.fillMode === 'pattern') {
+      const patCanvas = createPatternTileCanvas(this.pattern, colorHex, 0.4);
+      if (patCanvas) {
+        const pat = ctx.createPattern(patCanvas, 'repeat');
+        if (pat) {
+          if (this.pattern.angle && typeof DOMMatrix !== 'undefined') {
+            try {
+              pat.setTransform(new DOMMatrix().rotate(this.pattern.angle));
+            } catch (_) {}
+          }
+          ctx.fillStyle = pat;
+          ctx.fill();
+        }
+      }
     } else {
-      ctx.fillStyle = colorHex.startsWith('#') ? (colorHex + '33') : 'rgba(139, 92, 246, 0.25)';
+      // Translucent tint
+      ctx.fillStyle = colorHex.startsWith('#')
+        ? (colorHex + '33')
+        : 'rgba(99, 102, 241, 0.22)';
       ctx.fill();
+    }
 
-      // Contrasting dashed outline
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([6, 4]);
-      ctx.stroke();
+    // 2. High-contrast dual dashed boundary
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.6;
+    ctx.setLineDash([5, 4]);
+    ctx.stroke();
 
-      ctx.strokeStyle = colorHex;
-      ctx.lineWidth = 1.0;
-      ctx.setLineDash([4, 6]);
-      ctx.lineDashOffset = 3;
-      ctx.stroke();
+    ctx.strokeStyle = colorHex;
+    ctx.lineWidth = 1.0;
+    ctx.setLineDash([3, 6]);
+    ctx.lineDashOffset = 3;
+    ctx.stroke();
+
+    // 3. Draw vertex points along polygon (highlighting sharp turns)
+    ctx.setLineDash([]);
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      ctx.beginPath();
+      if (p.isCritical) {
+        // Distinct anchor marker for sharp turns
+        ctx.fillStyle = '#ffffff';
+        ctx.strokeStyle = colorHex;
+        ctx.lineWidth = 1.5;
+        ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      } else {
+        // Standard polygon vertex dot
+        ctx.fillStyle = colorHex;
+        ctx.arc(p.x, p.y, 2.0, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
 
     ctx.restore();
   }
 
-  finish(layer, colorHex, isEraser = false) {
-    if (!this.active || this.points.length < 3) {
-      this.active = false;
-      this.points = [];
+  /**
+   * Commits the closed polygon fill to the target layer.
+   * Respects alphaLock, layer locks, opacity and current color/pattern.
+   */
+  finish(layer, colorHex, opacity = 1.0, selectionTool = null) {
+    if (!this.active || this.polygonPoints.length < 3) {
+      this.cancel();
       return null;
     }
 
+    if (!layer || layer.locked) {
+      this.cancel();
+      return null;
+    }
+
+    const pts = this.polygonPoints;
     const ctx = layer.ctx;
     ctx.save();
-    if (isEraser || this.mode === 'erase') {
-      ctx.globalCompositeOperation = 'destination-out';
-      ctx.fillStyle = '#000000';
-    } else {
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.fillStyle = colorHex;
+
+    // Respect Layer Alpha Lock (source-atop restricts painting to existing pixels)
+    ctx.globalCompositeOperation = layer.alphaLock ? 'source-atop' : 'source-over';
+    ctx.globalAlpha = Math.max(0.01, Math.min(1.0, opacity));
+
+    // Optional clipping to active Selection Tool marquee
+    if (selectionTool && selectionTool.hasSelection && selectionTool.box) {
+      const b = selectionTool.box;
+      ctx.beginPath();
+      ctx.rect(b.x, b.y, b.w, b.h);
+      ctx.clip();
     }
 
+    // Clip to closed lasso polygon
     ctx.beginPath();
-    ctx.moveTo(this.points[0].x, this.points[0].y);
-    for (let i = 1; i < this.points.length; i++) {
-      ctx.lineTo(this.points[i].x, this.points[i].y);
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) {
+      ctx.lineTo(pts[i].x, pts[i].y);
     }
     ctx.closePath();
-    ctx.fill();
-    ctx.restore();
 
+    if (this.fillMode === 'pattern') {
+      ctx.clip();
+
+      const patCanvas = createPatternTileCanvas(this.pattern, colorHex, opacity);
+      if (patCanvas) {
+        const pat = ctx.createPattern(patCanvas, 'repeat');
+        if (pat) {
+          if (this.pattern.angle && typeof DOMMatrix !== 'undefined') {
+            try {
+              pat.setTransform(new DOMMatrix().rotate(this.pattern.angle));
+            } catch (_) {}
+          }
+          ctx.fillStyle = pat;
+
+          // Fill the polygon bounds
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          for (const p of pts) {
+            if (p.x < minX) minX = p.x;
+            if (p.x > maxX) maxX = p.x;
+            if (p.y < minY) minY = p.y;
+            if (p.y > maxY) maxY = p.y;
+          }
+          const pad = 40;
+          ctx.fillRect(minX - pad, minY - pad, (maxX - minX) + pad * 2, (maxY - minY) + pad * 2);
+        }
+      }
+    } else {
+      // Solid Color Fill
+      ctx.fillStyle = colorHex;
+      ctx.fill();
+    }
+
+    ctx.restore();
     layer.updateThumbnail();
 
-    const shape = {
+    const shapeRecord = {
       type: 'lasso-fill',
-      points: [...this.points],
+      points: pts.map(p => ({ x: p.x, y: p.y, isCritical: !!p.isCritical })),
       color: colorHex,
-      mode: isEraser ? 'erase' : this.mode
+      opacity: opacity,
+      fillMode: this.fillMode,
+      pattern: this.fillMode === 'pattern' ? { ...this.pattern } : null
     };
-    layer.addStroke(shape);
 
-    this.active = false;
-    this.points = [];
-    return shape;
+    if (layer.addStroke) {
+      layer.addStroke(shapeRecord);
+    }
+
+    this.cancel();
+    return shapeRecord;
   }
 
   cancel() {
     this.active = false;
-    this.points = [];
-  }
-
-  renderOverlay(ctx, colorHex = '#8b5cf6') {
-    this.drawLive(ctx, colorHex);
+    this.rawPoints = [];
+    this.polygonPoints = [];
+    this.smoothedSpeed = 0;
   }
 }
 
@@ -5274,6 +3424,8 @@ class LassoFill {
  * High-performance rectangular box selection with animated marching ants overlay,
  * pixel extraction, clearing, and transform integration.
  */
+
+
 class SelectionTool {
   constructor(docWidth = 1080, docHeight = 1080) {
     this.docWidth = docWidth;
@@ -5349,11 +3501,32 @@ class SelectionTool {
     this.box = null;
     this.hasSelection = false;
     this.active = false;
+    this.isInverse = false;
   }
 
   selectAll() {
     this.box = { x: 0, y: 0, w: this.docWidth, h: this.docHeight };
     this.hasSelection = true;
+    this.isInverse = false;
+  }
+
+  invert(docWidth = this.docWidth, docHeight = this.docHeight) {
+    this.docWidth = docWidth || this.docWidth;
+    this.docHeight = docHeight || this.docHeight;
+
+    if (!this.hasSelection || !this.box) {
+      this.selectAll();
+      return;
+    }
+
+    if (this.box.x === 0 && this.box.y === 0 && this.box.w >= this.docWidth && this.box.h >= this.docHeight) {
+      if (!this.isInverse) {
+        this.clear();
+        return;
+      }
+    }
+
+    this.isInverse = !this.isInverse;
   }
 
   getBounds() {
@@ -5372,12 +3545,13 @@ class SelectionTool {
 
   containsPoint(x, y) {
     const b = this.getBounds();
-    if (!b) return false;
-    return x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h;
+    if (!b) return true;
+    const inside = x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h;
+    return this.isInverse ? !inside : inside;
   }
 
   /**
-   * Cuts the raster pixels inside the box selection from the given layer.
+   * Cuts the raster pixels inside the selection from the given layer.
    * Returns a detached canvas containing the extracted content.
    */
   cutSelectedPixels(layer) {
@@ -5409,13 +3583,44 @@ class SelectionTool {
   }
 
   /**
-   * Clears the raster content inside the selection box on the layer.
+   * Clears the raster content inside the selection area on the layer.
+   * Creates ONE undoable command (single undo step) if history is provided.
    */
-  clearSelectedArea(layer) {
+  clearSelectedArea(layer, history = null, onRedraw = null) {
     if (!this.hasSelection || !this.box || !layer) return;
     const { x, y, w, h } = this.box;
-    layer.ctx.clearRect(x, y, w, h);
+
+    const bbox = this.isInverse
+      ? { x: 0, y: 0, width: this.docWidth, height: this.docHeight }
+      : { x, y, width: w, height: h };
+
+    let beforeSnapshot = null;
+    if (history && typeof cropBoundingBox === 'function') {
+      beforeSnapshot = cropBoundingBox(layer.canvas, bbox);
+    }
+
+    layer.ctx.save();
+    if (!this.isInverse) {
+      layer.ctx.clearRect(x, y, w, h);
+    } else {
+      // Clear 4 boundary rects outside the box
+      if (y > 0) layer.ctx.clearRect(0, 0, this.docWidth, y);
+      const btmY = y + h;
+      if (btmY < this.docHeight) layer.ctx.clearRect(0, btmY, this.docWidth, this.docHeight - btmY);
+      if (x > 0) layer.ctx.clearRect(0, y, x, h);
+      const rgtX = x + w;
+      if (rgtX < this.docWidth) layer.ctx.clearRect(rgtX, y, this.docWidth - rgtX, h);
+    }
+    layer.ctx.restore();
     layer.updateThumbnail();
+
+    if (history && beforeSnapshot && typeof RasterCommand === 'function') {
+      const afterSnapshot = cropBoundingBox(layer.canvas, bbox);
+      const cmd = new RasterCommand('Clear Selection', layer, beforeSnapshot, afterSnapshot, onRedraw, bbox);
+      history.push(cmd);
+    }
+
+    onRedraw?.(layer);
   }
 
   /**
@@ -5431,15 +3636,22 @@ class SelectionTool {
     const lw = Math.max(1, 1.5 / zoom);
     targetCtx.lineWidth = lw;
 
-    // Outer dark stroke
-    targetCtx.strokeStyle = '#1B1B1D';
-    targetCtx.strokeRect(bounds.x, bounds.y, bounds.w, bounds.h);
+    const drawAntsRect = (rx, ry, rw, rh) => {
+      targetCtx.strokeStyle = '#1B1B1D';
+      targetCtx.setLineDash([]);
+      targetCtx.strokeRect(rx, ry, rw, rh);
 
-    // Inner marching ants stroke
-    targetCtx.strokeStyle = '#FFFFFF';
-    targetCtx.setLineDash([5 / zoom, 5 / zoom]);
-    targetCtx.lineDashOffset = -this.dashOffset / zoom;
-    targetCtx.strokeRect(bounds.x, bounds.y, bounds.w, bounds.h);
+      targetCtx.strokeStyle = '#FFFFFF';
+      targetCtx.setLineDash([5 / zoom, 5 / zoom]);
+      targetCtx.lineDashOffset = -this.dashOffset / zoom;
+      targetCtx.strokeRect(rx, ry, rw, rh);
+    };
+
+    if (this.isInverse) {
+      drawAntsRect(0, 0, this.docWidth, this.docHeight);
+    }
+
+    drawAntsRect(bounds.x, bounds.y, bounds.w, bounds.h);
 
     // Corner grip handles
     targetCtx.fillStyle = '#3B6EDC';
@@ -6709,7 +4921,7 @@ class SymmetryManager {
 
   hitTest(wx, wy, zoom = 1.0) {
     if (this.mode === 'off' || this.locked) return false;
-    const hitRadius = 28 / Math.max(0.1, zoom);
+    const hitRadius = Math.max(26, 26 / Math.max(0.1, zoom));
     const dist = Math.hypot(wx - this.centerX, wy - this.centerY);
     return dist <= hitRadius;
   }
@@ -6959,6 +5171,27 @@ class VectorCanvas {
     this.toolManager = new ToolManager(docWidth, docHeight);
     this.history = null; // Injected from app
 
+    // Soft stamp sprite cache to avoid radial gradient recreation on every stamp
+    this.softStampCache = new Map();
+
+    // Separate eraser state (remembered independently from pen)
+    this.currentEraser = {
+      type: 'hard',
+      size: 28,
+      minSize: 1,
+      maxSize: 500,
+      opacity: 1.0,
+      hardness: 1.0,
+      spacing: 0.05,
+      tipShape: 'round'
+    };
+    try {
+      const savedEraser = localStorage.getItem('vectura_eraser_state');
+      if (savedEraser) {
+        Object.assign(this.currentEraser, JSON.parse(savedEraser));
+      }
+    } catch (_) {}
+
     // Live stroke buffer canvas (uncommitted drawing)
     this.liveCanvas = document.createElement('canvas');
     this.liveCanvas.width = docWidth;
@@ -6979,6 +5212,8 @@ class VectorCanvas {
     this.currentBrush = null;
     this.currentColor = '#8b5cf6';
     this.beforeStrokeCanvas = null;
+    this.lastRenderedSampleIndex = 0;
+    this.lastStampRadius = null;
 
     // Active fill animations list (non-blocking)
     this.activeFillAnimations = [];
@@ -7033,6 +5268,55 @@ class VectorCanvas {
   render() {
     this.needsRender = true;
     this.layerManager?.invalidateCaches();
+  }
+
+  saveEraserState() {
+    try {
+      localStorage.setItem('vectura_eraser_state', JSON.stringify(this.currentEraser));
+    } catch (_) {}
+  }
+
+  /**
+   * Caches circular soft stamp sprites to eliminate per-stamp radial gradient creation overhead
+   */
+  getSoftStampSprite(color, radius, hardness = 0.8, wetEdge = 0) {
+    const r = Math.max(1, Math.round(radius));
+    const h = Math.round((hardness ?? 0.8) * 100) / 100;
+    const we = Math.round((wetEdge ?? 0) * 100) / 100;
+    const key = `${color}_${r}_${h}_${we}`;
+    let sprite = this.softStampCache.get(key);
+    if (sprite) return { canvas: sprite, radius: r };
+
+    const pad = 2;
+    const size = r * 2 + pad * 2;
+    sprite = document.createElement('canvas');
+    sprite.width = size;
+    sprite.height = size;
+    const sCtx = sprite.getContext('2d');
+    const cx = size / 2;
+    const cy = size / 2;
+
+    const grad = sCtx.createRadialGradient(cx, cy, Math.max(0.01, r * Math.max(0.05, h)), cx, cy, r);
+    grad.addColorStop(0, color);
+    if (we > 0.05) {
+      const rim = Math.max(0.65, Math.min(0.95, 1 - (1 - h) * 0.3));
+      grad.addColorStop(rim, color);
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+    } else {
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+    }
+
+    sCtx.fillStyle = grad;
+    sCtx.beginPath();
+    sCtx.arc(cx, cy, r, 0, Math.PI * 2);
+    sCtx.fill();
+
+    if (this.softStampCache.size > 256) {
+      const firstKey = this.softStampCache.keys().next().value;
+      this.softStampCache.delete(firstKey);
+    }
+    this.softStampCache.set(key, sprite);
+    return { canvas: sprite, radius: r };
   }
 
   setDocumentSize(w, h) {
@@ -7220,12 +5504,17 @@ class VectorCanvas {
     // 4. Left click (0) on workspace outside artwork bounds
     const isPanTool = this.toolManager.activeTool === 'pan';
     const isOutsideDoc = world.x < 0 || world.x > this.docWidth || world.y < 0 || world.y > this.docHeight;
-    const isMousePan = (e.pointerType === 'mouse' && (e.button === 1 || e.button === 2 || this.isSpaceDown || e.altKey || isPanTool || (e.button === 0 && isOutsideDoc))) || (isPanTool && e.button === 0);
+    const shouldPan = isPanTool || (e.pointerType === 'mouse' && (e.button === 1 || e.button === 2 || this.isSpaceDown || e.altKey || (e.button === 0 && isOutsideDoc)));
 
-    if (isMousePan) {
+    if (shouldPan) {
+      this.isPanning = true;
       this.isMousePanning = true;
+      this.lastPanPos = { x: pos.x, y: pos.y };
       this.lastMousePanPos = { x: pos.x, y: pos.y };
       this.viewportCanvas.style.cursor = 'grabbing';
+      try {
+        this.viewportCanvas.setPointerCapture(e.pointerId);
+      } catch (_) {}
       return;
     }
 
@@ -7248,6 +5537,9 @@ class VectorCanvas {
       if (this.toolManager.symmetry.mode !== 'off' && !this.toolManager.symmetry.locked) {
         if (this.toolManager.symmetry.hitTest(world.x, world.y, this.viewport.zoom)) {
           this.isDraggingSymmetry = true;
+          try {
+            this.viewportCanvas.setPointerCapture(e.pointerId);
+          } catch (_) {}
           this.cancelLongPress();
           this.onHaptic?.();
           return;
@@ -7276,7 +5568,7 @@ class VectorCanvas {
         });
         return;
       } else if (this.toolManager.activeTool === 'lasso-fill') {
-        this.toolManager.lassoFill.start(world.x, world.y);
+        this.toolManager.lassoFill.start(world.x, world.y, e.timeStamp || Date.now());
         return;
       } else if (this.toolManager.activeTool === 'selection') {
         this.toolManager.selectionTool.start(world.x, world.y);
@@ -7363,6 +5655,7 @@ class VectorCanvas {
       // 2 or more fingers: Cancel any active stroke/tool & initialize Pinch / Pan / Rotate
       this.cancelAllActiveTools();
       this.isNavigating = true;
+      this.navigationGestureOccurred = true;
 
       const pts = Array.from(this.activePointers.values());
       const p1 = pts[0], p2 = pts[1];
@@ -7373,7 +5666,6 @@ class VectorCanvas {
       this.initialPinchDist = this.lastPinchDist;
       this.initialPinchAngle = this.lastPinchAngle;
       this.initialPinchCenter = { ...this.lastPinchCenter };
-      this.navigationGestureOccurred = false;
     }
   }
 
@@ -7381,13 +5673,18 @@ class VectorCanvas {
     e.preventDefault();
     const pos = this.getPointerPos(e);
 
-    // Mouse Pan Navigation
-    if (this.isMousePanning) {
-      const dx = pos.x - this.lastMousePanPos.x;
-      const dy = pos.y - this.lastMousePanPos.y;
-      this.viewport.panBy(dx, dy);
-      this.viewport.onNavigate?.(this.viewport.zoom, this.viewport.rotation);
-      this.lastMousePanPos = { x: pos.x, y: pos.y };
+    // Pan Navigation (single-touch Pan tool, mouse pan, spacebar pan)
+    if (this.isPanning || this.isMousePanning) {
+      const last = this.lastPanPos || this.lastMousePanPos;
+      if (last) {
+        const dx = pos.x - last.x;
+        const dy = pos.y - last.y;
+        this.viewport.panBy(dx, dy);
+        this.viewport.onNavigate?.(this.viewport.zoom, this.viewport.rotation);
+        this.lastPanPos = { x: pos.x, y: pos.y };
+        this.lastMousePanPos = { x: pos.x, y: pos.y };
+        this.needsRender = true;
+      }
       return;
     }
 
@@ -7404,6 +5701,46 @@ class VectorCanvas {
 
     this.activePointers.set(e.pointerId, { x: pos.x, y: pos.y, time: performance.now() });
 
+    // Multi-finger pinch / pan / rotate navigation
+    if (this.activePointers.size >= 2) {
+      this.cancelAllActiveTools();
+      this.isNavigating = true;
+      this.navigationGestureOccurred = true;
+
+      const pts = Array.from(this.activePointers.values());
+      const p1 = pts[0], p2 = pts[1];
+      const curDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const curAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+      const curCenter = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+
+      if (this.lastPinchCenter && this.lastPinchDist > 0) {
+        // Pan
+        const dx = curCenter.x - this.lastPinchCenter.x;
+        const dy = curCenter.y - this.lastPinchCenter.y;
+        this.viewport.panBy(dx, dy);
+
+        // Zoom
+        const factor = curDist / this.lastPinchDist;
+        if (factor > 0.01 && factor < 100) {
+          this.viewport.zoomAt(factor, curCenter.x, curCenter.y);
+        }
+
+        // Rotate
+        let deltaAngle = curAngle - this.lastPinchAngle;
+        while (deltaAngle > Math.PI) deltaAngle -= 2 * Math.PI;
+        while (deltaAngle < -Math.PI) deltaAngle += 2 * Math.PI;
+        this.viewport.rotateAt(deltaAngle, curCenter.x, curCenter.y);
+
+        this.viewport.onNavigate?.(this.viewport.zoom, this.viewport.rotation);
+        this.needsRender = true;
+      }
+
+      this.lastPinchDist = curDist;
+      this.lastPinchAngle = curAngle;
+      this.lastPinchCenter = curCenter;
+      return;
+    }
+
     // Handle Eyedropper sampling if active
     if (this.toolManager.eyedropper.active) {
       const world = this.viewport.screenToWorld(pos.x, pos.y);
@@ -7414,7 +5751,7 @@ class VectorCanvas {
     }
 
     // If navigating or multi-touch is active, don't execute any single-pointer tool
-    if (this.isNavigating || this.activePointers.size >= 2 || performance.now() - (this.lastNavigationTime || 0) < 250) {
+    if (this.isNavigating || performance.now() - (this.lastNavigationTime || 0) < 250) {
       this.cancelAllActiveTools();
       return;
     }
@@ -7443,7 +5780,7 @@ class VectorCanvas {
       this.needsRender = true;
       return;
     } else if (this.toolManager.activeTool === 'lasso-fill' && this.toolManager.lassoFill.active) {
-      this.toolManager.lassoFill.addPoint(world.x, world.y);
+      this.toolManager.lassoFill.addPoint(world.x, world.y, e.timeStamp || Date.now());
       this.needsRender = true;
       return;
     } else if (this.toolManager.activeTool === 'shape' && this.toolManager.shapeTool.active) {
@@ -7484,8 +5821,11 @@ class VectorCanvas {
     this.cancelLongPress();
     if (this.shapeHoldTimer) clearTimeout(this.shapeHoldTimer);
 
-    if (this.isMousePanning) {
+    if (this.isPanning || this.isMousePanning) {
+      this.isPanning = false;
       this.isMousePanning = false;
+      this.lastPanPos = null;
+      this.lastMousePanPos = null;
       const isPan = this.toolManager.activeTool === 'pan' || this.toolManager.activeTool === 'transform';
       this.viewportCanvas.style.cursor = isPan ? 'grab' : (this.isSpaceDown ? 'grab' : 'crosshair');
       return;
@@ -7496,6 +5836,13 @@ class VectorCanvas {
     const maxPointers = this.multiTouchTap.maxPointers;
 
     this.activePointers.delete(e.pointerId);
+    if (this.activePointers.size < 2) {
+      this.touchPinchDist = 0;
+      this.touchPinchCenter = null;
+      this.lastPinchDist = 0;
+      this.lastPinchCenter = null;
+      this.lastNavigationTime = performance.now();
+    }
 
     if (this.isDraggingSymmetry) {
       this.isDraggingSymmetry = false;
@@ -7587,7 +5934,7 @@ class VectorCanvas {
             height: Math.min(this.docHeight, Math.ceil(maxY - minY + 8))
           } : null;
           const beforeSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
-          this.toolManager.lassoFill.finish(activeLayer, this.currentColor, false);
+          this.toolManager.lassoFill.finish(activeLayer, this.currentColor, this.currentBrush?.opacity ?? 1.0, this.toolManager.selectionTool);
           const afterSnapshot = cropBoundingBox(activeLayer.canvas, bbox);
           this.layerManager.invalidateCaches();
           if (this.history) {
@@ -7649,12 +5996,18 @@ class VectorCanvas {
   onPointerCancel(e) {
     this.cancelLongPress();
     if (this.shapeHoldTimer) clearTimeout(this.shapeHoldTimer);
-    if (this.isMousePanning) {
+    if (this.isPanning || this.isMousePanning) {
+      this.isPanning = false;
       this.isMousePanning = false;
+      this.lastPanPos = null;
+      this.lastMousePanPos = null;
+      const isPan = this.toolManager.activeTool === 'pan' || this.toolManager.activeTool === 'transform';
       this.viewportCanvas.style.cursor = this.isSpaceDown ? 'grab' : 'crosshair';
     }
     this.activePointers.delete(e.pointerId);
     this.cancelStroke();
+    this.lastPinchDist = 0;
+    this.lastPinchCenter = null;
     this.lastNavigationTime = performance.now();
     if (this.activePointers.size === 0) {
       this.isNavigating = false;
@@ -7711,6 +6064,7 @@ class VectorCanvas {
     this.activePointerId = e.pointerId;
     this.shapeHoldDetected = false;
     this.lastStampRadius = null;
+    this.lastRenderedSampleIndex = 0;
 
     // Snapshot layer canvas before stroke for deterministic raster undo
     this.beforeStrokeCanvas = cloneCanvas(activeLayer.canvas);
@@ -7733,13 +6087,35 @@ class VectorCanvas {
     const isEraser = this.toolManager.activeTool === 'eraser' || (this.currentBrush && this.currentBrush.isEraser);
     const strokeSeed = Math.floor(Math.random() * 0xffffff);
 
-    const brushSnapshot = (this.currentBrush && typeof this.currentBrush.createSnapshot === 'function')
-      ? this.currentBrush.createSnapshot()
-      : (this.currentBrush ? JSON.parse(JSON.stringify(this.currentBrush)) : {});
+    // Eraser uses its own dedicated state and does NOT inherit pen min/max limits
+    let brushSnapshot;
+    if (isEraser) {
+      brushSnapshot = {
+        id: 'eraser_' + (this.currentEraser.type || 'hard'),
+        name: 'Eraser',
+        size: Math.max(1, Math.min(500, this.currentEraser.size || 28)),
+        opacity: Math.max(0.01, Math.min(1.0, this.currentEraser.opacity ?? 1.0)),
+        hardness: this.currentEraser.hardness ?? 1.0,
+        spacing: this.currentEraser.spacing ?? 0.05,
+        tipShape: this.currentEraser.tipShape || 'round',
+        minSize: 1,
+        maxSize: 500,
+        dynamics: {
+          pressure: { size: 100, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+          velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+          jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+          noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
+        }
+      };
+    } else {
+      brushSnapshot = (this.currentBrush && typeof this.currentBrush.createSnapshot === 'function')
+        ? this.currentBrush.createSnapshot()
+        : (this.currentBrush ? JSON.parse(JSON.stringify(this.currentBrush)) : {});
+    }
 
     this.currentStroke = {
       id: 'stroke_' + Date.now() + '_' + Math.floor(Math.random() * 10000),
-      brushId: this.currentBrush?.id || 'pencil',
+      brushId: isEraser ? 'eraser' : (this.currentBrush?.id || 'pencil'),
       brushSnapshot: brushSnapshot,
       color: isEraser ? '#000000' : this.currentColor,
       isEraser: isEraser,
@@ -7748,11 +6124,14 @@ class VectorCanvas {
     };
 
     if (isEraser) {
-      this.renderStrokeToLayer(activeLayer, this.currentStroke);
+      this.renderIncrementalStroke(activeLayer.ctx, this.currentStroke);
+      activeLayer.updateThumbnail();
       this.layerManager.invalidateCaches();
+      this.needsRender = true;
     } else {
       this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
-      this.renderLiveStroke();
+      this.renderIncrementalStroke(this.liveCtx, this.currentStroke);
+      this.needsRender = true;
     }
   }
 
@@ -7763,13 +6142,11 @@ class VectorCanvas {
     const rawWorld = this.viewport.screenToWorld(pos.x, pos.y);
     const snapped = this.toolManager.rulerGuides.snapPoint(rawWorld.x, rawWorld.y);
 
-    // Stop emission when finger is still unless brush has build-up enabled
     const pts = this.currentStroke.points;
     if (pts.length > 0) {
       const lastPt = pts[pts.length - 1];
       const distFromLast = Math.hypot(snapped.x - lastPt.x, snapped.y - lastPt.y);
-      const isBuildUp = !!(this.currentBrush?.buildUp || this.currentBrush?.isAirbrushBuildUp);
-      if (distFromLast < 1.8 && !isBuildUp) {
+      if (distFromLast < 1.5) {
         return;
       }
     }
@@ -7786,14 +6163,17 @@ class VectorCanvas {
       this.currentStroke.points.push(stabilized);
       if (this.currentStroke.isEraser) {
         const activeLayer = this.layerManager.getActiveLayer();
-        if (activeLayer && !activeLayer.locked && this.beforeStrokeCanvas) {
-          activeLayer.ctx.clearRect(0, 0, activeLayer.width, activeLayer.height);
-          activeLayer.ctx.drawImage(this.beforeStrokeCanvas, 0, 0);
-          this.renderStrokeToLayer(activeLayer, this.currentStroke);
+        if (activeLayer && !activeLayer.locked) {
+          // Render incrementally directly onto active layer using destination-out
+          this.renderIncrementalStroke(activeLayer.ctx, this.currentStroke);
+          activeLayer.updateThumbnail();
           this.layerManager.invalidateCaches();
+          this.needsRender = true;
         }
       } else {
-        this.renderLiveStroke();
+        // Render incrementally directly into liveCtx
+        this.renderIncrementalStroke(this.liveCtx, this.currentStroke);
+        this.needsRender = true;
       }
     }
   }
@@ -7845,6 +6225,10 @@ class VectorCanvas {
       if (activeLayer && !activeLayer.locked) {
         if (!this.currentStroke.isEraser) {
           this.renderStrokeToLayer(activeLayer, this.currentStroke);
+        } else {
+          this.renderIncrementalStroke(activeLayer.ctx, this.currentStroke);
+          activeLayer.addStroke(this.currentStroke);
+          activeLayer.updateThumbnail();
         }
         const bbox = this.getStrokeBoundingBox(this.currentStroke, this.docWidth, this.docHeight);
         const beforeSnapshot = cropBoundingBox(this.beforeStrokeCanvas, bbox);
@@ -7871,7 +6255,9 @@ class VectorCanvas {
       this.currentStroke = null;
       this.beforeStrokeCanvas = null;
       this.lastStampRadius = null;
+      this.lastRenderedSampleIndex = 0;
       this.layerManager.invalidateCaches();
+      this.onStrokeFinished?.();
     }
   }
 
@@ -7890,8 +6276,10 @@ class VectorCanvas {
       this.currentStroke = null;
       this.beforeStrokeCanvas = null;
       this.lastStampRadius = null;
+      this.lastRenderedSampleIndex = 0;
       this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
       this.layerManager.invalidateCaches();
+      this.onStrokeFinished?.();
     }
     if (this.toolManager.lassoFill?.active) {
       this.toolManager.lassoFill.cancel();
@@ -7933,18 +6321,57 @@ class VectorCanvas {
   renderLiveStroke() {
     if (!this.currentStroke) return;
     this.liveCtx.clearRect(0, 0, this.docWidth, this.docHeight);
+    this.lastRenderedSampleIndex = 0;
+    this.lastStampRadius = null;
+    this.renderIncrementalStroke(this.liveCtx, this.currentStroke);
+  }
 
-    const pts = this.currentStroke.points;
+  renderIncrementalStroke(ctx, stroke) {
+    const pts = stroke.points;
+    if (!pts || pts.length === 0) return;
+
+    const b = stroke.brushSnapshot || {};
+    const baseSize = Math.max(1, Number.isFinite(b.size) ? b.size : 8);
+    const sp = b.spacingSettings || {};
+    const spacingRatio = Math.max(0.01, Math.min(2.0, sp.spacing ?? b.spacing ?? 0.08));
+    const stepPx = Math.max(sp.minSpacingPx || 0.8, baseSize * spacingRatio);
+
+    const dyn = b.dynamics || {
+      pressure: { size: 100, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
+    };
+
+    const calcStep = (pt) => {
+      const pNorm = Math.max(0, Math.min(1, pt?.pressure ?? 0.5));
+      const pFactor = (pNorm - 0.5) * 2;
+      const speed = Math.max(0, pt?.speed || 0);
+      const vFactor = Math.min(1.5, Math.max(-1.0, (speed - 0.6) / 0.8));
+      let spMod = 1.0;
+      if (dyn.pressure?.spacing) spMod += (dyn.pressure.spacing / 100) * pFactor;
+      if (dyn.velocity?.spacing) spMod += (dyn.velocity.spacing / 100) * vFactor;
+      return Math.max(0.5, stepPx * Math.max(0.1, spMod));
+    };
+
+    const allSamples = this.spline.sampleStroke(pts, calcStep);
+    if (!allSamples || allSamples.length === 0) return;
+
+    const startIdx = this.lastRenderedSampleIndex || 0;
+    if (startIdx >= allSamples.length) return;
+
     if (this.toolManager.symmetry.mode !== 'off' && pts.length > 0) {
       const symmInstances = this.toolManager.symmetry.radialAxes || 4;
       const count = this.toolManager.symmetry.mode === 'radial' ? symmInstances : 2;
       for (let s = 0; s < count; s++) {
-        const mirroredPts = pts.map(p => this.toolManager.symmetry.getSymmetricPoints(p)[s] || p);
-        this.renderStrokeToContext(this.liveCtx, { ...this.currentStroke, points: mirroredPts });
+        const mirroredSamples = allSamples.map(p => this.toolManager.symmetry.getSymmetricPoints(p)[s] || p);
+        this.renderSamplesToContext(ctx, stroke, mirroredSamples, startIdx, allSamples.length);
       }
     } else {
-      this.renderStrokeToContext(this.liveCtx, this.currentStroke);
+      this.renderSamplesToContext(ctx, stroke, allSamples, startIdx, allSamples.length);
     }
+
+    this.lastRenderedSampleIndex = allSamples.length;
   }
 
   renderStrokeToLayer(layer, stroke) {
@@ -7963,30 +6390,20 @@ class VectorCanvas {
     layer.updateThumbnail();
   }
 
-  /**
-   * Stamping and Ribbon Stroke Render Engine with Ink-Bleed Safeguards & Advanced Spacing/Jitter
-   */
   renderStrokeToContext(ctx, stroke) {
     const b = stroke.brushSnapshot || {};
     const pts = stroke.points;
     if (!pts || pts.length === 0) return;
 
-    ctx.save();
-
-    const activeLayer = this.layerManager.getActiveLayer();
-    if (stroke.isEraser) {
-      ctx.globalCompositeOperation = 'destination-out';
-    } else if (activeLayer && ctx === activeLayer.ctx && activeLayer.alphaLock) {
-      ctx.globalCompositeOperation = 'source-atop';
-    } else {
-      ctx.globalCompositeOperation = b.blendMode || 'source-over';
-    }
-
-    ctx.fillStyle = stroke.color;
-    ctx.strokeStyle = stroke.color;
-
     // Pixel Art Mode: 1px / integer grid
     if (this.pixelArtMode || b.isPixel || b.spacingSettings?.pixelArtMode) {
+      ctx.save();
+      if (stroke.isEraser) {
+        ctx.globalCompositeOperation = 'destination-out';
+      } else {
+        ctx.globalCompositeOperation = b.blendMode || 'source-over';
+      }
+      ctx.fillStyle = stroke.color;
       ctx.imageSmoothingEnabled = false;
       for (let i = 0; i < pts.length - 1; i++) {
         const pixels = bresenhamPixelPerfect(
@@ -8003,59 +6420,107 @@ class VectorCanvas {
       return;
     }
 
-    // Spacing calculation
     const baseSize = Math.max(1, Number.isFinite(b.size) ? b.size : 8);
     const sp = b.spacingSettings || {};
     const spacingRatio = Math.max(0.01, Math.min(2.0, sp.spacing ?? b.spacing ?? 0.08));
-    let stepPx = Math.max(sp.minSpacingPx || 0.8, baseSize * spacingRatio);
+    const stepPx = Math.max(sp.minSpacingPx || 0.8, baseSize * spacingRatio);
 
-    // Auto-spacing mode: keep strokes smooth at all sizes
-    if (sp.autoSpacing) {
-      stepPx = Math.max(1.0, Math.min(12.0, baseSize * 0.12));
+    const dyn = b.dynamics || {
+      pressure: { size: 100, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
+    };
+
+    const calcStep = (pt) => {
+      const pNorm = Math.max(0, Math.min(1, pt?.pressure ?? 0.5));
+      const pFactor = (pNorm - 0.5) * 2;
+      const speed = Math.max(0, pt?.speed || 0);
+      const vFactor = Math.min(1.5, Math.max(-1.0, (speed - 0.6) / 0.8));
+      let spMod = 1.0;
+      if (dyn.pressure?.spacing) spMod += (dyn.pressure.spacing / 100) * pFactor;
+      if (dyn.velocity?.spacing) spMod += (dyn.velocity.spacing / 100) * vFactor;
+      return Math.max(0.5, stepPx * Math.max(0.1, spMod));
+    };
+
+    const samples = this.spline.sampleStroke(pts, calcStep);
+    if (!samples || samples.length === 0) return;
+
+    this.renderSamplesToContext(ctx, stroke, samples, 0, samples.length);
+  }
+
+  /**
+   * Stamping and Ribbon Stroke Render Engine with Ink-Bleed Safeguards & Advanced Spacing/Jitter
+   */
+  renderSamplesToContext(ctx, stroke, samples, startIdx = 0, endIdx = samples.length) {
+    const b = stroke.brushSnapshot || {};
+    if (!samples || samples.length === 0 || startIdx >= endIdx) return;
+
+    ctx.save();
+
+    const activeLayer = this.layerManager.getActiveLayer();
+    if (stroke.isEraser) {
+      ctx.globalCompositeOperation = 'destination-out';
+    } else if (activeLayer && ctx === activeLayer.ctx && activeLayer.alphaLock) {
+      ctx.globalCompositeOperation = 'source-atop';
+    } else {
+      ctx.globalCompositeOperation = b.blendMode || 'source-over';
     }
 
-    const samples = this.spline.sampleStroke(pts, stepPx);
-    if (samples.length === 0) {
-      ctx.restore();
-      return;
+    ctx.fillStyle = stroke.color;
+    ctx.strokeStyle = stroke.color;
+
+    // Glow width
+    if (b.glowWidth && b.glowWidth > 0 && !stroke.isEraser) {
+      ctx.shadowBlur = b.glowWidth;
+      ctx.shadowColor = stroke.color;
     }
 
+    const baseSize = Math.max(1, Number.isFinite(b.size) ? b.size : 8);
     const baseOpacity = Math.max(0.01, Math.min(1.0, Number.isFinite(b.opacity) ? b.opacity : 1.0));
     const strokeSeed = stroke.seed || 1337;
-    const totalLength = samples[samples.length - 1].distance || 1;
-
-    // INK BLEED & SIZE SAFEGUARDS:
     const brushMinRadius = Math.max(0.25, (b.minSize || 1) / 2);
-    const brushMaxRadius = Math.max(brushMinRadius + 0.5, (b.maxSize || 200) / 2);
-    let lastRadius = null;
+    const brushMaxRadius = Math.max(brushMinRadius + 0.5, (b.maxSize || 500) / 2);
 
-    // Single-stroke opacity capping: when !buildUp, render into stroke buffer
-    // so repeated passes or lingering within the SAME stroke never exceed baseOpacity
-    const useStrokeBuffer = (!b.buildUp && baseOpacity < 0.98 && this.strokeCtx);
-    const targetCtx = useStrokeBuffer ? this.strokeCtx : ctx;
+    // Unified dynamics sources: Pressure, Velocity, Jitter, Noise
+    const dyn = b.dynamics || {
+      pressure: { size: 100, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+      noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
+    };
 
-    if (useStrokeBuffer) {
-      this.strokeCtx.clearRect(0, 0, this.docWidth, this.docHeight);
-      this.strokeCtx.save();
-      this.strokeCtx.fillStyle = stroke.color;
-      this.strokeCtx.strokeStyle = stroke.color;
-    }
+    const dP = dyn.pressure || {};
+    const dV = dyn.velocity || {};
+    const dJ = dyn.jitter || {};
+    const dN = dyn.noise || {};
 
-    // Factor Links Matrix from brush
-    const fl = b.factorLinks || {};
-    const vLinks = fl.velocity || {};
-    const jLinks = fl.jitter || {};
-    const nLinks = fl.noise || {};
+    const noiseScale = b.noiseScale || 0.02;
+    const noiseOctaves = b.noiseOctaves || 2;
+    const noiseSeed = (strokeSeed ^ (b.noiseSeed || 42)) & 0xffff;
 
-    // Render individual stamp segments
-    for (let i = 0; i < samples.length; i++) {
+    for (let i = startIdx; i < endIdx; i++) {
       const s = samples[i];
-      if (!Number.isFinite(s.x) || !Number.isFinite(s.y)) continue;
+      if (!s || !Number.isFinite(s.x) || !Number.isFinite(s.y)) continue;
 
-      let pressure = Number.isFinite(s.pressure) ? s.pressure : 0.5;
-      pressure = Math.max(0.01, Math.min(1.0, pressure));
+      const pNorm = Math.max(0, Math.min(1.0, Number.isFinite(s.pressure) ? s.pressure : 0.5));
+      const pFactor = (pNorm - 0.5) * 2.0; // -1 to +1
 
-      let radius = (baseSize * pressure) / 2;
+      const speed = Math.max(0, s.speed || 0);
+      const vFactor = Math.min(1.5, Math.max(-1.0, (speed - 0.6) / 0.8)); // real px/ms speed response
+
+      const jVal = ((Math.abs(Math.sin(strokeSeed * 17 + i * 9301 + 49297)) * 233280) % 1.0) * 2 - 1; // -1 to +1
+
+      const nVal = CoherentNoise.noise2D(s.x * noiseScale, s.y * noiseScale, noiseSeed, noiseOctaves); // -1 to +1
+
+      // Size calculation
+      let sizeMod = 1.0;
+      if (dP.size) sizeMod += (dP.size / 100) * pFactor;
+      if (dV.size) sizeMod += (dV.size / 100) * vFactor;
+      if (dJ.size) sizeMod += (dJ.size / 100) * jVal;
+      if (dN.size) sizeMod += (dN.size / 100) * nVal;
+
+      let radius = (baseSize / 2) * Math.max(0.02, sizeMod);
 
       // Taper at start and end
       if (b.taperStart > 0 && i < b.taperStart) {
@@ -8065,123 +6530,98 @@ class VectorCanvas {
         radius *= Math.max(0.05, (samples.length - i) / b.taperEnd);
       }
 
-      // 1. Evaluate Factors: velocity, jitter, noise (smoothed limits)
-      const vFactor = Math.min(1.5, Math.max(-1.0, (pressure - 0.5) * 2.0));
-      const jFactor = ((Math.sin(strokeSeed + i * 1337.7) * 43758.5453) % 1.0);
-      const rawNoise = CoherentNoise.computeNoiseSample(b.jitter || { enabled: true }, strokeSeed, s.distance, s.time || 0);
-      const nFactor = Math.max(-1.0, Math.min(1.0, rawNoise * 0.2)); // Reduced 2D noise limit to prevent jitter explosion
+      // Light smoothing on radius (replaces 25% rate limiter so negative velocity factors work)
+      if (this.lastStampRadius !== null) {
+        radius = this.lastStampRadius * 0.2 + radius * 0.8;
+      }
+      // Final hard clamp
+      radius = Math.max(brushMinRadius, Math.min(brushMaxRadius, radius));
+      this.lastStampRadius = radius;
 
-      // 2. Modulate Children (Size, Rotation, Spacing, Opacity, Tip Rotation)
-      // Child: Size
-      let sizeMod = 1.0;
-      if (vLinks.size) sizeMod += (vLinks.size / 100) * vFactor;
-      if (jLinks.size) sizeMod += (jLinks.size / 100) * jFactor * 0.4;
-      if (nLinks.size) sizeMod += (nLinks.size / 100) * nFactor * 0.2;
-      radius = radius * Math.max(0.05, sizeMod);
+      // Opacity calculation
+      let alphaMod = 0.0;
+      if (dP.opacity) alphaMod += (dP.opacity / 100) * pFactor;
+      if (dV.opacity) alphaMod += (dV.opacity / 100) * vFactor;
+      if (dJ.opacity) alphaMod += (dJ.opacity / 100) * jVal;
+      if (dN.opacity) alphaMod += (dN.opacity / 100) * nVal;
 
-      // Child: Opacity
-      let stampAlpha = useStrokeBuffer ? (b.flow ?? 1.0) : (baseOpacity * (b.flow ?? 1.0));
-      let alphaMod = 0;
-      if (vLinks.opacity) alphaMod += (vLinks.opacity / 100) * vFactor;
-      if (jLinks.opacity) alphaMod += (jLinks.opacity / 100) * jFactor * 0.4;
-      if (nLinks.opacity) alphaMod += (nLinks.opacity / 100) * nFactor * 0.2;
-      stampAlpha = Math.max(0.01, Math.min(1.0, stampAlpha * (1.0 + alphaMod)));
+      let stampAlpha = Math.max(0.01, Math.min(1.0, baseOpacity * Math.max(0.0, 1.0 + alphaMod) * (b.flow ?? 1.0)));
 
-      // Child: Rotation & Tip Rotation
+      // Grain texture modulation
+      if (b.grain && b.grain > 0) {
+        const grainNoise = ((Math.abs(Math.sin(s.x * 12.9898 + s.y * 78.233 + strokeSeed)) * 43758.5453) % 1.0);
+        stampAlpha *= (1.0 - (b.grain * 0.5 * grainNoise));
+      }
+
+      // Rotation calculation
       let stampRotation = b.rotation || 0;
-      let rotMod = 0;
-      if (vLinks.rotation) rotMod += (vLinks.rotation / 100) * vFactor * Math.PI;
-      if (jLinks.rotation) rotMod += (jLinks.rotation / 100) * jFactor * Math.PI;
-      if (nLinks.rotation) rotMod += (nLinks.rotation / 100) * nFactor * 0.3 * Math.PI;
-      if (vLinks.tipRotation) rotMod += (vLinks.tipRotation / 100) * vFactor * Math.PI;
-      if (jLinks.tipRotation) rotMod += (jLinks.tipRotation / 100) * jFactor * Math.PI;
-      if (nLinks.tipRotation) rotMod += (nLinks.tipRotation / 100) * nFactor * 0.3 * Math.PI;
+      let rotMod = 0.0;
+      if (dP.rotation) rotMod += (dP.rotation / 100) * pFactor * Math.PI;
+      if (dV.rotation) rotMod += (dV.rotation / 100) * vFactor * Math.PI;
+      if (dJ.rotation) rotMod += (dJ.rotation / 100) * jVal * Math.PI;
+      if (dN.rotation) rotMod += (dN.rotation / 100) * nVal * Math.PI;
       stampRotation += rotMod;
 
+      // Scatter calculation
       let stampX = s.x;
       let stampY = s.y;
+      let scatterMod = b.scatter || 0;
+      if (dP.scatter) scatterMod += (dP.scatter / 100) * Math.abs(pFactor);
+      if (dV.scatter) scatterMod += (dV.scatter / 100) * Math.max(0, vFactor);
+      if (dJ.scatter) scatterMod += (dJ.scatter / 100) * Math.abs(jVal);
+      if (dN.scatter) scatterMod += (dN.scatter / 100) * Math.abs(nVal);
 
-      if (b.jitter && b.jitter.enabled) {
-        const jTargets = CoherentNoise.evaluateAllTargets(
-          b.jitter,
-          strokeSeed,
-          s.distance,
-          s.time,
-          s.speed || 0,
-          totalLength
-        );
-        radius = Math.max(0.25, radius * (1.0 + jTargets.sizeDelta));
-        stampX += jTargets.wobbleX;
-        stampY += jTargets.wobbleY;
-        stampRotation += jTargets.angleDelta;
-        stampAlpha = Math.max(0.01, Math.min(1.0, stampAlpha + jTargets.opacityDelta));
+      if (scatterMod > 0.01) {
+        const scatAngle = ((Math.sin(strokeSeed + i * 7919) * 10000) % 1) * Math.PI * 2;
+        const scatDist = Math.abs(((Math.sin(strokeSeed + i * 4999) * 10000) % 1)) * radius * scatterMod * 2.0;
+        stampX += Math.cos(scatAngle) * scatDist;
+        stampY += Math.sin(scatAngle) * scatDist;
       }
 
-      if (!Number.isFinite(radius)) radius = baseSize / 2;
+      ctx.globalAlpha = Math.max(0.01, Math.min(1.0, stampAlpha));
 
-      // RATE LIMITER: limit how much size can change between two consecutive stamps
-      if (lastRadius !== null) {
-        const maxDelta = Math.max(1.5, lastRadius * 0.25);
-        radius = Math.max(lastRadius - maxDelta, Math.min(lastRadius + maxDelta, radius));
+      ctx.save();
+      ctx.translate(stampX, stampY);
+      if (stampRotation !== 0) ctx.rotate(stampRotation);
+
+      const roundness = b.roundness !== undefined ? Math.max(0.1, b.roundness) : 1.0;
+      const aspect = b.aspectRatio ? Math.max(0.1, b.aspectRatio) : 1.0;
+      if (roundness !== 1.0 || aspect !== 1.0) {
+        ctx.scale(1.0, (1.0 / aspect) * roundness);
       }
 
-      // HARD CLAMP: strictly enforce brush.minSize and brush.maxSize bounds
-      radius = Math.max(brushMinRadius, Math.min(brushMaxRadius, radius));
-      lastRadius = radius;
-
-      targetCtx.globalAlpha = Math.max(0.01, Math.min(1.0, stampAlpha));
-
-      // Custom Stamp Shapes, Aspect Ratio, and Hardness
-      targetCtx.save();
-      targetCtx.translate(stampX, stampY);
-      if (stampRotation !== 0) targetCtx.rotate(stampRotation);
-      if (b.aspectRatio && b.aspectRatio !== 1.0) {
-        targetCtx.scale(1.0, 1.0 / Math.max(0.1, b.aspectRatio));
-      }
-
+      // Stamp shape rendering
       if (b.tipShape === 'square') {
-        targetCtx.fillRect(-radius, -radius, radius * 2, radius * 2);
+        ctx.fillRect(-radius, -radius, radius * 2, radius * 2);
       } else if (b.tipShape === 'chisel') {
-        targetCtx.fillRect(-radius * 1.8, -radius * 0.4, radius * 3.6, radius * 0.8);
+        ctx.fillRect(-radius * 1.8, -radius * 0.4, radius * 3.6, radius * 0.8);
       } else if (b.tipShape === 'star') {
-        targetCtx.beginPath();
+        ctx.beginPath();
         for (let sp = 0; sp < 10; sp++) {
           const a = (sp * Math.PI) / 5 - Math.PI / 2;
           const rad = sp % 2 === 0 ? radius : radius * 0.45;
           const px = Math.cos(a) * rad;
           const py = Math.sin(a) * rad;
-          if (sp === 0) targetCtx.moveTo(px, py);
-          else targetCtx.lineTo(px, py);
+          if (sp === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
         }
-        targetCtx.closePath();
-        targetCtx.fill();
+        ctx.closePath();
+        ctx.fill();
       } else if (b.tipShape === 'bristle') {
         for (let br = -2; br <= 2; br++) {
-          targetCtx.beginPath();
-          targetCtx.arc(br * (radius * 0.35), 0, Math.max(0.4, radius * 0.25), 0, Math.PI * 2);
-          targetCtx.fill();
+          ctx.beginPath();
+          ctx.arc(br * (radius * 0.35), 0, Math.max(0.4, radius * 0.25), 0, Math.PI * 2);
+          ctx.fill();
         }
-      } else if (b.tipShape === 'soft' || b.tipShape === 'gaussian' || (b.hardness !== undefined && b.hardness < 0.6)) {
-        const rad = Math.max(1, radius);
-        const grad = targetCtx.createRadialGradient(0, 0, rad * Math.max(0.05, b.hardness ?? 0.3), 0, 0, rad);
-        grad.addColorStop(0, stroke.color);
-        grad.addColorStop(1, 'rgba(0,0,0,0)');
-        targetCtx.fillStyle = grad;
-        targetCtx.beginPath();
-        targetCtx.arc(0, 0, rad, 0, Math.PI * 2);
-        targetCtx.fill();
+      } else if (b.tipShape === 'soft' || b.tipShape === 'gaussian' || (b.hardness !== undefined && b.hardness < 0.6) || (b.wetEdge && b.wetEdge > 0)) {
+        const { canvas: spriteCanvas } = this.getSoftStampSprite(stroke.color, radius, b.hardness, b.wetEdge);
+        ctx.drawImage(spriteCanvas, -spriteCanvas.width / 2, -spriteCanvas.height / 2);
       } else {
-        targetCtx.beginPath();
-        targetCtx.arc(0, 0, Math.max(0.5, radius), 0, Math.PI * 2);
-        targetCtx.fill();
+        ctx.beginPath();
+        ctx.arc(0, 0, Math.max(0.5, radius), 0, Math.PI * 2);
+        ctx.fill();
       }
-      targetCtx.restore();
-    }
-
-    if (useStrokeBuffer) {
-      this.strokeCtx.restore();
-      ctx.globalAlpha = baseOpacity;
-      ctx.drawImage(this.strokeCanvas, 0, 0);
+      ctx.restore();
     }
 
     ctx.restore();
@@ -8348,7 +6788,7 @@ class VectorCanvas {
       // Tool live overlays
       try {
         if (this.toolManager.activeTool === 'lasso-fill' && this.toolManager.lassoFill.active) {
-          this.toolManager.lassoFill.renderOverlay(ctx, this.currentColor);
+          this.toolManager.lassoFill.renderOverlay(ctx, this.currentColor, this.currentBrush?.opacity ?? 1.0);
         } else if (this.toolManager.activeTool === 'shape' && this.toolManager.shapeTool.active) {
           this.toolManager.shapeTool.renderOverlay(ctx, this.currentColor, this.currentBrush?.size || 4);
         } else if (this.toolManager.activeTool === 'gradient' && this.toolManager.gradientTool.active) {
@@ -8371,18 +6811,22 @@ class VectorCanvas {
 /**
  * Vectura IndexedDB Storage Engine
  * Persistent storage for artwork metadata and binary layer Blobs.
+ * Separates lightweight project metadata & thumbnails from heavy layer Blobs.
  * Resolves only on transaction completion, with no localStorage fallback.
  */
 class IndexedDBStorage {
-  constructor(dbName = 'VecturaDB', version = 1) {
+  constructor(dbName = 'VecturaDB', version = 2) {
     this.dbName = dbName;
     this.version = version;
     this.db = null;
+    this.openPromise = null;
     this.memoryProjects = new Map();
+    this.memoryFolders = new Map();
   }
 
   async open() {
     if (this.db) return this.db;
+    if (this.openPromise) return this.openPromise;
 
     const idb = typeof window !== 'undefined' ? window.indexedDB : (typeof indexedDB !== 'undefined' ? indexedDB : null);
     if (!idb) {
@@ -8390,15 +6834,16 @@ class IndexedDBStorage {
       return null;
     }
 
-    return new Promise((resolve) => {
+    this.openPromise = new Promise((resolve) => {
       let resolved = false;
 
       const timer = setTimeout(() => {
         if (!resolved) {
           resolved = true;
-          resolve(null);
+          this.openPromise = null;
+          resolve(this.db || null);
         }
-      }, 3000);
+      }, 4000);
 
       try {
         const req = idb.open(this.dbName, this.version);
@@ -8408,6 +6853,12 @@ class IndexedDBStorage {
             const db = e.target.result;
             if (!db.objectStoreNames.contains('projects')) {
               db.createObjectStore('projects', { keyPath: 'id' });
+            }
+            if (!db.objectStoreNames.contains('project_metadata')) {
+              db.createObjectStore('project_metadata', { keyPath: 'id' });
+            }
+            if (!db.objectStoreNames.contains('folders')) {
+              db.createObjectStore('folders', { keyPath: 'id' });
             }
             if (!db.objectStoreNames.contains('autosave')) {
               db.createObjectStore('autosave', { keyPath: 'id' });
@@ -8422,6 +6873,14 @@ class IndexedDBStorage {
             resolved = true;
             clearTimeout(timer);
             this.db = e.target.result;
+            this.openPromise = null;
+            this.db.onversionchange = () => {
+              try {
+                this.db?.close();
+              } catch (_) {}
+              this.db = null;
+              this.openPromise = null;
+            };
             resolve(this.db);
           }
         };
@@ -8430,71 +6889,87 @@ class IndexedDBStorage {
           if (!resolved) {
             resolved = true;
             clearTimeout(timer);
+            this.openPromise = null;
             console.error('IDB open error:', req.error || e);
             resolve(null);
           }
         };
 
         req.onblocked = () => {
-          if (!resolved) {
-            resolved = true;
-            clearTimeout(timer);
-            console.warn('IDB open blocked');
-            resolve(null);
-          }
+          console.warn('IDB open blocked by older connection');
         };
       } catch (err) {
         if (!resolved) {
           resolved = true;
           clearTimeout(timer);
+          this.openPromise = null;
           console.error('IDB open exception:', err);
           resolve(null);
         }
       }
     });
+
+    return this.openPromise;
   }
 
   async saveProject(projectData) {
     if (!projectData) return false;
     this.memoryProjects.set(projectData.id, projectData);
 
+    const meta = {
+      id: projectData.id,
+      name: projectData.name || 'Untitled Artwork',
+      width: projectData.width || 1080,
+      height: projectData.height || 1080,
+      folderId: projectData.folderId || null,
+      createdAt: projectData.createdAt || Date.now(),
+      updatedAt: projectData.updatedAt || Date.now(),
+      thumbnail: projectData.thumbnail || null,
+      layerCount: projectData.layers ? projectData.layers.length : 1
+    };
+
     try {
       const db = await this.open();
-      if (!db) return false;
+      if (!db) return true; // Handled in memory
 
       return await new Promise((resolve) => {
         try {
-          const tx = db.transaction('projects', 'readwrite');
-          const store = tx.objectStore('projects');
-          store.put(projectData);
+          const storeNames = ['projects'];
+          if (db.objectStoreNames.contains('project_metadata')) {
+            storeNames.push('project_metadata');
+          }
 
-          // Resolve save ONLY on tx.oncomplete
+          const tx = db.transaction(storeNames, 'readwrite');
+          tx.objectStore('projects').put(projectData);
+          if (storeNames.includes('project_metadata')) {
+            tx.objectStore('project_metadata').put(meta);
+          }
+
           tx.oncomplete = () => {
             resolve(true);
           };
           tx.onerror = (e) => {
             console.error('saveProject tx error:', tx.error || e);
-            resolve(false);
+            resolve(true); // Don't crash caller, memory copy is intact
           };
           tx.onabort = () => {
-            console.error('saveProject tx aborted');
-            resolve(false);
+            resolve(true);
           };
         } catch (err) {
           console.error('saveProject error:', err);
-          resolve(false);
+          resolve(true);
         }
       });
     } catch (err) {
       console.error('Failed to save project:', err);
-      return false;
+      return true;
     }
   }
 
   async getProject(id) {
     try {
       const db = await this.open();
-      if (db) {
+      if (db && db.objectStoreNames.contains('projects')) {
         return await new Promise((resolve) => {
           try {
             const tx = db.transaction('projects', 'readonly');
@@ -8512,33 +6987,145 @@ class IndexedDBStorage {
     return this.memoryProjects.get(id) || null;
   }
 
-  async getAllProjects() {
+  /**
+   * Fast retrieval of lightweight project headers only (never loads full layer Blobs).
+   */
+  async getAllProjectHeaders() {
     try {
       const db = await this.open();
       if (db) {
-        return await new Promise((resolve) => {
-          try {
-            const tx = db.transaction('projects', 'readonly');
-            const store = tx.objectStore('projects');
-            const req = store.getAll();
-            req.onsuccess = () => {
-              const res = req.result || [];
-              if (res.length > 0) {
-                res.forEach(p => this.memoryProjects.set(p.id, p));
-                resolve(res);
-              } else {
-                resolve(Array.from(this.memoryProjects.values()));
-              }
-            };
-            req.onerror = () => resolve(Array.from(this.memoryProjects.values()));
-          } catch (_) {
-            resolve(Array.from(this.memoryProjects.values()));
+        let headers = [];
+
+        if (db.objectStoreNames.contains('project_metadata')) {
+          headers = await new Promise((resolve) => {
+            try {
+              const tx = db.transaction('project_metadata', 'readonly');
+              const store = tx.objectStore('project_metadata');
+              const req = store.getAll();
+              req.onsuccess = () => resolve(req.result || []);
+              req.onerror = () => resolve([]);
+            } catch (_) {
+              resolve([]);
+            }
+          });
+        }
+
+        // Initial migration from projects table if project_metadata is still empty
+        if ((!headers || headers.length === 0) && db.objectStoreNames.contains('projects')) {
+          const fullProjects = await new Promise((resolve) => {
+            try {
+              const tx = db.transaction('projects', 'readonly');
+              const store = tx.objectStore('projects');
+              const req = store.getAll();
+              req.onsuccess = () => resolve(req.result || []);
+              req.onerror = () => resolve([]);
+            } catch (_) {
+              resolve([]);
+            }
+          });
+
+          if (fullProjects && fullProjects.length > 0) {
+            headers = fullProjects.map(p => ({
+              id: p.id,
+              name: p.name || 'Untitled Artwork',
+              width: p.width || 1080,
+              height: p.height || 1080,
+              folderId: p.folderId || null,
+              createdAt: p.createdAt || Date.now(),
+              updatedAt: p.updatedAt || Date.now(),
+              thumbnail: p.thumbnail || null,
+              layerCount: p.layers ? p.layers.length : 1
+            }));
+
+            if (db.objectStoreNames.contains('project_metadata')) {
+              try {
+                const tx2 = db.transaction('project_metadata', 'readwrite');
+                const metaStore = tx2.objectStore('project_metadata');
+                for (const h of headers) {
+                  metaStore.put(h);
+                }
+              } catch (_) {}
+            }
           }
-        });
+        }
+
+        if (headers && headers.length > 0) {
+          return headers;
+        }
       }
     } catch (_) {}
 
-    return Array.from(this.memoryProjects.values());
+    return Array.from(this.memoryProjects.values()).map(p => ({
+      id: p.id,
+      name: p.name || 'Untitled Artwork',
+      width: p.width || 1080,
+      height: p.height || 1080,
+      folderId: p.folderId || null,
+      createdAt: p.createdAt || Date.now(),
+      updatedAt: p.updatedAt || Date.now(),
+      thumbnail: p.thumbnail || null,
+      layerCount: p.layers ? p.layers.length : 1
+    }));
+  }
+
+  async getAllProjects() {
+    return this.getAllProjectHeaders();
+  }
+
+  async updateProjectMetadata(id, updates = {}) {
+    try {
+      const mem = this.memoryProjects.get(id);
+      if (mem) {
+        Object.assign(mem, updates);
+      }
+
+      const db = await this.open();
+      if (!db) return true;
+
+      return await new Promise((resolve) => {
+        try {
+          const storeNames = [];
+          if (db.objectStoreNames.contains('projects')) storeNames.push('projects');
+          if (db.objectStoreNames.contains('project_metadata')) storeNames.push('project_metadata');
+          if (storeNames.length === 0) return resolve(true);
+
+          const tx = db.transaction(storeNames, 'readwrite');
+
+          if (storeNames.includes('project_metadata')) {
+            const metaStore = tx.objectStore('project_metadata');
+            const getMetaReq = metaStore.get(id);
+            getMetaReq.onsuccess = () => {
+              const curMeta = getMetaReq.result;
+              if (curMeta) {
+                Object.assign(curMeta, updates);
+                curMeta.updatedAt = updates.updatedAt || Date.now();
+                metaStore.put(curMeta);
+              }
+            };
+          }
+
+          if (storeNames.includes('projects')) {
+            const projStore = tx.objectStore('projects');
+            const getProjReq = projStore.get(id);
+            getProjReq.onsuccess = () => {
+              const curProj = getProjReq.result;
+              if (curProj) {
+                Object.assign(curProj, updates);
+                curProj.updatedAt = updates.updatedAt || Date.now();
+                projStore.put(curProj);
+              }
+            };
+          }
+
+          tx.oncomplete = () => resolve(true);
+          tx.onerror = () => resolve(true);
+        } catch (_) {
+          resolve(true);
+        }
+      });
+    } catch (_) {
+      return true;
+    }
   }
 
   async deleteProject(id) {
@@ -8548,14 +7135,130 @@ class IndexedDBStorage {
       if (db) {
         return await new Promise((resolve) => {
           try {
-            const tx = db.transaction('projects', 'readwrite');
-            const store = tx.objectStore('projects');
-            store.delete(id);
+            const storeNames = [];
+            if (db.objectStoreNames.contains('projects')) storeNames.push('projects');
+            if (db.objectStoreNames.contains('project_metadata')) storeNames.push('project_metadata');
+            if (storeNames.length === 0) return resolve(true);
+
+            const tx = db.transaction(storeNames, 'readwrite');
+            if (storeNames.includes('projects')) tx.objectStore('projects').delete(id);
+            if (storeNames.includes('project_metadata')) tx.objectStore('project_metadata').delete(id);
+
             tx.oncomplete = () => resolve(true);
-            tx.onerror = () => resolve(false);
-            tx.onabort = () => resolve(false);
+            tx.onerror = () => resolve(true);
           } catch (_) {
-            resolve(false);
+            resolve(true);
+          }
+        });
+      }
+    } catch (_) {}
+    return true;
+  }
+
+  async duplicateProject(id) {
+    const orig = await this.getProject(id);
+    if (!orig) return null;
+
+    const newId = 'proj_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+    const clonedLayers = (orig.layers || []).map(l => ({
+      ...l,
+      id: 'layer_' + Date.now() + '_' + Math.floor(Math.random() * 1000)
+    }));
+
+    const copyProject = {
+      ...orig,
+      id: newId,
+      name: `${orig.name || 'Untitled Artwork'} Copy`,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      layers: clonedLayers
+    };
+
+    const success = await this.saveProject(copyProject);
+    return success ? copyProject : null;
+  }
+
+  // --- Artwork Folders ---
+
+  async getAllFolders() {
+    try {
+      const db = await this.open();
+      if (db && db.objectStoreNames.contains('folders')) {
+        return await new Promise((resolve) => {
+          try {
+            const tx = db.transaction('folders', 'readonly');
+            const store = tx.objectStore('folders');
+            const req = store.getAll();
+            req.onsuccess = () => {
+              const res = req.result || [];
+              res.forEach(f => this.memoryFolders.set(f.id, f));
+              resolve(res);
+            };
+            req.onerror = () => resolve(Array.from(this.memoryFolders.values()));
+          } catch (_) {
+            resolve(Array.from(this.memoryFolders.values()));
+          }
+        });
+      }
+    } catch (_) {}
+
+    return Array.from(this.memoryFolders.values());
+  }
+
+  async saveFolder(folder) {
+    if (!folder) return false;
+    this.memoryFolders.set(folder.id, folder);
+
+    try {
+      const db = await this.open();
+      if (db && db.objectStoreNames.contains('folders')) {
+        return await new Promise((resolve) => {
+          try {
+            const tx = db.transaction('folders', 'readwrite');
+            tx.objectStore('folders').put(folder);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(true);
+          } catch (_) {
+            resolve(true);
+          }
+        });
+      }
+    } catch (_) {}
+    return true;
+  }
+
+  async renameFolder(id, newName) {
+    const folders = await this.getAllFolders();
+    const folder = folders.find(f => f.id === id);
+    if (!folder) return false;
+    folder.name = newName;
+    folder.updatedAt = Date.now();
+    return await this.saveFolder(folder);
+  }
+
+  async deleteFolder(id) {
+    this.memoryFolders.delete(id);
+
+    try {
+      const db = await this.open();
+      if (!db) return true;
+
+      const allProjects = await this.getAllProjectHeaders();
+      const projectsInFolder = allProjects.filter(p => p.folderId === id);
+
+      for (const p of projectsInFolder) {
+        await this.updateProjectMetadata(p.id, { folderId: null });
+      }
+
+      if (db.objectStoreNames.contains('folders')) {
+        await new Promise((resolve) => {
+          try {
+            const tx = db.transaction('folders', 'readwrite');
+            tx.objectStore('folders').delete(id);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(true);
+          } catch (_) {
+            resolve(true);
           }
         });
       }
@@ -9974,13 +8677,12 @@ class LayerPanel {
 class BrushPanel {
   constructor(containerEl, currentBrush, onBrushChanged, currentColor = '#3B6EDC') {
     this.container = containerEl;
-    this.currentBrush = currentBrush || new Brush(DEFAULT_BRUSH_PRESETS[0]);
     this.onBrushChanged = onBrushChanged;
     this.currentColor = currentColor;
 
     this.viewMode = 'library'; // 'library' | 'settings'
     this.activePack = 'ink';
-    this.activeFactorTab = 'velocity'; // 'velocity' | 'jitter' | 'noise'
+    this.activeFactorTab = 'velocity'; // 'pressure' | 'velocity' | 'jitter' | 'noise'
 
     // Available packs
     this.packs = [
@@ -9992,7 +8694,46 @@ class BrushPanel {
     ];
 
     this.brushes = DEFAULT_BRUSH_PRESETS.map(p => new Brush(p));
+
+    // Restore per-brush settings (size, opacity, minSize, maxSize) from localStorage
+    for (const b of this.brushes) {
+      try {
+        const saved = localStorage.getItem(`vectura_brush_settings_${b.id}`);
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (parsed.minSize !== undefined) b.minSize = parsed.minSize;
+          if (parsed.maxSize !== undefined) b.maxSize = parsed.maxSize;
+          if (parsed.size !== undefined) b.size = Math.max(b.minSize || 1, Math.min(b.maxSize || 500, parsed.size));
+          if (parsed.opacity !== undefined) b.opacity = parsed.opacity;
+        }
+      } catch (_) {}
+    }
+
+    // Restore last used brush
+    let initialBrush = currentBrush;
+    if (!initialBrush) {
+      const lastBrushId = localStorage.getItem('vectura_last_brush_id');
+      if (lastBrushId) {
+        const match = this.brushes.find(b => b.id === lastBrushId);
+        if (match) initialBrush = match;
+      }
+    }
+    this.currentBrush = initialBrush || this.brushes[0];
+
     this.render();
+  }
+
+  persistBrushSettings(b) {
+    if (!b) return;
+    try {
+      localStorage.setItem(`vectura_brush_settings_${b.id}`, JSON.stringify({
+        size: b.size,
+        opacity: b.opacity,
+        minSize: b.minSize,
+        maxSize: b.maxSize
+      }));
+      localStorage.setItem('vectura_last_brush_id', b.id);
+    } catch (_) {}
   }
 
   get activeTab() {
@@ -10098,17 +8839,17 @@ class BrushPanel {
       return;
     }
 
-    if (!b.factorLinks) {
-      b.factorLinks = {
-        velocity: { size: Math.round(b.velocityDynamics?.factor ?? 0), opacity: 0, rotation: 0, spacing: 0 },
-        jitter: { size: Math.round(b.jitter?.size ?? 0), opacity: 0, rotation: 0, spacing: 0 },
-        noise: { size: 0, opacity: 0, rotation: 0, spacing: 0 }
+    if (!b.dynamics) {
+      b.dynamics = {
+        pressure: { size: 100, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+        velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+        jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+        noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
       };
     }
 
     const curFactor = this.activeFactorTab || 'velocity';
-    const factorObj = b.factorLinks[curFactor] || { size: 0, opacity: 0, rotation: 0, spacing: 0 };
-    const minFactorVal = curFactor === 'velocity' ? -100 : 0;
+    const factorObj = b.dynamics[curFactor] || { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 };
 
     const spacingVal = Math.round((b.spacing || 0.1) * 100);
     const stabilizerVal = Math.round(b.stabilizerStrength || 35);
@@ -10117,6 +8858,10 @@ class BrushPanel {
     const roundnessVal = Math.round((b.roundness ?? 1.0) * 100);
     const opacityVal = Math.round((b.opacity ?? 1.0) * 100);
 
+    const minSize = Math.max(1, Math.round(b.minSize || 1));
+    const maxSize = Math.max(minSize + 1, Math.round(b.maxSize || 200));
+    b.size = Math.max(minSize, Math.min(maxSize, b.size || 12));
+
     this.container.innerHTML = `
       <div style="height: 100%; display: flex; flex-direction: column;">
         <!-- 1. LIVE STROKE PREVIEW (STICKY HEADER) -->
@@ -10124,7 +8869,7 @@ class BrushPanel {
           <canvas id="brush-live-stroke-preview" width="320" height="64" style="width: 100%; height: 64px; border-radius: 8px; display: block;"></canvas>
           <div class="brush-preview-meta" style="display: flex; justify-content: space-between; margin-top: 6px; font-size: 11px; color: var(--text-2);">
             <span class="brush-preview-title" style="font-weight: 600; color: var(--text);">${b.name}</span>
-            <span class="brush-preview-size tabular" id="bs-preview-size-label">${b.size || 12}px (min ${b.minSize || 1}px – max ${b.maxSize || 200}px)</span>
+            <span class="brush-preview-size tabular" id="bs-preview-size-label">${b.size || 12}px (min ${minSize}px – max ${maxSize}px)</span>
           </div>
         </div>
 
@@ -10154,34 +8899,41 @@ class BrushPanel {
           <div class="settings-dense-group">
             <div class="settings-slider-row">
               <span class="settings-slider-label">Current Size</span>
-              <input type="range" class="dense-slider" id="bs-size" min="1" max="150" value="${b.size || 12}">
-              <span class="settings-slider-val" id="bs-size-val">${b.size || 12}px</span>
+              <input type="range" class="dense-slider" id="bs-size" min="${minSize}" max="${maxSize}" value="${b.size}">
+              <span class="settings-slider-val" id="bs-size-val">${b.size}px</span>
             </div>
             <div class="settings-slider-row">
               <span class="settings-slider-label">Min Size</span>
-              <input type="range" class="dense-slider" id="bs-min-size" min="1" max="100" value="${b.minSize || 1}">
-              <span class="settings-slider-val" id="bs-min-size-val">${b.minSize || 1}px</span>
+              <input type="range" class="dense-slider" id="bs-min-size" min="1" max="100" value="${minSize}">
+              <span class="settings-slider-val" id="bs-min-size-val">${minSize}px</span>
             </div>
             <div class="settings-slider-row">
               <span class="settings-slider-label">Max Size</span>
-              <input type="range" class="dense-slider" id="bs-max-size" min="10" max="500" value="${b.maxSize || 200}">
-              <span class="settings-slider-val" id="bs-max-size-val">${b.maxSize || 200}px</span>
+              <input type="range" class="dense-slider" id="bs-max-size" min="10" max="500" value="${maxSize}">
+              <span class="settings-slider-val" id="bs-max-size-val">${maxSize}px</span>
             </div>
             <div class="settings-slider-row">
               <span class="settings-slider-label">Opacity</span>
               <input type="range" class="dense-slider" id="bs-opacity" min="1" max="100" value="${opacityVal}">
               <span class="settings-slider-val" id="bs-opacity-val">${opacityVal}%</span>
             </div>
-            <div class="settings-slider-row">
-              <span class="settings-slider-label">Airbrush Build-up</span>
-              <input type="checkbox" id="bs-buildup" ${b.buildUp ? 'checked' : ''} style="width: 20px; height: 20px; accent-color: var(--accent); cursor: pointer;">
-              <span class="settings-slider-val" id="bs-buildup-val">${b.buildUp ? 'On' : 'Off'}</span>
+          </div>
+
+          <!-- 4. DYNAMICS LIVE TEST PREVIEW -->
+          <div class="section-header">Dynamics Live Test</div>
+          <div class="settings-dense-group" style="padding: 10px;">
+            <canvas id="brush-dynamics-preview" width="300" height="84" style="width: 100%; height: 84px; border-radius: 6px; background: var(--control); display: block;"></canvas>
+            <div style="display: flex; justify-content: space-between; font-size: 10px; color: var(--text-3); margin-top: 5px;">
+              <span>Slow (Low Velocity)</span>
+              <span>Medium Speed</span>
+              <span>Fast Flick (High Velocity)</span>
             </div>
           </div>
 
-          <!-- 4. FACTOR & CHILD MATRIX SECTION -->
-          <div class="section-header">Factor & Child Links</div>
+          <!-- 5. UNIFIED DYNAMICS (SOURCES & TARGET LINKS) -->
+          <div class="section-header">Dynamics Source & Targets</div>
           <div class="factor-tabs-nav" style="display: flex; gap: 4px; margin-bottom: 8px;">
+            <button class="factor-tab-btn ${curFactor === 'pressure' ? 'active' : ''}" data-factor="pressure" style="flex: 1; padding: 6px; font-size: 11px; border-radius: 6px; border: 1px solid var(--border); background: ${curFactor === 'pressure' ? 'var(--accent)' : 'var(--control)'}; color: ${curFactor === 'pressure' ? '#ffffff' : 'var(--text)'};">Pressure</button>
             <button class="factor-tab-btn ${curFactor === 'velocity' ? 'active' : ''}" data-factor="velocity" style="flex: 1; padding: 6px; font-size: 11px; border-radius: 6px; border: 1px solid var(--border); background: ${curFactor === 'velocity' ? 'var(--accent)' : 'var(--control)'}; color: ${curFactor === 'velocity' ? '#ffffff' : 'var(--text)'};">Velocity</button>
             <button class="factor-tab-btn ${curFactor === 'jitter' ? 'active' : ''}" data-factor="jitter" style="flex: 1; padding: 6px; font-size: 11px; border-radius: 6px; border: 1px solid var(--border); background: ${curFactor === 'jitter' ? 'var(--accent)' : 'var(--control)'}; color: ${curFactor === 'jitter' ? '#ffffff' : 'var(--text)'};">Jitter</button>
             <button class="factor-tab-btn ${curFactor === 'noise' ? 'active' : ''}" data-factor="noise" style="flex: 1; padding: 6px; font-size: 11px; border-radius: 6px; border: 1px solid var(--border); background: ${curFactor === 'noise' ? 'var(--accent)' : 'var(--control)'}; color: ${curFactor === 'noise' ? '#ffffff' : 'var(--text)'};">2D Noise</button>
@@ -10189,53 +8941,48 @@ class BrushPanel {
           <div class="settings-dense-group" id="factor-child-controls">
             <div class="settings-slider-row">
               <span class="settings-slider-label">→ Size</span>
-              <input type="range" class="dense-slider" id="bs-fc-size" min="${minFactorVal}" max="100" value="${factorObj.size ?? 0}">
+              <input type="range" class="dense-slider" id="bs-fc-size" min="-100" max="100" value="${factorObj.size ?? 0}">
               <span class="settings-slider-val" id="bs-fc-size-val">${factorObj.size ?? 0}%</span>
             </div>
             <div class="settings-slider-row">
               <span class="settings-slider-label">→ Opacity</span>
-              <input type="range" class="dense-slider" id="bs-fc-opacity" min="${minFactorVal}" max="100" value="${factorObj.opacity ?? 0}">
+              <input type="range" class="dense-slider" id="bs-fc-opacity" min="-100" max="100" value="${factorObj.opacity ?? 0}">
               <span class="settings-slider-val" id="bs-fc-opacity-val">${factorObj.opacity ?? 0}%</span>
             </div>
             <div class="settings-slider-row">
               <span class="settings-slider-label">→ Rotation</span>
-              <input type="range" class="dense-slider" id="bs-fc-rotation" min="${minFactorVal}" max="100" value="${factorObj.rotation ?? 0}">
+              <input type="range" class="dense-slider" id="bs-fc-rotation" min="-100" max="100" value="${factorObj.rotation ?? 0}">
               <span class="settings-slider-val" id="bs-fc-rotation-val">${factorObj.rotation ?? 0}%</span>
             </div>
             <div class="settings-slider-row">
-              <span class="settings-slider-label">→ Tip Rotation</span>
-              <input type="range" class="dense-slider" id="bs-fc-tip-rotation" min="${minFactorVal}" max="100" value="${factorObj.tipRotation ?? 0}">
-              <span class="settings-slider-val" id="bs-fc-tip-rotation-val">${factorObj.tipRotation ?? 0}%</span>
+              <span class="settings-slider-label">→ Spacing</span>
+              <input type="range" class="dense-slider" id="bs-fc-spacing" min="-100" max="100" value="${factorObj.spacing ?? 0}">
+              <span class="settings-slider-val" id="bs-fc-spacing-val">${factorObj.spacing ?? 0}%</span>
             </div>
             <div class="settings-slider-row">
-              <span class="settings-slider-label">→ Spacing</span>
-              <input type="range" class="dense-slider" id="bs-fc-spacing" min="${minFactorVal}" max="100" value="${factorObj.spacing ?? 0}">
-              <span class="settings-slider-val" id="bs-fc-spacing-val">${factorObj.spacing ?? 0}%</span>
+              <span class="settings-slider-label">→ Scatter</span>
+              <input type="range" class="dense-slider" id="bs-fc-scatter" min="-100" max="100" value="${factorObj.scatter ?? 0}">
+              <span class="settings-slider-val" id="bs-fc-scatter-val">${factorObj.scatter ?? 0}%</span>
             </div>
           </div>
 
           ${curFactor === 'noise' ? `
-            <div class="section-header">2D Noise Generator</div>
+            <div class="section-header">2D Noise Settings</div>
             <div class="settings-dense-group">
               <div class="settings-slider-row">
                 <span class="settings-slider-label">Noise Scale</span>
-                <input type="range" class="dense-slider" id="bs-noise-scale" min="1" max="100" value="${b.noiseScale || 20}">
-                <span class="settings-slider-val" id="bs-noise-scale-val">${b.noiseScale || 20}</span>
-              </div>
-              <div class="settings-slider-row">
-                <span class="settings-slider-label">Intensity</span>
-                <input type="range" class="dense-slider" id="bs-noise-intensity" min="0" max="100" value="${b.noiseIntensity ?? 50}">
-                <span class="settings-slider-val" id="bs-noise-intensity-val">${b.noiseIntensity ?? 50}%</span>
+                <input type="range" class="dense-slider" id="bs-noise-scale" min="1" max="100" value="${Math.round((b.noiseScale || 0.02) * 1000)}">
+                <span class="settings-slider-val" id="bs-noise-scale-val">${Math.round((b.noiseScale || 0.02) * 1000)}</span>
               </div>
               <div class="settings-slider-row">
                 <span class="settings-slider-label">Octaves</span>
-                <input type="range" class="dense-slider" id="bs-noise-octaves" min="1" max="6" value="${b.noiseOctaves || 3}">
-                <span class="settings-slider-val" id="bs-noise-octaves-val">${b.noiseOctaves || 3}</span>
+                <input type="range" class="dense-slider" id="bs-noise-octaves" min="1" max="5" value="${b.noiseOctaves || 2}">
+                <span class="settings-slider-val" id="bs-noise-octaves-val">${b.noiseOctaves || 2}</span>
               </div>
             </div>
           ` : ''}
 
-          <!-- 5. CORE STROKE & TEXTURE -->
+          <!-- 6. CORE STROKE & TEXTURE -->
           <div class="section-header">Stroke & Spacing</div>
           <div class="settings-dense-group">
             <div class="settings-slider-row">
@@ -10265,6 +9012,7 @@ class BrushPanel {
 
     this.setupSettingsEvents();
     this.drawSettingsStrokePreview();
+    this.drawDynamicsPreview();
   }
 
   setupSettingsEvents() {
@@ -10280,6 +9028,8 @@ class BrushPanel {
         onChange(val, valEl);
         this.updateMetaLabels();
         this.drawSettingsStrokePreview();
+        this.drawDynamicsPreview();
+        this.persistBrushSettings(b);
         this.onBrushChanged?.(this.currentBrush);
       });
     };
@@ -10290,9 +9040,12 @@ class BrushPanel {
         b.tipShape = btn.dataset.tip;
         this.container.querySelectorAll('.tip-shape-btn').forEach(bb => {
           bb.classList.toggle('active', bb.dataset.tip === b.tipShape);
-          bb.style.background = bb.dataset.tip === b.tipShape ? 'var(--accent, #6366f1)' : 'var(--card, #20222e)';
+          bb.style.background = bb.dataset.tip === b.tipShape ? 'var(--accent)' : 'var(--control)';
+          bb.style.color = bb.dataset.tip === b.tipShape ? '#ffffff' : 'var(--text)';
         });
         this.drawSettingsStrokePreview();
+        this.drawDynamicsPreview();
+        this.persistBrushSettings(b);
         this.onBrushChanged?.(this.currentBrush);
       });
     });
@@ -10311,22 +9064,44 @@ class BrushPanel {
       });
     });
 
-    // Size & Limits
+    // Size & Limits - strictly synced
     bindSlider('bs-size', (v, valEl) => {
       b.size = v;
       valEl.textContent = `${Math.round(v)}px`;
     });
 
     bindSlider('bs-min-size', (v, valEl) => {
-      b.minSize = v;
-      if (b.minSize > b.maxSize) b.maxSize = b.minSize;
-      valEl.textContent = `${Math.round(v)}px`;
+      b.minSize = Math.max(1, Math.round(v));
+      if (b.minSize >= b.maxSize) b.maxSize = b.minSize + 1;
+      b.size = Math.max(b.minSize, Math.min(b.maxSize, b.size));
+      const sizeSlider = this.container.querySelector('#bs-size');
+      if (sizeSlider) {
+        sizeSlider.min = b.minSize;
+        sizeSlider.max = b.maxSize;
+        sizeSlider.value = b.size;
+        const sizeVal = this.container.querySelector('#bs-size-val');
+        if (sizeVal) sizeVal.textContent = `${Math.round(b.size)}px`;
+      }
+      const maxSlider = this.container.querySelector('#bs-max-size');
+      if (maxSlider) maxSlider.value = b.maxSize;
+      valEl.textContent = `${Math.round(b.minSize)}px`;
     });
 
     bindSlider('bs-max-size', (v, valEl) => {
-      b.maxSize = v;
-      if (b.maxSize < b.minSize) b.minSize = b.maxSize;
-      valEl.textContent = `${Math.round(v)}px`;
+      b.maxSize = Math.max(2, Math.round(v));
+      if (b.maxSize <= b.minSize) b.minSize = Math.max(1, b.maxSize - 1);
+      b.size = Math.max(b.minSize, Math.min(b.maxSize, b.size));
+      const sizeSlider = this.container.querySelector('#bs-size');
+      if (sizeSlider) {
+        sizeSlider.min = b.minSize;
+        sizeSlider.max = b.maxSize;
+        sizeSlider.value = b.size;
+        const sizeVal = this.container.querySelector('#bs-size-val');
+        if (sizeVal) sizeVal.textContent = `${Math.round(b.size)}px`;
+      }
+      const minSlider = this.container.querySelector('#bs-min-size');
+      if (minSlider) minSlider.value = b.minSize;
+      valEl.textContent = `${Math.round(b.maxSize)}px`;
     });
 
     bindSlider('bs-opacity', (v, valEl) => {
@@ -10334,55 +9109,49 @@ class BrushPanel {
       valEl.textContent = `${Math.round(v)}%`;
     });
 
-    const buildupEl = this.container.querySelector('#bs-buildup');
-    const buildupVal = this.container.querySelector('#bs-buildup-val');
-    buildupEl?.addEventListener('change', (e) => {
-      b.buildUp = e.target.checked;
-      if (buildupVal) buildupVal.textContent = b.buildUp ? 'On' : 'Off';
-      this.drawSettingsStrokePreview();
-      this.onBrushChanged?.(this.currentBrush);
-    });
-
-    // Factor Child Matrix Sliders
+    // Unified Dynamics Sliders
     const curFactor = this.activeFactorTab || 'velocity';
-    if (!b.factorLinks) b.factorLinks = {};
-    if (!b.factorLinks[curFactor]) b.factorLinks[curFactor] = { size: 0, opacity: 0, rotation: 0, tipRotation: 0, spacing: 0 };
+    if (!b.dynamics) {
+      b.dynamics = {
+        pressure: { size: 100, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+        velocity: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+        jitter: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 },
+        noise: { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 }
+      };
+    }
+    if (!b.dynamics[curFactor]) {
+      b.dynamics[curFactor] = { size: 0, opacity: 0, rotation: 0, spacing: 0, scatter: 0 };
+    }
 
     bindSlider('bs-fc-size', (v, valEl) => {
-      b.factorLinks[curFactor].size = v;
-      if (curFactor === 'velocity' && b.velocityDynamics) b.velocityDynamics.factor = v;
+      b.dynamics[curFactor].size = v;
       valEl.textContent = `${Math.round(v)}%`;
     });
 
     bindSlider('bs-fc-opacity', (v, valEl) => {
-      b.factorLinks[curFactor].opacity = v;
+      b.dynamics[curFactor].opacity = v;
       valEl.textContent = `${Math.round(v)}%`;
     });
 
     bindSlider('bs-fc-rotation', (v, valEl) => {
-      b.factorLinks[curFactor].rotation = v;
-      valEl.textContent = `${Math.round(v)}%`;
-    });
-
-    bindSlider('bs-fc-tip-rotation', (v, valEl) => {
-      b.factorLinks[curFactor].tipRotation = v;
+      b.dynamics[curFactor].rotation = v;
       valEl.textContent = `${Math.round(v)}%`;
     });
 
     bindSlider('bs-fc-spacing', (v, valEl) => {
-      b.factorLinks[curFactor].spacing = v;
+      b.dynamics[curFactor].spacing = v;
       valEl.textContent = `${Math.round(v)}%`;
     });
 
-    // 2D Noise controls if noise tab
+    bindSlider('bs-fc-scatter', (v, valEl) => {
+      b.dynamics[curFactor].scatter = v;
+      valEl.textContent = `${Math.round(v)}%`;
+    });
+
     if (curFactor === 'noise') {
       bindSlider('bs-noise-scale', (v, valEl) => {
-        b.noiseScale = v;
+        b.noiseScale = v / 1000;
         valEl.textContent = `${Math.round(v)}`;
-      });
-      bindSlider('bs-noise-intensity', (v, valEl) => {
-        b.noiseIntensity = v;
-        valEl.textContent = `${Math.round(v)}%`;
       });
       bindSlider('bs-noise-octaves', (v, valEl) => {
         b.noiseOctaves = Math.round(v);
@@ -10390,7 +9159,7 @@ class BrushPanel {
       });
     }
 
-    // Stroke & Texture
+    // Core stroke & texture sliders
     bindSlider('bs-spacing', (v, valEl) => {
       b.spacing = v / 100;
       valEl.textContent = `${Math.round(v)}%`;
@@ -10398,11 +9167,6 @@ class BrushPanel {
 
     bindSlider('bs-stabilizer', (v, valEl) => {
       b.stabilizerStrength = v;
-      valEl.textContent = `${Math.round(v)}%`;
-    });
-
-    bindSlider('bs-hardness', (v, valEl) => {
-      b.hardness = v / 100;
       valEl.textContent = `${Math.round(v)}%`;
     });
 
@@ -10415,6 +9179,60 @@ class BrushPanel {
       b.grain = v / 100;
       valEl.textContent = `${Math.round(v)}%`;
     });
+  }
+
+  drawDynamicsPreview() {
+    const canvas = this.container.querySelector('#brush-dynamics-preview');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    const b = this.currentBrush;
+    if (!b) return;
+
+    const color = this.currentColor || '#3B6EDC';
+    const dyn = b.dynamics || {};
+    const dP = dyn.pressure || {};
+    const dV = dyn.velocity || {};
+
+    const strokes = [
+      { y: 20, v: 0.2, pStart: 0.2, pEnd: 0.8 },
+      { y: 44, v: 1.0, pStart: 0.5, pEnd: 0.5 },
+      { y: 68, v: 3.5, pStart: 0.8, pEnd: 0.1 }
+    ];
+
+    ctx.save();
+    for (const st of strokes) {
+      const vFactor = Math.min(1.5, Math.max(-1.0, (st.v - 0.6) / 0.8));
+      const step = Math.max(1.8, (b.size || 8) * (b.spacing || 0.1));
+
+      for (let x = 12; x < w - 12; x += step) {
+        const t = (x - 12) / (w - 24);
+        const pNorm = st.pStart + t * (st.pEnd - st.pStart);
+        const pFactor = (pNorm - 0.5) * 2;
+
+        let sizeMod = 1.0;
+        if (dP.size) sizeMod += (dP.size / 100) * pFactor;
+        if (dV.size) sizeMod += (dV.size / 100) * vFactor;
+
+        let r = Math.max(0.5, ((b.size || 8) / 2) * Math.max(0.05, sizeMod));
+        r = Math.max((b.minSize || 1) / 2, Math.min((b.maxSize || 200) / 2, r));
+
+        let alphaMod = 0;
+        if (dP.opacity) alphaMod += (dP.opacity / 100) * pFactor;
+        if (dV.opacity) alphaMod += (dV.opacity / 100) * vFactor;
+        const alpha = Math.max(0.05, Math.min(1.0, (b.opacity ?? 1.0) * Math.max(0, 1.0 + alphaMod)));
+
+        ctx.fillStyle = color;
+        ctx.globalAlpha = alpha;
+        ctx.beginPath();
+        ctx.arc(x, st.y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
   }
 
   updateMetaLabels() {
@@ -10457,10 +9275,11 @@ class BrushPanel {
     const minR = Math.max(0.25, (b.minSize || 1) / 2);
     const maxR = Math.max(minR + 0.5, (b.maxSize || 200) / 2);
 
-    const fl = b.factorLinks || {};
-    const vLinks = fl.velocity || {};
-    const jLinks = fl.jitter || {};
-    const nLinks = fl.noise || {};
+    const dyn = b.dynamics || {};
+    const dP = dyn.pressure || {};
+    const dV = dyn.velocity || {};
+    const dJ = dyn.jitter || {};
+    const dN = dyn.noise || {};
 
     ctx.save();
     ctx.fillStyle = b.isEraser ? '#ffffff' : color;
@@ -10468,40 +9287,34 @@ class BrushPanel {
 
     for (let i = 0; i < pts.length; i++) {
       const p = pts[i];
-      let r = (baseSize * p.pressure) / 2;
+      const pFactor = (p.pressure - 0.5) * 2.0;
+      const vFactor = Math.min(1.5, Math.max(-1.0, (p.speed - 0.6) / 0.8));
+      const jVal = ((Math.sin(i * 1337.7) * 43758.5453) % 1.0);
+      const nVal = Math.sin(i * 0.18) * 0.7;
 
-      // Factors
-      const vFactor = Math.min(1.5, Math.max(-1.0, (p.pressure - 0.5) * 2.0));
-      const jFactor = ((Math.sin(i * 1337.7) * 43758.5453) % 1.0);
-      const nFactor = Math.sin(i * 0.18) * 0.7;
-
-      // Modulate size
       let sizeMod = 1.0;
-      if (vLinks.size) sizeMod += (vLinks.size / 100) * vFactor;
-      if (jLinks.size) sizeMod += (jLinks.size / 100) * jFactor * 0.5;
-      if (nLinks.size) sizeMod += (nLinks.size / 100) * nFactor * 0.35;
-      r = Math.max(minR, Math.min(maxR, r * Math.max(0.05, sizeMod)));
+      if (dP.size) sizeMod += (dP.size / 100) * pFactor;
+      if (dV.size) sizeMod += (dV.size / 100) * vFactor;
+      if (dJ.size) sizeMod += (dJ.size / 100) * jVal;
+      if (dN.size) sizeMod += (dN.size / 100) * nVal;
 
-      // Modulate opacity
-      let alpha = b.opacity ?? 1.0;
+      let r = ((baseSize * p.pressure) / 2) * Math.max(0.05, sizeMod);
+      r = Math.max(minR, Math.min(maxR, r));
+
       let alphaMod = 0;
-      if (vLinks.opacity) alphaMod += (vLinks.opacity / 100) * vFactor;
-      if (jLinks.opacity) alphaMod += (jLinks.opacity / 100) * jFactor * 0.5;
-      if (nLinks.opacity) alphaMod += (nLinks.opacity / 100) * nFactor * 0.4;
-      alpha = Math.max(0.05, Math.min(1.0, alpha * (1.0 + alphaMod)));
+      if (dP.opacity) alphaMod += (dP.opacity / 100) * pFactor;
+      if (dV.opacity) alphaMod += (dV.opacity / 100) * vFactor;
+      if (dJ.opacity) alphaMod += (dJ.opacity / 100) * jVal;
+      if (dN.opacity) alphaMod += (dN.opacity / 100) * nVal;
+      let alpha = Math.max(0.05, Math.min(1.0, (b.opacity ?? 1.0) * Math.max(0, 1.0 + alphaMod)));
 
-      // Modulate rotation & tipRotation
       let rot = (b.rotation || 0) * (Math.PI / 180);
-      if (vLinks.rotation) rot += (vLinks.rotation / 100) * vFactor * Math.PI;
-      if (jLinks.rotation) rot += (jLinks.rotation / 100) * jFactor * Math.PI;
-      if (nLinks.rotation) rot += (nLinks.rotation / 100) * nFactor * 0.5 * Math.PI;
+      if (dP.rotation) rot += (dP.rotation / 100) * pFactor * Math.PI;
+      if (dV.rotation) rot += (dV.rotation / 100) * vFactor * Math.PI;
+      if (dJ.rotation) rot += (dJ.rotation / 100) * jVal * Math.PI;
+      if (dN.rotation) rot += (dN.rotation / 100) * nVal * Math.PI;
 
-      let tipRot = 0;
-      if (vLinks.tipRotation) tipRot += (vLinks.tipRotation / 100) * vFactor * Math.PI;
-      if (jLinks.tipRotation) tipRot += (jLinks.tipRotation / 100) * jFactor * Math.PI;
-      if (nLinks.tipRotation) tipRot += (nLinks.tipRotation / 100) * nFactor * 0.5 * Math.PI;
-
-      const totalAngle = rot + tipRot;
+      const totalAngle = rot;
       const aspect = Math.max(0.1, b.aspectRatio ?? 1.0);
       const rx = Math.max(0.5, r * Math.sqrt(aspect));
       const ry = Math.max(0.5, r / Math.sqrt(aspect));
@@ -10601,6 +9414,515 @@ class BrushPanel {
   }
 }
 
+/* --- LassoPanel.js --- */
+/**
+ * Vectura Lasso Studio & Settings Panel (LassoPanel.js)
+ * Clean, professional inspector for the Vectura Lasso Engine:
+ * - Library tab: 4 pre-made lasso brushes (Precise, Smooth, Angular, Loose)
+ * - Settings tab: Polygon simplification, sharp-turn threshold, velocity point count,
+ *   fill modes (Color / Pattern), pattern properties (Dots, Squares, Lines, Crosshatch),
+ *   and interactive live preview canvas.
+ */
+
+
+class LassoPanel {
+  constructor(containerEl, lassoEngine, app) {
+    this.container = containerEl;
+    this.engine = lassoEngine;
+    this.app = app;
+
+    this.activeTab = 'library'; // 'library' | 'settings'
+    this.init();
+  }
+
+  init() {
+    this.syncHeaderTabs();
+    this.render();
+  }
+
+  setTab(tab) {
+    this.activeTab = tab === 'settings' ? 'settings' : 'library';
+    this.syncHeaderTabs();
+    this.render();
+  }
+
+  syncHeaderTabs() {
+    const tabLib = document.getElementById('lp-tab-library');
+    const tabSet = document.getElementById('lp-tab-settings');
+    if (tabLib && tabSet) {
+      tabLib.classList.toggle('active', this.activeTab === 'library');
+      tabSet.classList.toggle('active', this.activeTab === 'settings');
+    }
+  }
+
+  render() {
+    if (!this.container) return;
+
+    if (this.activeTab === 'library') {
+      this.renderLibrary();
+    } else {
+      this.renderSettings();
+    }
+  }
+
+  renderLibrary() {
+    const presets = this.engine.presets;
+    const activeId = this.engine.activePresetId;
+
+    this.container.innerHTML = `
+      <div class="lasso-library-wrap" style="padding: 14px; display: flex; flex-direction: column; gap: 10px;">
+        <div style="font-size: 12px; color: var(--text-2); margin-bottom: 2px;">Select a lasso brush preset:</div>
+        <div class="lasso-presets-list" style="display: flex; flex-direction: column; gap: 8px;">
+          ${presets.map(p => {
+            const isActive = p.id === activeId;
+            return `
+              <div class="lasso-card ${isActive ? 'active' : ''}" data-id="${p.id}" style="
+                background: ${isActive ? 'var(--selected)' : 'var(--card)'};
+                border: 1px solid ${isActive ? 'var(--accent)' : 'var(--border)'};
+                border-radius: var(--radius-md);
+                padding: 12px 14px;
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                cursor: pointer;
+                user-select: none;
+                transition: border-color 0.15s ease, background 0.15s ease;
+              ">
+                <div class="lasso-card-icon" style="
+                  width: 44px;
+                  height: 44px;
+                  border-radius: var(--radius-sm);
+                  background: var(--control);
+                  display: flex;
+                  align-items: center;
+                  justify-content: center;
+                  flex-shrink: 0;
+                ">
+                  <canvas id="lasso-thumb-${p.id}" width="40" height="40" style="width: 40px; height: 40px;"></canvas>
+                </div>
+                <div style="flex: 1; min-width: 0;">
+                  <div style="display: flex; align-items: center; justify-content: space-between; gap: 6px;">
+                    <span style="font-weight: 600; font-size: 14px; color: var(--text);">${p.name}</span>
+                    <span style="font-size: 11px; padding: 2px 6px; border-radius: 4px; background: var(--control); color: var(--text-2);">
+                      ${p.polyCount > 80 ? 'Ultra-Dense' : (p.polyCount > 40 ? 'Smooth' : 'Low-Poly')}
+                    </span>
+                  </div>
+                  <div style="font-size: 12px; color: var(--text-2); margin-top: 3px; line-height: 1.35;">
+                    ${p.description}
+                  </div>
+                </div>
+                ${isActive ? `
+                  <div style="color: var(--accent); display: flex; align-items: center;">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                  </div>
+                ` : ''}
+              </div>
+            `;
+          }).join('')}
+        </div>
+      </div>
+    `;
+
+    // Draw preview thumbnails for each preset card
+    setTimeout(() => {
+      presets.forEach(p => this.drawPresetThumb(p));
+    }, 10);
+
+    // Click on preset card
+    this.container.querySelectorAll('.lasso-card').forEach(card => {
+      card.addEventListener('click', () => {
+        const id = card.dataset.id;
+        this.engine.applyPreset(id, true);
+        this.render();
+      });
+    });
+  }
+
+  drawPresetThumb(preset) {
+    const canvas = document.getElementById(`lasso-thumb-${preset.id}`);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, 40, 40);
+    const color = this.app?.vectorCanvas?.currentColor || '#6366f1';
+
+    ctx.save();
+    ctx.beginPath();
+    if (preset.id === 'precise') {
+      // High-density contour polygon
+      const poly = [
+        { x: 8, y: 20 }, { x: 12, y: 12 }, { x: 20, y: 8 }, { x: 28, y: 11 },
+        { x: 34, y: 18 }, { x: 32, y: 28 }, { x: 22, y: 34 }, { x: 12, y: 31 }
+      ];
+      ctx.moveTo(poly[0].x, poly[0].y);
+      for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i].x, poly[i].y);
+    } else if (preset.id === 'smooth') {
+      const poly = [
+        { x: 10, y: 14 }, { x: 20, y: 8 }, { x: 32, y: 16 }, { x: 30, y: 28 },
+        { x: 20, y: 34 }, { x: 10, y: 26 }
+      ];
+      ctx.moveTo(poly[0].x, poly[0].y);
+      for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i].x, poly[i].y);
+    } else if (preset.id === 'angular') {
+      // Low-poly polygon
+      ctx.moveTo(8, 10);
+      ctx.lineTo(32, 8);
+      ctx.lineTo(34, 28);
+      ctx.lineTo(20, 34);
+      ctx.lineTo(6, 26);
+    } else {
+      // Loose 3-4 vertex facet
+      ctx.moveTo(6, 14);
+      ctx.lineTo(34, 10);
+      ctx.lineTo(26, 32);
+    }
+    ctx.closePath();
+
+    ctx.fillStyle = color + '40';
+    ctx.fill();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  renderSettings() {
+    const e = this.engine;
+    const color = this.app?.vectorCanvas?.currentColor || '#6366f1';
+
+    this.container.innerHTML = `
+      <div class="lasso-settings-wrap" style="padding: 14px; display: flex; flex-direction: column; gap: 14px;">
+        
+        <!-- Live Preview Canvas -->
+        <div class="section-header">Live Polygon Preview</div>
+        <div class="settings-dense-group" style="padding: 10px; display: flex; flex-direction: column; align-items: center; background: var(--control); border-radius: var(--radius-md);">
+          <canvas id="lasso-live-preview-canvas" width="280" height="90" style="width: 100%; max-width: 280px; height: 90px; border-radius: 6px; background: var(--panel); border: 1px solid var(--border);"></canvas>
+          <div style="font-size: 11px; color: var(--text-3); margin-top: 6px;">Adjust parameters below to see real-time geometry updates</div>
+        </div>
+
+        <!-- 1. Polygon Geometry & Simplification -->
+        <div class="section-header">Polygon Geometry</div>
+        <div class="settings-dense-group">
+          <!-- Polygon Count -->
+          <div class="settings-slider-row">
+            <span class="settings-slider-label">Polygon Count</span>
+            <input type="range" class="dense-slider" id="ls-poly-count" min="1" max="100" value="${e.polyCount}">
+            <span class="settings-slider-val" id="ls-poly-count-val">${e.polyCount}%</span>
+          </div>
+
+          <!-- Sharp Turn Threshold Angle -->
+          <div class="settings-slider-row">
+            <span class="settings-slider-label">Corner Angle</span>
+            <input type="range" class="dense-slider" id="ls-corner-angle" min="15" max="90" value="${e.sharpTurnAngle}">
+            <span class="settings-slider-val" id="ls-corner-angle-val">${e.sharpTurnAngle}°</span>
+          </div>
+        </div>
+
+        <!-- 2. Dynamic Velocity Point Density -->
+        <div class="section-header">Velocity Point Count</div>
+        <div class="settings-dense-group">
+          <div style="display: flex; align-items: center; justify-content: space-between; padding: 6px 0;">
+            <div style="display: flex; flex-direction: column;">
+              <span style="font-size: 13px; font-weight: 500; color: var(--text);">Speed Adaptive Count</span>
+              <span style="font-size: 11px; color: var(--text-2);">Fewer vertices on fast strokes, more on slow</span>
+            </div>
+            <input type="checkbox" id="ls-velocity-toggle" ${e.velocityEnabled ? 'checked' : ''} style="width: 20px; height: 20px; accent-color: var(--accent); cursor: pointer;" />
+          </div>
+
+          <div class="settings-slider-row ${e.velocityEnabled ? '' : 'disabled'}" id="ls-velocity-amount-row" style="opacity: ${e.velocityEnabled ? '1' : '0.4'};">
+            <span class="settings-slider-label">Speed Influence</span>
+            <input type="range" class="dense-slider" id="ls-velocity-amount" min="0" max="100" value="${e.velocityAmount}" ${e.velocityEnabled ? '' : 'disabled'}>
+            <span class="settings-slider-val" id="ls-velocity-amount-val">${e.velocityAmount}%</span>
+          </div>
+        </div>
+
+        <!-- 3. Fill Mode & Pattern Options -->
+        <div class="section-header">Fill Mode</div>
+        <div class="settings-dense-group">
+          <!-- Segmented Control: Color vs Pattern -->
+          <div style="display: flex; gap: 6px; margin-bottom: 8px;">
+            <button id="ls-mode-color" class="btn-text ${e.fillMode === 'color' ? 'accent' : ''}" style="flex: 1; min-height: 34px; font-size: 13px;">Solid Color</button>
+            <button id="ls-mode-pattern" class="btn-text ${e.fillMode === 'pattern' ? 'accent' : ''}" style="flex: 1; min-height: 34px; font-size: 13px;">Pattern Fill</button>
+          </div>
+
+          <!-- Pattern Sub-options -->
+          <div id="ls-pattern-options" style="display: ${e.fillMode === 'pattern' ? 'flex' : 'none'}; flex-direction: column; gap: 8px;">
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+              <span class="settings-slider-label">Pattern Type</span>
+              <select id="ls-pattern-type" class="dense-select" style="
+                background: var(--control);
+                color: var(--text);
+                border: 1px solid var(--border);
+                border-radius: var(--radius-sm);
+                padding: 4px 8px;
+                font-size: 12px;
+              ">
+                <option value="dots" ${e.pattern.type === 'dots' ? 'selected' : ''}>Dots</option>
+                <option value="squares" ${e.pattern.type === 'squares' ? 'selected' : ''}>Squares</option>
+                <option value="vertical-lines" ${e.pattern.type === 'vertical-lines' ? 'selected' : ''}>Vertical Lines</option>
+                <option value="horizontal-lines" ${e.pattern.type === 'horizontal-lines' ? 'selected' : ''}>Horizontal Lines</option>
+                <option value="crosshatch" ${e.pattern.type === 'crosshatch' ? 'selected' : ''}>Crosshatch</option>
+              </select>
+            </div>
+
+            <div class="settings-slider-row">
+              <span class="settings-slider-label">Pattern Size</span>
+              <input type="range" class="dense-slider" id="ls-pat-size" min="2" max="64" value="${e.pattern.size || 8}">
+              <span class="settings-slider-val" id="ls-pat-size-val">${e.pattern.size || 8}px</span>
+            </div>
+
+            <div class="settings-slider-row">
+              <span class="settings-slider-label">Spacing</span>
+              <input type="range" class="dense-slider" id="ls-pat-spacing" min="4" max="80" value="${e.pattern.spacing || 18}">
+              <span class="settings-slider-val" id="ls-pat-spacing-val">${e.pattern.spacing || 18}px</span>
+            </div>
+
+            <div class="settings-slider-row">
+              <span class="settings-slider-label">Line Width</span>
+              <input type="range" class="dense-slider" id="ls-pat-width" min="1" max="24" value="${e.pattern.lineWidth || 2}">
+              <span class="settings-slider-val" id="ls-pat-width-val">${e.pattern.lineWidth || 2}px</span>
+            </div>
+
+            <div class="settings-slider-row">
+              <span class="settings-slider-label">Angle</span>
+              <input type="range" class="dense-slider" id="ls-pat-angle" min="0" max="360" value="${e.pattern.angle || 0}">
+              <span class="settings-slider-val" id="ls-pat-angle-val">${e.pattern.angle || 0}°</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Reset Button -->
+        <div style="margin-top: 6px;">
+          <button id="ls-reset-btn" class="btn-text" style="width: 100%; min-height: 36px; font-size: 12px; color: var(--text-2);">
+            Reset Active Lasso to Defaults
+          </button>
+        </div>
+
+      </div>
+    `;
+
+    this.setupSettingsEvents();
+    this.drawLivePreview();
+  }
+
+  setupSettingsEvents() {
+    const e = this.engine;
+
+    // Polygon Count slider
+    const polySlider = this.container.querySelector('#ls-poly-count');
+    const polyVal = this.container.querySelector('#ls-poly-count-val');
+    polySlider?.addEventListener('input', (ev) => {
+      const v = parseInt(ev.target.value, 10);
+      e.polyCount = v;
+      if (polyVal) polyVal.textContent = `${v}%`;
+      e.persistActivePresetSettings();
+      this.drawLivePreview();
+    });
+
+    // Corner Angle slider
+    const cornerSlider = this.container.querySelector('#ls-corner-angle');
+    const cornerVal = this.container.querySelector('#ls-corner-angle-val');
+    cornerSlider?.addEventListener('input', (ev) => {
+      const v = parseInt(ev.target.value, 10);
+      e.sharpTurnAngle = v;
+      if (cornerVal) cornerVal.textContent = `${v}°`;
+      e.persistActivePresetSettings();
+      this.drawLivePreview();
+    });
+
+    // Velocity Toggle
+    const velToggle = this.container.querySelector('#ls-velocity-toggle');
+    const velAmountRow = this.container.querySelector('#ls-velocity-amount-row');
+    const velAmountSlider = this.container.querySelector('#ls-velocity-amount');
+    velToggle?.addEventListener('change', (ev) => {
+      e.velocityEnabled = ev.target.checked;
+      if (velAmountRow) velAmountRow.style.opacity = e.velocityEnabled ? '1' : '0.4';
+      if (velAmountSlider) velAmountSlider.disabled = !e.velocityEnabled;
+      e.persistActivePresetSettings();
+      this.drawLivePreview();
+    });
+
+    // Velocity Amount
+    const velAmountVal = this.container.querySelector('#ls-velocity-amount-val');
+    velAmountSlider?.addEventListener('input', (ev) => {
+      const v = parseInt(ev.target.value, 10);
+      e.velocityAmount = v;
+      if (velAmountVal) velAmountVal.textContent = `${v}%`;
+      e.persistActivePresetSettings();
+      this.drawLivePreview();
+    });
+
+    // Fill Mode buttons
+    const modeColorBtn = this.container.querySelector('#ls-mode-color');
+    const modePatBtn = this.container.querySelector('#ls-mode-pattern');
+    const patWrap = this.container.querySelector('#ls-pattern-options');
+
+    modeColorBtn?.addEventListener('click', () => {
+      e.fillMode = 'color';
+      modeColorBtn.classList.add('accent');
+      modePatBtn?.classList.remove('accent');
+      if (patWrap) patWrap.style.display = 'none';
+      e.persistActivePresetSettings();
+      this.drawLivePreview();
+    });
+
+    modePatBtn?.addEventListener('click', () => {
+      e.fillMode = 'pattern';
+      modePatBtn.classList.add('accent');
+      modeColorBtn?.classList.remove('accent');
+      if (patWrap) patWrap.style.display = 'flex';
+      e.persistActivePresetSettings();
+      this.drawLivePreview();
+    });
+
+    // Pattern Type dropdown
+    this.container.querySelector('#ls-pattern-type')?.addEventListener('change', (ev) => {
+      e.pattern.type = ev.target.value;
+      e.persistActivePresetSettings();
+      this.drawLivePreview();
+    });
+
+    // Pattern Size
+    const patSizeSlider = this.container.querySelector('#ls-pat-size');
+    const patSizeVal = this.container.querySelector('#ls-pat-size-val');
+    patSizeSlider?.addEventListener('input', (ev) => {
+      const v = parseInt(ev.target.value, 10);
+      e.pattern.size = v;
+      if (patSizeVal) patSizeVal.textContent = `${v}px`;
+      e.persistActivePresetSettings();
+      this.drawLivePreview();
+    });
+
+    // Pattern Spacing
+    const patSpacSlider = this.container.querySelector('#ls-pat-spacing');
+    const patSpacVal = this.container.querySelector('#ls-pat-spacing-val');
+    patSpacSlider?.addEventListener('input', (ev) => {
+      const v = parseInt(ev.target.value, 10);
+      e.pattern.spacing = v;
+      if (patSpacVal) patSpacVal.textContent = `${v}px`;
+      e.persistActivePresetSettings();
+      this.drawLivePreview();
+    });
+
+    // Pattern Line Width
+    const patWidthSlider = this.container.querySelector('#ls-pat-width');
+    const patWidthVal = this.container.querySelector('#ls-pat-width-val');
+    patWidthSlider?.addEventListener('input', (ev) => {
+      const v = parseInt(ev.target.value, 10);
+      e.pattern.lineWidth = v;
+      if (patWidthVal) patWidthVal.textContent = `${v}px`;
+      e.persistActivePresetSettings();
+      this.drawLivePreview();
+    });
+
+    // Pattern Angle
+    const patAngleSlider = this.container.querySelector('#ls-pat-angle');
+    const patAngleVal = this.container.querySelector('#ls-pat-angle-val');
+    patAngleSlider?.addEventListener('input', (ev) => {
+      const v = parseInt(ev.target.value, 10);
+      e.pattern.angle = v;
+      if (patAngleVal) patAngleVal.textContent = `${v}°`;
+      e.persistActivePresetSettings();
+      this.drawLivePreview();
+    });
+
+    // Reset button
+    this.container.querySelector('#ls-reset-btn')?.addEventListener('click', () => {
+      try {
+        localStorage.removeItem(`vectura_lasso_preset_${e.activePresetId}`);
+      } catch (_) {}
+      e.applyPreset(e.activePresetId, true);
+      this.render();
+    });
+  }
+
+  drawLivePreview() {
+    const canvas = document.getElementById('lasso-live-preview-canvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    const color = this.app?.vectorCanvas?.currentColor || '#6366f1';
+    const e = this.engine;
+
+    // Build a stylized demo polygon path with sharp and gentle corners
+    const pts = [
+      { x: 30, y: 45, isCritical: true },
+      { x: 75, y: 15, isCritical: false },
+      { x: 140, y: 22, isCritical: false },
+      { x: 210, y: 12, isCritical: true }, // Sharp corner
+      { x: 255, y: 50, isCritical: false },
+      { x: 220, y: 78, isCritical: false },
+      { x: 130, y: 72, isCritical: true }, // Sharp corner
+      { x: 55, y: 78, isCritical: false }
+    ];
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) {
+      ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.closePath();
+
+    if (e.fillMode === 'pattern') {
+      ctx.clip();
+      const patCanvas = createPatternTileCanvas(e.pattern, color, 0.85);
+      if (patCanvas) {
+        const pat = ctx.createPattern(patCanvas, 'repeat');
+        if (pat) {
+          if (e.pattern.angle && typeof DOMMatrix !== 'undefined') {
+            try {
+              pat.setTransform(new DOMMatrix().rotate(e.pattern.angle));
+            } catch (_) {}
+          }
+          ctx.fillStyle = pat;
+          ctx.fillRect(0, 0, w, h);
+        }
+      }
+    } else {
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.85;
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // Outline and vertex indicators
+    ctx.save();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.closePath();
+    ctx.stroke();
+
+    ctx.setLineDash([]);
+    for (const p of pts) {
+      ctx.beginPath();
+      if (p.isCritical) {
+        ctx.fillStyle = '#ffffff';
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = color;
+        ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+}
+
 /* --- ToolPanel.js --- */
 /**
  * Vectura Tool Options Strip Manager (44px contextual strip)
@@ -10682,7 +10004,7 @@ class ToolPanel {
           gapBtn.classList.toggle('accent', fb.gapClose);
         }
       });
-    } else if (tool === 'select' || tool === 'selection' || tool === 'lasso-fill') {
+    } else if (tool === 'select' || tool === 'selection') {
       this.container.innerHTML = `
         <div class="strip-item" style="display: flex; align-items: center; gap: 6px; width: 100%;">
           <button id="strip-sel-add" class="btn-text accent" style="min-height: 28px; padding: 2px 8px; font-size: var(--text-secondary);">Add</button>
@@ -10693,6 +10015,38 @@ class ToolPanel {
       `;
       this.container.querySelector('#strip-sel-inv')?.addEventListener('click', () => {
         tm.selectionTool?.invert();
+      });
+    } else if (tool === 'lasso-fill') {
+      const lf = tm.lassoFill;
+      const curPreset = lf?.presets?.find(p => p.id === lf.activePresetId);
+      const presetName = curPreset?.name || 'Precise';
+      const isPattern = lf?.fillMode === 'pattern';
+      this.container.innerHTML = `
+        <div class="strip-item" style="display: flex; align-items: center; gap: 8px; width: 100%; overflow-x: auto;">
+          <span style="font-weight: 600; font-size: var(--text-body); color: var(--text);">Lasso</span>
+          <button id="strip-lasso-brush-btn" class="btn-text accent" style="min-height: 28px; padding: 2px 10px; font-size: 11px; white-space: nowrap;">
+            ${presetName}
+          </button>
+          <button id="strip-lasso-mode-btn" class="btn-text" style="min-height: 28px; padding: 2px 8px; font-size: 11px; white-space: nowrap;">
+            ${isPattern ? 'Pattern: ' + (lf.pattern?.type || 'dots') : 'Solid Color'}
+          </button>
+          <button id="strip-lasso-studio-btn" class="btn-text" style="min-height: 28px; padding: 2px 8px; font-size: 11px; white-space: nowrap;">
+            Lasso Studio ⚙
+          </button>
+        </div>
+      `;
+      this.container.querySelector('#strip-lasso-brush-btn')?.addEventListener('click', () => {
+        this.app?.uiManager?.toggleSheet('lasso');
+      });
+      this.container.querySelector('#strip-lasso-mode-btn')?.addEventListener('click', () => {
+        if (lf) {
+          lf.fillMode = lf.fillMode === 'pattern' ? 'color' : 'pattern';
+          lf.persistActivePresetSettings();
+          this.update('lasso-fill');
+        }
+      });
+      this.container.querySelector('#strip-lasso-studio-btn')?.addEventListener('click', () => {
+        this.app?.uiManager?.toggleSheet('lasso');
       });
     } else if (tool === 'smudge') {
       const sm = tm.smudgeTool;
@@ -11301,9 +10655,17 @@ class Tutorial {
 
 /* --- HomeScreen.js --- */
 /**
- * Vectura Projects Gallery & New Canvas Screen
- * Redesigned full-height modal list modeled on ibisPaint's "New canvas" screen
- * Classic Vectura light-gray UI, flat, no glow, zero animations, 1-tap instant canvas creation.
+ * Vectura Projects Gallery & Artwork Manager (HomeScreen.js)
+ * Upgraded Pinterest-style Masonry Board with:
+ * - Real aspect ratio cards in balanced 2-column masonry layout
+ * - Artwork Folders with 2x2 thumbnail previews and breadcrumb navigation
+ * - Card long-press action sheet: Open, Rename, Duplicate, Move to folder, Export, Delete
+ * - Multiple selection mode: Select all, Move, Delete, Export
+ * - Sorting (Newest, Oldest, Name A-Z, Name Z-A, Canvas Size)
+ * - Debounced search with empty states
+ * - Safe delete with confirmation dialog and 5-second Undo Toast
+ * - Lightweight, virtualized/lazy-loaded thumbnails (never loads full layer blobs)
+ * - Full-height ibisPaint-style "New canvas" modal integration
  */
 
 
@@ -11449,16 +10811,47 @@ function getDashedRatioIconHtml(w, h) {
   `;
 }
 
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 class HomeScreen {
-  constructor(storage, onOpenProject, onNewProject) {
+  constructor(storage, onOpenProject, onNewProject, onDeleteProject, app) {
     this.storage = storage;
     this.onOpenProject = onOpenProject;
     this.onNewProject = onNewProject;
+    this.onDeleteProject = onDeleteProject;
+    this.app = app;
 
     this.screenEl = document.getElementById('home-screen');
     this.projects = [];
+    this.folders = [];
+    this.currentFolderId = null; // null = root
 
-    // Load remembered custom size from localStorage safely
+    // Selection mode state
+    this.isSelectionMode = false;
+    this.selectedProjectIds = new Set();
+
+    // Sort & Search state
+    this.sortOption = localStorage.getItem('vectura_sort_option') || 'newest';
+    this.searchQuery = '';
+    this.searchDebounceTimer = null;
+
+    // Undo toast state
+    this.undoTimeout = null;
+    this.lastDeletedProjects = [];
+
+    // Long press timer
+    this.longPressTimer = null;
+    this.longPressStartPos = { x: 0, y: 0 };
+
+    // Remembered custom size
     const storedW = parseInt(localStorage.getItem('vectura_last_custom_w'), 10);
     const storedH = parseInt(localStorage.getItem('vectura_last_custom_h'), 10);
     this.lastCustomW = (storedW && storedW >= 1 && storedW <= 4096) ? storedW : 1080;
@@ -11469,28 +10862,174 @@ class HomeScreen {
 
   async init() {
     this.screenEl.innerHTML = `
+      <!-- 1. Gallery Header -->
       <header class="sheet-header" id="hs-header">
         <div class="hs-header-left">
-          <span class="hs-header-title">Artworks</span>
+          <!-- Back button when in folder -->
+          <button id="hs-back-btn" class="btn-icon hidden" title="Back to artworks" style="margin-right: 4px;">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+          </button>
+          
+          <!-- Breadcrumb navigation -->
+          <div class="hs-breadcrumb-container">
+            <span class="hs-breadcrumb-item active" id="hs-crumb-root">Artworks</span>
+            <span class="hs-breadcrumb-sep hidden" id="hs-crumb-sep">/</span>
+            <span class="hs-breadcrumb-item hidden" id="hs-crumb-folder"></span>
+          </div>
+
           <span id="hs-count-badge" class="hs-header-badge">0</span>
         </div>
+
         <div class="hs-header-right">
+          <!-- Selection toggle button -->
+          <button id="hs-select-toggle" class="btn-icon" title="Select multiple" aria-label="Select artworks">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+          </button>
+
+          <!-- New Folder button -->
+          <button id="hs-new-folder-btn" class="btn-icon" title="New Folder">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
+          </button>
+
+          <!-- New Canvas CTA button -->
           <button id="hs-new-btn" class="btn-text accent" style="font-size: 13px; font-weight: 600; min-height: 36px; padding: 6px 14px; border-radius: 8px; box-shadow: none;">
             + New Canvas
           </button>
+
+          <!-- Return to current open canvas button -->
           <button id="hs-close-gallery" class="btn-icon" title="Return to canvas">
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
         </div>
       </header>
 
-      <!-- Projects Grid -->
-      <div class="gallery-grid" id="hs-gallery-grid"></div>
+      <!-- Selection Mode Header Bar (replaces standard header during selection mode) -->
+      <div id="hs-selection-header" class="hidden">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <button id="hs-selection-cancel" class="btn-text" style="padding: 6px 12px; font-size: 13px;">Cancel</button>
+          <span id="hs-selection-count" style="font-weight: 600; font-size: 14px; color: var(--text);">0 selected</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <button id="hs-selection-all" class="btn-text" style="padding: 6px 12px; font-size: 13px;">Select All</button>
+        </div>
+      </div>
 
-      <!-- Redesigned ibisPaint-style Full-Height Modal List -->
+      <!-- 2. Search & Sort Subheader -->
+      <div class="hs-toolbar-row">
+        <!-- Search bar -->
+        <div class="hs-search-box">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--text-3); flex-shrink: 0;"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="hs-search-input" placeholder="Search artworks..." autocomplete="off" />
+          <button id="hs-search-clear" class="btn-icon hidden" style="width: 24px; height: 24px; padding: 0; color: var(--text-3);" title="Clear search">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+
+        <!-- Sort selector -->
+        <div class="hs-sort-wrap">
+          <select id="hs-sort-select" class="hs-sort-dropdown" aria-label="Sort artworks">
+            <option value="newest">Newest first</option>
+            <option value="oldest">Oldest first</option>
+            <option value="name_asc">Name (A–Z)</option>
+            <option value="name_desc">Name (Z–A)</option>
+            <option value="size_desc">Canvas Size</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- 3. Pinterest-Style 2-Column Masonry Board -->
+      <div class="gallery-scroll-area" id="hs-gallery-scroll">
+        <!-- Folders Grid (shown if folders exist at current level) -->
+        <div id="hs-folders-grid" class="folders-grid"></div>
+
+        <!-- Balanced 2-Column Masonry for Artworks -->
+        <div id="hs-masonry-container" class="masonry-container">
+          <div class="masonry-column" id="masonry-col-0"></div>
+          <div class="masonry-column" id="masonry-col-1"></div>
+        </div>
+
+        <!-- Empty State Container -->
+        <div id="hs-empty-state" class="hidden"></div>
+      </div>
+
+      <!-- 4. Batch Actions Bar (Multiple Selection Mode) -->
+      <div id="hs-batch-bar" class="hs-batch-actions-bar hidden">
+        <button id="hs-batch-move" class="btn-text" style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+          <span>Move</span>
+        </button>
+        <div class="hs-batch-divider"></div>
+        <button id="hs-batch-export" class="btn-text" style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+          <span>Export</span>
+        </button>
+        <div class="hs-batch-divider"></div>
+        <button id="hs-batch-delete" class="btn-text" style="flex: 1; color: var(--danger); display: flex; align-items: center; justify-content: center; gap: 6px;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          <span>Delete</span>
+        </button>
+      </div>
+
+      <!-- 5. Long Press Actions Sheet Modal -->
+      <div id="hs-action-sheet-overlay" class="dialog-overlay">
+        <div class="hs-action-sheet-card">
+          <div class="hs-action-sheet-header">
+            <span id="hs-sheet-title" class="hs-sheet-artwork-title">Artwork Actions</span>
+            <button id="hs-sheet-close" class="btn-icon" style="width: 32px; height: 32px; padding: 0;">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            </button>
+          </div>
+          <div class="hs-sheet-actions-list">
+            <button class="hs-sheet-item" id="hs-action-open">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+              <span>Open in Canvas</span>
+            </button>
+            <button class="hs-sheet-item" id="hs-action-rename">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>
+              <span>Rename</span>
+            </button>
+            <button class="hs-sheet-item" id="hs-action-duplicate">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              <span>Duplicate</span>
+            </button>
+            <button class="hs-sheet-item" id="hs-action-move">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              <span>Move to Folder</span>
+            </button>
+            <button class="hs-sheet-item" id="hs-action-export">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+              <span>Export Artwork</span>
+            </button>
+            <button class="hs-sheet-item danger" id="hs-action-delete">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+              <span>Delete Artwork</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 6. Move to Folder Dialog -->
+      <div id="hs-move-modal" class="dialog-overlay">
+        <div class="dialog-card" style="max-width: 360px;">
+          <div class="dialog-header">
+            <span style="font-size: 16px; font-weight: 600;">Move to Folder</span>
+            <button id="hs-move-modal-close" class="btn-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            </button>
+          </div>
+          <div class="dialog-body" id="hs-move-folder-list" style="max-height: 280px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;"></div>
+        </div>
+      </div>
+
+      <!-- 7. Undo Floating Toast -->
+      <div id="hs-undo-toast" class="hs-undo-toast-wrap hidden">
+        <span id="hs-undo-message">Artwork deleted</span>
+        <button id="hs-undo-btn" class="hs-undo-action-btn">Undo</button>
+      </div>
+
+      <!-- 8. Redesigned ibisPaint-style Full-Height Modal List -->
       <div id="hs-modal" class="new-canvas-overlay">
         <div class="new-canvas-screen">
-          <!-- Top bar: Title "New" + X close button -->
           <div class="new-canvas-topbar">
             <span class="new-canvas-title">New</span>
             <button id="hs-modal-close" class="new-canvas-close-btn" aria-label="Close" title="Close">
@@ -11501,7 +11040,6 @@ class HomeScreen {
             </button>
           </div>
 
-          <!-- Single Scrollable List (~56px touch rows, thin dividers) -->
           <div class="new-canvas-list">
             <!-- Row: Folder -->
             <div class="new-canvas-row" id="nc-row-folder">
@@ -11512,7 +11050,7 @@ class HomeScreen {
               </div>
               <div class="new-canvas-row-title">Folder</div>
               <div style="color: var(--text-3); font-size: 13px; display: flex; align-items: center; gap: 4px; padding-right: 4px;">
-                <span>Artworks</span>
+                <span id="nc-folder-name-preview">Artworks</span>
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
               </div>
             </div>
@@ -11548,8 +11086,6 @@ class HomeScreen {
 
             <!-- Section: For Printing -->
             <div class="new-canvas-section-band">For Printing</div>
-
-            <!-- For Printing Presets -->
             ${PRINT_PRESETS.map(p => this.renderPresetRow(p)).join('')}
           </div>
         </div>
@@ -11614,7 +11150,7 @@ class HomeScreen {
   }
 
   setupEvents() {
-    // Open / Close modal
+    // 1. Header Buttons
     this.screenEl.querySelector('#hs-new-btn')?.addEventListener('click', () => {
       this.openModal();
     });
@@ -11624,17 +11160,165 @@ class HomeScreen {
     });
 
     this.screenEl.querySelector('#hs-close-gallery')?.addEventListener('click', () => {
-      this.hide();
+      if (!this.app.currentProject) {
+        this.openModal();
+      } else {
+        this.hide();
+      }
     });
 
-    // Row "Folder" -> opens project manager folder picker (reveals the artworks gallery)
-    this.screenEl.querySelector('#nc-row-folder')?.addEventListener('click', () => {
-      this.closeModal();
-      const grid = this.screenEl.querySelector('#hs-gallery-grid');
-      if (grid) grid.scrollTop = 0;
+    // Back button in folder
+    this.screenEl.querySelector('#hs-back-btn')?.addEventListener('click', () => {
+      this.navigateToFolder(null);
     });
 
-    // Custom Row Dimension Inputs
+    this.screenEl.querySelector('#hs-crumb-root')?.addEventListener('click', () => {
+      this.navigateToFolder(null);
+    });
+
+    // Create New Folder
+    this.screenEl.querySelector('#hs-new-folder-btn')?.addEventListener('click', () => {
+      this.promptCreateFolder();
+    });
+
+    // Toggle Multiple Selection Mode
+    this.screenEl.querySelector('#hs-select-toggle')?.addEventListener('click', () => {
+      this.toggleSelectionMode();
+    });
+
+    this.screenEl.querySelector('#hs-selection-cancel')?.addEventListener('click', () => {
+      this.exitSelectionMode();
+    });
+
+    this.screenEl.querySelector('#hs-selection-all')?.addEventListener('click', () => {
+      this.toggleSelectAll();
+    });
+
+    // Search Input with Debounce
+    const searchInput = this.screenEl.querySelector('#hs-search-input');
+    const searchClear = this.screenEl.querySelector('#hs-search-clear');
+    searchInput?.addEventListener('input', (e) => {
+      const q = e.target.value.trim();
+      searchClear?.classList.toggle('hidden', !q);
+      if (this.searchDebounceTimer) clearTimeout(this.searchDebounceTimer);
+      this.searchDebounceTimer = setTimeout(() => {
+        this.searchQuery = q.toLowerCase();
+        this.renderGalleryGrid();
+      }, 250);
+    });
+
+    searchClear?.addEventListener('click', () => {
+      if (searchInput) searchInput.value = '';
+      searchClear.classList.add('hidden');
+      this.searchQuery = '';
+      this.renderGalleryGrid();
+    });
+
+    // Sort Dropdown
+    const sortSelect = this.screenEl.querySelector('#hs-sort-select');
+    if (sortSelect) {
+      sortSelect.value = this.sortOption;
+      sortSelect.addEventListener('change', (e) => {
+        this.sortOption = e.target.value;
+        localStorage.setItem('vectura_sort_option', this.sortOption);
+        this.renderGalleryGrid();
+      });
+    }
+
+    // Batch Actions Bar (Move, Export, Delete)
+    this.screenEl.querySelector('#hs-batch-move')?.addEventListener('click', () => {
+      this.openBatchMoveDialog();
+    });
+
+    this.screenEl.querySelector('#hs-batch-export')?.addEventListener('click', () => {
+      this.executeBatchExport();
+    });
+
+    this.screenEl.querySelector('#hs-batch-delete')?.addEventListener('click', () => {
+      this.executeBatchDelete();
+    });
+
+    // Action Sheet Close
+    this.screenEl.querySelector('#hs-sheet-close')?.addEventListener('click', () => {
+      this.closeActionSheet();
+    });
+
+    this.screenEl.querySelector('#hs-action-sheet-overlay')?.addEventListener('click', (e) => {
+      if (e.target.id === 'hs-action-sheet-overlay') {
+        this.closeActionSheet();
+      }
+    });
+
+    // Move to folder dialog close
+    this.screenEl.querySelector('#hs-move-modal-close')?.addEventListener('click', () => {
+      this.closeMoveModal();
+    });
+
+    this.screenEl.querySelector('#hs-move-modal')?.addEventListener('click', (e) => {
+      if (e.target.id === 'hs-move-modal') {
+        this.closeMoveModal();
+      }
+    });
+
+    // Undo Toast Button
+    this.screenEl.querySelector('#hs-undo-btn')?.addEventListener('click', () => {
+      this.undoLastDelete();
+    });
+
+    // Action Sheet Options
+    this.screenEl.querySelector('#hs-action-open')?.addEventListener('click', () => {
+      if (this.activeActionProjectId) {
+        const id = this.activeActionProjectId;
+        this.closeActionSheet();
+        this.openProjectById(id);
+      }
+    });
+
+    this.screenEl.querySelector('#hs-action-rename')?.addEventListener('click', () => {
+      if (this.activeActionProjectId) {
+        const id = this.activeActionProjectId;
+        this.closeActionSheet();
+        this.promptRenameProject(id);
+      }
+    });
+
+    this.screenEl.querySelector('#hs-action-duplicate')?.addEventListener('click', async () => {
+      if (this.activeActionProjectId) {
+        const id = this.activeActionProjectId;
+        this.closeActionSheet();
+        await this.duplicateProject(id);
+      }
+    });
+
+    this.screenEl.querySelector('#hs-action-move')?.addEventListener('click', () => {
+      if (this.activeActionProjectId) {
+        const id = this.activeActionProjectId;
+        this.closeActionSheet();
+        this.openMoveDialog([id]);
+      }
+    });
+
+    this.screenEl.querySelector('#hs-action-export')?.addEventListener('click', async () => {
+      if (this.activeActionProjectId) {
+        const id = this.activeActionProjectId;
+        this.closeActionSheet();
+        await this.exportSingleProject(id);
+      }
+    });
+
+    this.screenEl.querySelector('#hs-action-delete')?.addEventListener('click', () => {
+      if (this.activeActionProjectId) {
+        const id = this.activeActionProjectId;
+        this.closeActionSheet();
+        this.confirmDeleteProjects([id]);
+      }
+    });
+
+    // New Canvas Modal Custom Dimensions Setup
+    this.setupNewCanvasModalEvents();
+  }
+
+  setupNewCanvasModalEvents() {
     const customWInput = this.screenEl.querySelector('#nc-custom-w');
     const customHInput = this.screenEl.querySelector('#nc-custom-h');
     const customIconSlot = this.screenEl.querySelector('#nc-custom-icon-slot');
@@ -11662,23 +11346,8 @@ class HomeScreen {
 
     customWInput?.addEventListener('change', updateCustomValues);
     customHInput?.addEventListener('change', updateCustomValues);
-    customWInput?.addEventListener('input', () => {
-      const w = Math.max(1, Math.min(4096, parseInt(customWInput.value, 10) || 1));
-      const h = Math.max(1, Math.min(4096, parseInt(customHInput.value, 10) || 1));
-      if (customIconSlot) customIconSlot.innerHTML = getDashedRatioIconHtml(w, h);
-    });
-    customHInput?.addEventListener('input', () => {
-      const w = Math.max(1, Math.min(4096, parseInt(customWInput.value, 10) || 1));
-      const h = Math.max(1, Math.min(4096, parseInt(customHInput.value, 10) || 1));
-      if (customIconSlot) customIconSlot.innerHTML = getDashedRatioIconHtml(w, h);
-    });
+    customInputsWrap?.addEventListener('click', (e) => e.stopPropagation());
 
-    // Prevent clicking inside inputs from triggering row click
-    customInputsWrap?.addEventListener('click', (e) => {
-      e.stopPropagation();
-    });
-
-    // Pencil button focuses width input for quick typing
     this.screenEl.querySelector('#nc-custom-pencil-btn')?.addEventListener('click', (e) => {
       e.stopPropagation();
       customWInput?.focus();
@@ -11686,16 +11355,10 @@ class HomeScreen {
     });
 
     const submitCustom = () => {
-      updateCustomValues();
-      this.createAndOpenProject(this.lastCustomW, this.lastCustomH);
+      let w = parseInt(customWInput?.value, 10) || this.lastCustomW;
+      let h = parseInt(customHInput?.value, 10) || this.lastCustomH;
+      this.createAndOpenProject(w, h);
     };
-
-    customWInput?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') submitCustom();
-    });
-    customHInput?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') submitCustom();
-    });
 
     this.screenEl.querySelector('#nc-custom-create-btn')?.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -11706,7 +11369,7 @@ class HomeScreen {
       submitCustom();
     });
 
-    // Preset rows and chevron toggle handlers
+    // Preset rows
     this.screenEl.querySelectorAll('.preset-item-row').forEach(row => {
       row.addEventListener('click', (e) => {
         const chevronBtn = e.target.closest('.new-canvas-chevron-btn');
@@ -11737,7 +11400,13 @@ class HomeScreen {
       });
     });
 
-    // Setup memory warning dialog actions
+    // Row "Folder" in New Canvas modal -> switch folder or reveals gallery
+    this.screenEl.querySelector('#nc-row-folder')?.addEventListener('click', () => {
+      this.closeModal();
+      this.renderGalleryGrid();
+    });
+
+    // Memory warning modal
     this.setupMemoryWarningEvents();
   }
 
@@ -11783,7 +11452,6 @@ class HomeScreen {
     w = Math.max(1, Math.min(4096, w));
     h = Math.max(1, Math.min(4096, h));
 
-    // Warn gently if canvas size exceeds device memory (~12.5 MP)
     if (w * h > 12500000) {
       this.showMemoryWarning(w, h);
       return;
@@ -11795,22 +11463,35 @@ class HomeScreen {
   doCreateProject(width, height) {
     this.closeModal();
     this.hide();
-    this.onNewProject?.({ width, height });
+    this.onNewProject?.({
+      width,
+      height,
+      folderId: this.currentFolderId
+    });
   }
 
   openModal() {
     const modal = this.screenEl.querySelector('#hs-modal');
     if (!modal) return;
 
-    // Refresh custom inputs with remembered size
     const customWInput = this.screenEl.querySelector('#nc-custom-w');
     const customHInput = this.screenEl.querySelector('#nc-custom-h');
     const customIconSlot = this.screenEl.querySelector('#nc-custom-icon-slot');
+    const folderPreview = this.screenEl.querySelector('#nc-folder-name-preview');
 
     if (customWInput) customWInput.value = this.lastCustomW;
     if (customHInput) customHInput.value = this.lastCustomH;
     if (customIconSlot) {
       customIconSlot.innerHTML = getDashedRatioIconHtml(this.lastCustomW, this.lastCustomH);
+    }
+
+    if (folderPreview) {
+      if (this.currentFolderId) {
+        const curFolder = this.folders.find(f => f.id === this.currentFolderId);
+        folderPreview.textContent = curFolder ? curFolder.name : 'Folder';
+      } else {
+        folderPreview.textContent = 'Artworks';
+      }
     }
 
     modal.classList.add('open');
@@ -11821,86 +11502,701 @@ class HomeScreen {
     if (modal) modal.classList.remove('open');
   }
 
-  async refresh() {
-    this.projects = await this.storage.getAllProjects();
-    const countBadge = this.screenEl.querySelector('#hs-count-badge');
-    if (countBadge) countBadge.textContent = this.projects.length;
+  // --- Folder Management ---
 
-    const grid = this.screenEl.querySelector('#hs-gallery-grid');
-    if (!grid) return;
+  navigateToFolder(folderId) {
+    this.currentFolderId = folderId;
+    this.exitSelectionMode();
 
-    if (this.projects.length === 0) {
-      grid.innerHTML = `
-        <div style="grid-column: 1 / -1; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 260px; color: var(--text-2); gap: 10px;">
-          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-          <span style="font-size: var(--text-body); font-weight: 500;">No saved artworks</span>
-          <button id="hs-first-new-btn" class="btn-text accent" style="margin-top: 6px;">+ Create canvas</button>
-        </div>
-      `;
-      grid.querySelector('#hs-first-new-btn')?.addEventListener('click', () => {
-        this.openModal();
-      });
-      return;
+    const backBtn = this.screenEl.querySelector('#hs-back-btn');
+    const sep = this.screenEl.querySelector('#hs-crumb-sep');
+    const folderCrumb = this.screenEl.querySelector('#hs-crumb-folder');
+    const rootCrumb = this.screenEl.querySelector('#hs-crumb-root');
+
+    if (folderId) {
+      const folder = this.folders.find(f => f.id === folderId);
+      backBtn?.classList.remove('hidden');
+      sep?.classList.remove('hidden');
+      if (folderCrumb) {
+        folderCrumb.textContent = folder ? folder.name : 'Folder';
+        folderCrumb.classList.remove('hidden');
+      }
+      rootCrumb?.classList.remove('active');
+    } else {
+      backBtn?.classList.add('hidden');
+      sep?.classList.add('hidden');
+      folderCrumb?.classList.add('hidden');
+      rootCrumb?.classList.add('active');
     }
 
-    grid.innerHTML = this.projects
-      .map(p => {
-        const safeName = (p.name || 'Untitled Artwork')
-          .replace(/&/g, '&amp;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;')
-          .replace(/"/g, '&quot;')
-          .replace(/'/g, '&#039;');
-        const thumbHtml = p.thumbnail
-          ? `<div class="gallery-card-thumb-wrap">
-              <img class="gallery-card-thumb" src="${p.thumbnail}" alt="${safeName}" />
-            </div>`
-          : `<div class="gallery-card-thumb-wrap">
-              <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color: var(--text-3);">
-                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-                <circle cx="8.5" cy="8.5" r="1.5"/>
-                <polyline points="21 15 16 10 5 21"/>
-              </svg>
-            </div>`;
-        return `
-        <div class="gallery-card" data-id="${p.id}">
-          ${thumbHtml}
-          <div class="gallery-card-info">
-            <div class="gallery-card-title-row">
-              <span class="gallery-card-title">${safeName}</span>
-              <button class="btn-icon hs-del-btn" data-id="${p.id}" style="width: 26px; height: 26px; min-width: 26px; color: var(--danger); padding: 0;" title="Delete">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    this.renderGalleryGrid();
+  }
+
+  async promptCreateFolder() {
+    const name = prompt('New Folder Name:', 'Untitled Folder');
+    if (!name || !name.trim()) return;
+
+    const newFolder = {
+      id: 'folder_' + Date.now() + '_' + Math.floor(Math.random() * 1000),
+      name: name.trim(),
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+
+    await this.storage.saveFolder(newFolder);
+    await this.refresh();
+  }
+
+  async promptRenameFolder(folderId) {
+    const folder = this.folders.find(f => f.id === folderId);
+    if (!folder) return;
+
+    const newName = prompt('Rename Folder:', folder.name);
+    if (!newName || !newName.trim() || newName.trim() === folder.name) return;
+
+    await this.storage.renameFolder(folderId, newName.trim());
+    await this.refresh();
+  }
+
+  async confirmDeleteFolder(folderId) {
+    const folder = this.folders.find(f => f.id === folderId);
+    if (!folder) return;
+
+    const count = this.projects.filter(p => p.folderId === folderId).length;
+    const msg = count > 0
+      ? `Delete folder "${folder.name}"? The ${count} artwork(s) inside will be kept in Artworks.`
+      : `Delete empty folder "${folder.name}"?`;
+
+    if (confirm(msg)) {
+      await this.storage.deleteFolder(folderId);
+      if (this.currentFolderId === folderId) {
+        this.navigateToFolder(null);
+      } else {
+        await this.refresh();
+      }
+      this.showToast(`Folder "${folder.name}" deleted`);
+    }
+  }
+
+  // --- Multiple Selection Mode ---
+
+  toggleSelectionMode() {
+    if (this.isSelectionMode) {
+      this.exitSelectionMode();
+    } else {
+      this.enterSelectionMode();
+    }
+  }
+
+  enterSelectionMode() {
+    this.isSelectionMode = true;
+    this.selectedProjectIds.clear();
+
+    this.screenEl.querySelector('#hs-header')?.classList.add('hidden');
+    this.screenEl.querySelector('#hs-selection-header')?.classList.remove('hidden');
+    this.screenEl.querySelector('#hs-batch-bar')?.classList.remove('hidden');
+
+    this.updateSelectionUI();
+    this.renderGalleryGrid();
+  }
+
+  exitSelectionMode() {
+    this.isSelectionMode = false;
+    this.selectedProjectIds.clear();
+
+    this.screenEl.querySelector('#hs-header')?.classList.remove('hidden');
+    this.screenEl.querySelector('#hs-selection-header')?.classList.add('hidden');
+    this.screenEl.querySelector('#hs-batch-bar')?.classList.add('hidden');
+
+    this.renderGalleryGrid();
+  }
+
+  toggleSelectProject(id) {
+    if (this.selectedProjectIds.has(id)) {
+      this.selectedProjectIds.delete(id);
+    } else {
+      this.selectedProjectIds.add(id);
+    }
+    this.updateSelectionUI();
+  }
+
+  toggleSelectAll() {
+    const currentList = this.getFilteredProjects();
+    if (this.selectedProjectIds.size === currentList.length) {
+      this.selectedProjectIds.clear();
+    } else {
+      currentList.forEach(p => this.selectedProjectIds.add(p.id));
+    }
+    this.updateSelectionUI();
+    this.renderGalleryGrid();
+  }
+
+  updateSelectionUI() {
+    const countEl = this.screenEl.querySelector('#hs-selection-count');
+    if (countEl) {
+      countEl.textContent = `${this.selectedProjectIds.size} selected`;
+    }
+
+    const selectAllBtn = this.screenEl.querySelector('#hs-selection-all');
+    const currentList = this.getFilteredProjects();
+    if (selectAllBtn) {
+      selectAllBtn.textContent = (this.selectedProjectIds.size > 0 && this.selectedProjectIds.size === currentList.length)
+        ? 'Deselect All'
+        : 'Select All';
+    }
+
+    // Toggle card selected visual class
+    this.screenEl.querySelectorAll('.gallery-card').forEach(card => {
+      const id = card.dataset.id;
+      const isSel = this.selectedProjectIds.has(id);
+      card.classList.toggle('selected', isSel);
+      const chk = card.querySelector('.gallery-card-checkbox');
+      if (chk) {
+        chk.classList.toggle('checked', isSel);
+        chk.innerHTML = isSel
+          ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>`
+          : '';
+      }
+    });
+  }
+
+  // --- Project Actions: Duplicate, Rename, Move, Export, Delete ---
+
+  async openProjectById(id) {
+    const project = await this.storage.getProject(id);
+    if (project) {
+      this.hide();
+      this.onOpenProject?.(project);
+    }
+  }
+
+  async promptRenameProject(id) {
+    const project = this.projects.find(p => p.id === id);
+    if (!project) return;
+
+    const newName = prompt('Rename Artwork:', project.name);
+    if (!newName || !newName.trim() || newName.trim() === project.name) return;
+
+    await this.storage.updateProjectMetadata(id, { name: newName.trim(), updatedAt: Date.now() });
+    await this.refresh();
+  }
+
+  async duplicateProject(id) {
+    const copy = await this.storage.duplicateProject(id);
+    if (copy) {
+      await this.refresh();
+      this.showToast('Artwork duplicated');
+    }
+  }
+
+  openActionSheet(projectId, projectTitle) {
+    this.activeActionProjectId = projectId;
+    const titleEl = this.screenEl.querySelector('#hs-sheet-title');
+    if (titleEl) titleEl.textContent = projectTitle || 'Artwork Actions';
+    this.screenEl.querySelector('#hs-action-sheet-overlay')?.classList.add('open');
+  }
+
+  closeActionSheet() {
+    this.activeActionProjectId = null;
+    this.screenEl.querySelector('#hs-action-sheet-overlay')?.classList.remove('open');
+  }
+
+  // --- Move to Folder ---
+
+  openMoveDialog(projectIds) {
+    this.pendingMoveProjectIds = projectIds;
+    const listEl = this.screenEl.querySelector('#hs-move-folder-list');
+    if (!listEl) return;
+
+    const items = [
+      { id: null, name: 'Root (Artworks)' },
+      ...this.folders
+    ];
+
+    listEl.innerHTML = items.map(f => `
+      <button class="btn-text hs-move-dest-btn" data-folder-id="${f.id || ''}" style="width: 100%; text-align: left; padding: 12px; display: flex; align-items: center; gap: 10px; border-radius: var(--radius-sm); background: var(--control);">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        <span style="flex: 1; font-weight: 500;">${escapeHtml(f.name)}</span>
+      </button>
+    `).join('');
+
+    listEl.querySelectorAll('.hs-move-dest-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const destFolderId = btn.dataset.folderId || null;
+        await this.executeMoveProjects(this.pendingMoveProjectIds, destFolderId);
+        this.closeMoveModal();
+      });
+    });
+
+    this.screenEl.querySelector('#hs-move-modal')?.classList.add('open');
+  }
+
+  closeMoveModal() {
+    this.pendingMoveProjectIds = null;
+    this.screenEl.querySelector('#hs-move-modal')?.classList.remove('open');
+  }
+
+  async executeMoveProjects(projectIds, destFolderId) {
+    if (!projectIds || projectIds.length === 0) return;
+    for (const id of projectIds) {
+      await this.storage.updateProjectMetadata(id, { folderId: destFolderId, updatedAt: Date.now() });
+    }
+    await this.refresh();
+    const destName = destFolderId ? (this.folders.find(f => f.id === destFolderId)?.name || 'folder') : 'Artworks';
+    this.showToast(`Moved ${projectIds.length} artwork(s) to ${destName}`);
+    if (this.isSelectionMode) this.exitSelectionMode();
+  }
+
+  openBatchMoveDialog() {
+    if (this.selectedProjectIds.size === 0) {
+      this.showToast('No artworks selected');
+      return;
+    }
+    this.openMoveDialog(Array.from(this.selectedProjectIds));
+  }
+
+  // --- Single & Batch Export ---
+
+  async exportSingleProject(id) {
+    const project = await this.storage.getProject(id);
+    if (!project) return;
+
+    if (this.app?.exporter && window.AndroidBridge) {
+      const filename = `${(project.name || 'artwork').replace(/[^a-zA-Z0-9_-]/g, '_')}.png`;
+      if (project.thumbnail) {
+        await this.app.exporter.shareOrDownload(project.thumbnail, filename, 'image/png');
+        return;
+      }
+    }
+    // Fallback: open project to export
+    this.openProjectById(id);
+  }
+
+  async executeBatchExport() {
+    if (this.selectedProjectIds.size === 0) {
+      this.showToast('No artworks selected');
+      return;
+    }
+    const ids = Array.from(this.selectedProjectIds);
+    this.showToast(`Exporting ${ids.length} artwork(s)...`);
+
+    for (const id of ids) {
+      const p = await this.storage.getProject(id);
+      if (p && p.thumbnail && this.app?.exporter) {
+        const filename = `${(p.name || 'artwork').replace(/[^a-zA-Z0-9_-]/g, '_')}.png`;
+        await this.app.exporter.shareOrDownload(p.thumbnail, filename, 'image/png');
+      }
+    }
+    this.exitSelectionMode();
+  }
+
+  // --- Safe Delete with Confirm and Undo Toast ---
+
+  confirmDeleteProjects(ids) {
+    if (!ids || ids.length === 0) return;
+    const msg = ids.length === 1
+      ? 'Delete this artwork?'
+      : `Delete ${ids.length} selected artworks?`;
+
+    if (confirm(msg)) {
+      this.deleteProjectsWithUndo(ids);
+    }
+  }
+
+  executeBatchDelete() {
+    if (this.selectedProjectIds.size === 0) {
+      this.showToast('No artworks selected');
+      return;
+    }
+    this.confirmDeleteProjects(Array.from(this.selectedProjectIds));
+  }
+
+  async deleteProjectsWithUndo(ids) {
+    this.lastDeletedProjects = [];
+
+    // Backup projects in memory before deleting so user can Undo
+    for (const id of ids) {
+      const p = await this.storage.getProject(id);
+      if (p) this.lastDeletedProjects.push(p);
+
+      if (this.onDeleteProject) {
+        await this.onDeleteProject(id);
+      } else {
+        await this.storage.deleteProject(id);
+      }
+    }
+
+    if (this.isSelectionMode) this.exitSelectionMode();
+    await this.refresh();
+
+    // Show floating undo toast
+    this.showUndoToast(ids.length);
+  }
+
+  showUndoToast(count) {
+    const toast = this.screenEl.querySelector('#hs-undo-toast');
+    const msg = this.screenEl.querySelector('#hs-undo-message');
+    if (!toast || !msg) return;
+
+    msg.textContent = count === 1 ? 'Artwork deleted' : `${count} artworks deleted`;
+    toast.classList.remove('hidden');
+
+    if (this.undoTimeout) clearTimeout(this.undoTimeout);
+    this.undoTimeout = setTimeout(() => {
+      toast.classList.add('hidden');
+      this.lastDeletedProjects = [];
+    }, 5000);
+  }
+
+  async undoLastDelete() {
+    if (this.undoTimeout) clearTimeout(this.undoTimeout);
+    this.screenEl.querySelector('#hs-undo-toast')?.classList.add('hidden');
+
+    if (this.lastDeletedProjects && this.lastDeletedProjects.length > 0) {
+      for (const p of this.lastDeletedProjects) {
+        await this.storage.saveProject(p);
+      }
+      this.lastDeletedProjects = [];
+      await this.refresh();
+      this.showToast('Artwork(s) restored');
+    }
+  }
+
+  showToast(message) {
+    if (this.app?.showToast) {
+      this.app.showToast(message);
+    } else {
+      console.log('Toast:', message);
+    }
+  }
+
+  // --- Filtering and Sorting ---
+
+  getFilteredProjects() {
+    let list = this.projects.filter(p => {
+      if (this.currentFolderId) {
+        return p.folderId === this.currentFolderId;
+      }
+      return !p.folderId; // Root artworks only
+    });
+
+    if (this.searchQuery) {
+      list = list.filter(p => (p.name || '').toLowerCase().includes(this.searchQuery));
+    }
+
+    switch (this.sortOption) {
+      case 'oldest':
+        list.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+        break;
+      case 'name_asc':
+        list.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        break;
+      case 'name_desc':
+        list.sort((a, b) => (b.name || '').localeCompare(a.name || ''));
+        break;
+      case 'size_desc':
+        list.sort((a, b) => (b.width * b.height) - (a.width * a.height));
+        break;
+      case 'newest':
+      default:
+        list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        break;
+    }
+
+    return list;
+  }
+
+  getFilteredFolders() {
+    if (this.currentFolderId) {
+      return []; // Only root supports top-level folders
+    }
+    let list = [...this.folders];
+    if (this.searchQuery) {
+      list = list.filter(f => f.name.toLowerCase().includes(this.searchQuery));
+    }
+    list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    return list;
+  }
+
+  // --- Refresh and Render ---
+
+  async refresh() {
+    this.projects = await this.storage.getAllProjectHeaders();
+    this.folders = await this.storage.getAllFolders();
+
+    const countBadge = this.screenEl.querySelector('#hs-count-badge');
+    if (countBadge) {
+      const curList = this.getFilteredProjects();
+      countBadge.textContent = curList.length;
+    }
+
+    this.renderGalleryGrid();
+  }
+
+  renderGalleryGrid() {
+    const foldersGrid = this.screenEl.querySelector('#hs-folders-grid');
+    const col0 = this.screenEl.querySelector('#masonry-col-0');
+    const col1 = this.screenEl.querySelector('#masonry-col-1');
+    const emptyState = this.screenEl.querySelector('#hs-empty-state');
+    if (!col0 || !col1) return;
+
+    col0.innerHTML = '';
+    col1.innerHTML = '';
+    if (foldersGrid) foldersGrid.innerHTML = '';
+
+    const currentFolders = this.getFilteredFolders();
+    const currentProjects = this.getFilteredProjects();
+
+    const countBadge = this.screenEl.querySelector('#hs-count-badge');
+    if (countBadge) countBadge.textContent = currentProjects.length;
+
+    // 1. Render Folders (only in root)
+    if (foldersGrid) {
+      if (currentFolders.length > 0) {
+        foldersGrid.classList.remove('hidden');
+        foldersGrid.innerHTML = currentFolders.map(folder => {
+          // Find up to 4 preview thumbnails of projects in this folder
+          const folderProjects = this.projects.filter(p => p.folderId === folder.id);
+          const previewThumbs = folderProjects.slice(0, 4).map(p => p.thumbnail).filter(Boolean);
+
+          let previewGridHtml = '';
+          if (previewThumbs.length > 0) {
+            previewGridHtml = `
+              <div class="folder-thumb-preview-grid">
+                ${[0, 1, 2, 3].map(idx => {
+                  const src = previewThumbs[idx];
+                  return src
+                    ? `<img class="folder-thumb-mini" src="${src}" alt="" loading="lazy" />`
+                    : `<div class="folder-thumb-mini-empty"></div>`;
+                }).join('')}
+              </div>
+            `;
+          } else {
+            previewGridHtml = `
+              <div class="folder-thumb-empty-icon">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              </div>
+            `;
+          }
+
+          return `
+            <div class="folder-card" data-folder-id="${folder.id}">
+              ${previewGridHtml}
+              <div class="folder-card-meta">
+                <span class="folder-card-title">${escapeHtml(folder.name)}</span>
+                <span class="folder-card-count">${folderProjects.length} artwork${folderProjects.length === 1 ? '' : 's'}</span>
+              </div>
+              <button class="btn-icon folder-card-menu-btn" data-folder-id="${folder.id}" title="Folder options">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/><circle cx="5" cy="12" r="1.5"/></svg>
               </button>
             </div>
-            <span class="gallery-card-meta tabular">${new Date(p.updatedAt).toLocaleDateString()} · ${p.width} × ${p.height}</span>
-          </div>
+          `;
+        }).join('');
+
+        // Wire folder click & context menu
+        foldersGrid.querySelectorAll('.folder-card').forEach(card => {
+          card.addEventListener('click', (e) => {
+            if (e.target.closest('.folder-card-menu-btn')) return;
+            const folderId = card.dataset.folderId;
+            this.navigateToFolder(folderId);
+          });
+        });
+
+        foldersGrid.querySelectorAll('.folder-card-menu-btn').forEach(btn => {
+          btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const folderId = btn.dataset.folderId;
+            const folder = this.folders.find(f => f.id === folderId);
+            if (!folder) return;
+
+            const choice = prompt(`Folder "${folder.name}":\n1. Rename\n2. Delete\nEnter 1 or 2:`, '1');
+            if (choice === '1') {
+              this.promptRenameFolder(folderId);
+            } else if (choice === '2') {
+              this.confirmDeleteFolder(folderId);
+            }
+          });
+        });
+      } else {
+        foldersGrid.classList.add('hidden');
+      }
+    }
+
+    // 2. Empty State Check
+    if (currentProjects.length === 0 && currentFolders.length === 0) {
+      if (emptyState) {
+        emptyState.classList.remove('hidden');
+        if (this.searchQuery) {
+          emptyState.innerHTML = `
+            <div class="hs-empty-box">
+              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+              <span style="font-weight: 600; font-size: 15px;">No results found</span>
+              <span style="font-size: 12px; color: var(--text-2);">No artworks match "${escapeHtml(this.searchQuery)}"</span>
+            </div>
+          `;
+        } else if (this.currentFolderId) {
+          emptyState.innerHTML = `
+            <div class="hs-empty-box">
+              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              <span style="font-weight: 600; font-size: 15px;">This folder is empty</span>
+              <button id="hs-empty-folder-new-btn" class="btn-text accent" style="margin-top: 8px;">+ New Canvas in Folder</button>
+            </div>
+          `;
+          emptyState.querySelector('#hs-empty-folder-new-btn')?.addEventListener('click', () => {
+            this.openModal();
+          });
+        } else {
+          emptyState.innerHTML = `
+            <div class="hs-empty-box">
+              <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+              <span style="font-weight: 600; font-size: 16px;">No saved artworks</span>
+              <span style="font-size: 13px; color: var(--text-2);">Create your first masterpiece</span>
+              <button id="hs-empty-first-new-btn" class="btn-text accent" style="margin-top: 10px; font-weight: 600; min-height: 40px; padding: 8px 18px; border-radius: 8px;">+ Create Canvas</button>
+            </div>
+          `;
+          emptyState.querySelector('#hs-empty-first-new-btn')?.addEventListener('click', () => {
+            this.openModal();
+          });
+        }
+      }
+      return;
+    } else {
+      emptyState?.classList.add('hidden');
+    }
+
+    // 3. Pinterest-Style Balanced 2-Column Masonry Placement
+    let heightCol0 = 0;
+    let heightCol1 = 0;
+
+    currentProjects.forEach(p => {
+      const w = p.width || 1080;
+      const h = p.height || 1080;
+      // Clamp aspect ratio to avoid excessively tall/narrow cards
+      const rawRatio = w / h;
+      const clampedRatio = Math.max(0.45, Math.min(2.2, rawRatio));
+      const cardEstimatedHeight = (1 / clampedRatio) + 0.35; // card image aspect height + meta row
+
+      // Target column with smaller cumulative height
+      const targetCol = heightCol0 <= heightCol1 ? col0 : col1;
+      if (heightCol0 <= heightCol1) {
+        heightCol0 += cardEstimatedHeight;
+      } else {
+        heightCol1 += cardEstimatedHeight;
+      }
+
+      const cardEl = this.createArtworkCardElement(p, clampedRatio);
+      targetCol.appendChild(cardEl);
+    });
+  }
+
+  createArtworkCardElement(p, clampedRatio) {
+    const card = document.createElement('div');
+    card.className = 'gallery-card';
+    card.dataset.id = p.id;
+    if (this.selectedProjectIds.has(p.id)) {
+      card.classList.add('selected');
+    }
+
+    const safeName = escapeHtml(p.name || 'Untitled Artwork');
+    const mp = ((p.width * p.height) / 1000000).toFixed(1);
+    const dateStr = new Date(p.updatedAt || p.createdAt || Date.now()).toLocaleDateString();
+
+    const isSelected = this.selectedProjectIds.has(p.id);
+
+    const thumbHtml = p.thumbnail
+      ? `<img class="gallery-card-thumb" src="${p.thumbnail}" alt="${safeName}" loading="lazy" />`
+      : `<div class="gallery-card-thumb-empty">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+        </div>`;
+
+    card.innerHTML = `
+      <div class="gallery-card-thumb-wrap" style="aspect-ratio: ${clampedRatio};">
+        ${thumbHtml}
+        <!-- Selection checkbox circle (shown in selection mode or on hover/touch) -->
+        <div class="gallery-card-checkbox ${isSelected ? 'checked' : ''} ${this.isSelectionMode ? 'visible' : ''}">
+          ${isSelected ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>` : ''}
         </div>
-      `;
-      })
-      .join('');
+      </div>
+      <div class="gallery-card-info">
+        <div class="gallery-card-title-row">
+          <span class="gallery-card-title" title="${safeName}">${safeName}</span>
+          <button class="btn-icon hs-card-menu-btn" data-id="${p.id}" title="Artwork options">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/><circle cx="5" cy="12" r="1.5"/></svg>
+          </button>
+        </div>
+        <div class="gallery-card-meta">
+          <span>${dateStr}</span>
+          <span>·</span>
+          <span>${p.width}×${p.height}</span>
+        </div>
+      </div>
+    `;
 
-    grid.querySelectorAll('.gallery-card').forEach(card => {
-      card.addEventListener('click', (e) => {
-        if (e.target.closest('.hs-del-btn')) return;
-        const id = card.dataset.id;
-        const project = this.projects.find(p => p.id === id);
-        if (project) {
-          this.hide();
-          this.onOpenProject?.(project);
-        }
-      });
+    // Click handler
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('.hs-card-menu-btn')) return;
+
+      if (this.isSelectionMode) {
+        this.toggleSelectProject(p.id);
+      } else {
+        this.openProjectById(p.id);
+      }
     });
 
-    grid.querySelectorAll('.hs-del-btn').forEach(btn => {
-      btn.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        const id = btn.dataset.id;
-        if (confirm('Delete this artwork?')) {
-          await this.storage.deleteProject(id);
-          await this.refresh();
-        }
-      });
+    // 3-dots Card Menu Button
+    card.querySelector('.hs-card-menu-btn')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.openActionSheet(p.id, p.name);
     });
+
+    // Long press support (opens actions sheet, or initiates selection mode)
+    const handleTouchStart = (e) => {
+      if (this.isSelectionMode) return;
+      const t = e.touches ? e.touches[0] : e;
+      this.longPressStartPos = { x: t.clientX, y: t.clientY };
+
+      this.longPressTimer = setTimeout(() => {
+        if (this.app?.triggerHaptic) this.app.triggerHaptic();
+        this.openActionSheet(p.id, p.name);
+      }, 500);
+    };
+
+    const handleTouchMove = (e) => {
+      if (!this.longPressTimer) return;
+      const t = e.touches ? e.touches[0] : e;
+      const dx = Math.abs(t.clientX - this.longPressStartPos.x);
+      const dy = Math.abs(t.clientY - this.longPressStartPos.y);
+      if (dx > 10 || dy > 10) {
+        clearTimeout(this.longPressTimer);
+        this.longPressTimer = null;
+      }
+    };
+
+    const handleTouchEnd = () => {
+      if (this.longPressTimer) {
+        clearTimeout(this.longPressTimer);
+        this.longPressTimer = null;
+      }
+    };
+
+    card.addEventListener('touchstart', handleTouchStart, { passive: true });
+    card.addEventListener('touchmove', handleTouchMove, { passive: true });
+    card.addEventListener('touchend', handleTouchEnd);
+    card.addEventListener('touchcancel', handleTouchEnd);
+
+    // Mouse long press fallback
+    card.addEventListener('mousedown', (e) => {
+      if (e.button !== 0 || this.isSelectionMode) return;
+      this.longPressStartPos = { x: e.clientX, y: e.clientY };
+      this.longPressTimer = setTimeout(() => {
+        this.openActionSheet(p.id, p.name);
+      }, 500);
+    });
+    card.addEventListener('mousemove', handleTouchMove);
+    card.addEventListener('mouseup', handleTouchEnd);
+    card.addEventListener('mouseleave', handleTouchEnd);
+
+    return card;
   }
 
   show() {
@@ -11910,6 +12206,41 @@ class HomeScreen {
 
   hide() {
     this.screenEl.classList.add('hidden');
+    this.closeActionSheet();
+    this.closeMoveModal();
+    this.exitSelectionMode();
+  }
+
+  handleBack() {
+    const modal = this.screenEl.querySelector('#hs-modal');
+    if (modal && modal.classList.contains('open')) {
+      this.closeModal();
+      return true;
+    }
+    const memWarn = this.screenEl.querySelector('#nc-memory-warning');
+    if (memWarn && memWarn.classList.contains('open')) {
+      memWarn.classList.remove('open');
+      return true;
+    }
+    const actionSheet = this.screenEl.querySelector('#hs-action-sheet-overlay');
+    if (actionSheet && actionSheet.classList.contains('open')) {
+      this.closeActionSheet();
+      return true;
+    }
+    const moveModal = this.screenEl.querySelector('#hs-move-modal');
+    if (moveModal && moveModal.classList.contains('open')) {
+      this.closeMoveModal();
+      return true;
+    }
+    if (this.isSelectionMode) {
+      this.exitSelectionMode();
+      return true;
+    }
+    if (this.currentFolderId) {
+      this.navigateToFolder(null);
+      return true;
+    }
+    return false;
   }
 }
 
@@ -11925,6 +12256,7 @@ class HomeScreen {
  * - 56px bottom toolbar with 8 equal items.
  * - Non-modal bottom sheets (Brush, Colour, Layers) with 4x32 drag handles.
  */
+
 
 
 
@@ -12019,6 +12351,7 @@ class UIManager {
     // Bottom Sheets
     this.sheetLayers = document.getElementById('sheet-layers');
     this.sheetBrushes = document.getElementById('sheet-brushes');
+    this.sheetLasso = document.getElementById('sheet-lasso');
     this.sheetColor = document.getElementById('sheet-color');
 
     // Modals
@@ -12068,12 +12401,23 @@ class UIManager {
       this.vc.currentBrush,
       (brush) => {
         this.vc.currentBrush = brush;
-        this.updateEdgeSlidersFromBrush();
+        this.updateEdgeSliders();
         if (this.toolPanel) {
           this.toolPanel.render();
         }
       },
       this.vc.currentColor
+    );
+    if (this.brushPanel.currentBrush) {
+      this.vc.currentBrush = this.brushPanel.currentBrush;
+    }
+    this.setupEraserMenuEvents();
+
+    // 3b. Lasso Studio Panel
+    this.lassoPanel = new LassoPanel(
+      document.getElementById('sheet-lasso-content'),
+      this.vc.toolManager.lassoFill,
+      this.app
     );
 
     // 4. Tool Options Strip Panel
@@ -12171,13 +12515,33 @@ class UIManager {
       this.hideChips();
     });
 
-    // Close more menu & shapes popover when tapping outside
+    document.getElementById('menu-btn-clear-canvas')?.addEventListener('click', () => {
+      this.closeMoreMenu();
+      const active = this.vc.layerManager.getActiveLayer();
+      if (active && !active.locked) {
+        this.layerPanel.executeLayerOp('Clear Layer', () => {
+          active.ctx.clearRect(0, 0, active.width, active.height);
+          active.updateThumbnail();
+        }, true);
+      }
+    });
+
+    document.getElementById('menu-btn-new-artwork')?.addEventListener('click', () => {
+      this.closeMoreMenu();
+      this.app?.homeScreen?.show();
+      this.app?.homeScreen?.openModal();
+    });
+
+    // Close more menu, shapes popover & eraser popover when tapping outside
     window.addEventListener('pointerdown', (e) => {
       if (!e.target.closest('#more-menu-popover, #btn-more-menu')) {
         this.closeMoreMenu();
       }
       if (!e.target.closest('#shapes-popover-menu, #top-btn-shapes')) {
         document.getElementById('shapes-popover-menu')?.classList.add('hidden');
+      }
+      if (!e.target.closest('#eraser-popover-menu, #bar-btn-eraser')) {
+        this.closeEraserMenu();
       }
     });
 
@@ -12196,6 +12560,10 @@ class UIManager {
         this.vc.toolManager.selectionTool.clear();
       }
       this.selectTool('transform', 'top-btn-transform');
+    });
+
+    document.getElementById('top-btn-pan')?.addEventListener('click', () => {
+      this.selectTool('pan', 'top-btn-pan');
     });
 
     document.getElementById('top-btn-shapes')?.addEventListener('click', () => {
@@ -12260,6 +12628,17 @@ class UIManager {
           this.toggleSheet('brushes');
           return;
         }
+        if (item.tool === 'eraser' && this.activeTool === 'eraser') {
+          // Second tap on active Eraser opens Eraser popup menu
+          this.toggleEraserMenu();
+          return;
+        }
+        if (item.tool === 'lasso-fill' && this.activeTool === 'lasso-fill') {
+          // Second tap on active Lasso opens Lasso Studio sheet
+          this.toggleSheet('lasso');
+          return;
+        }
+        this.closeEraserMenu();
         this.selectTool(item.tool, item.id);
       });
     }
@@ -12285,6 +12664,14 @@ class UIManager {
     });
     document.getElementById('bp-tab-settings')?.addEventListener('click', () => {
       this.brushPanel.activeTab = 'settings';
+    });
+
+    // Header tabs for Lasso Studio
+    document.getElementById('lp-tab-library')?.addEventListener('click', () => {
+      this.lassoPanel.setTab('library');
+    });
+    document.getElementById('lp-tab-settings')?.addEventListener('click', () => {
+      this.lassoPanel.setTab('settings');
     });
 
     ['disc', 'classic', 'sliders', 'palettes'].forEach(t => {
@@ -12324,7 +12711,10 @@ class UIManager {
         this.settingsDialog.close();
         return true;
       }
-      if (!document.getElementById('home-screen').classList.contains('hidden')) {
+      if (this.app.homeScreen && !document.getElementById('home-screen').classList.contains('hidden')) {
+        if (this.app.homeScreen.handleBack && this.app.homeScreen.handleBack()) {
+          return true;
+        }
         return false;
       }
       this.app.openGallery();
@@ -12348,6 +12738,8 @@ class UIManager {
     }
 
     this.updateTopPanelContext(toolName);
+    this.updateEdgeSliders();
+    this.toolPanel?.update(toolName);
   }
 
   updateTopPanelContext(toolName) {
@@ -12377,11 +12769,20 @@ class UIManager {
       });
       ctxEl.querySelector('#ctx-btn-invert')?.addEventListener('click', () => {
         this.vc.toolManager.selectionTool.invert(this.vc.docWidth, this.vc.docHeight);
+        this.vc.needsRender = true;
       });
       ctxEl.querySelector('#ctx-btn-clear')?.addEventListener('click', () => {
         const activeLayer = this.vc.layerManager.getActiveLayer();
-        if (activeLayer) {
-          this.vc.toolManager.selectionTool.clearSelectedArea(activeLayer);
+        if (activeLayer && this.vc.toolManager.selectionTool.hasSelection) {
+          this.vc.toolManager.selectionTool.clearSelectedArea(
+            activeLayer,
+            this.vc.history,
+            () => {
+              this.vc.layerManager.invalidateCaches();
+              this.vc.needsRender = true;
+              this.app?.markDirty?.();
+            }
+          );
         }
       });
     } else if (toolName === 'transform') {
@@ -12435,6 +12836,7 @@ class UIManager {
 
     const map = {
       brushes: this.sheetBrushes,
+      lasso: this.sheetLasso,
       color: this.sheetColor,
       layers: this.sheetLayers
     };
@@ -12445,13 +12847,14 @@ class UIManager {
       sheet.classList.add('open');
       if (name === 'layers') this.layerPanel.render();
       if (name === 'brushes') this.brushPanel.render();
+      if (name === 'lasso') this.lassoPanel.render();
       if (name === 'color') this.colorPicker.render();
     }
   }
 
   closeSheets() {
     this.activeSheet = null;
-    [this.sheetBrushes, this.sheetColor, this.sheetLayers].forEach(s => {
+    [this.sheetBrushes, this.sheetLasso, this.sheetColor, this.sheetLayers].forEach(s => {
       if (s) {
         s.classList.remove('open');
         s.style.transform = '';
@@ -12461,7 +12864,7 @@ class UIManager {
   }
 
   setupSheetGestures() {
-    [this.sheetBrushes, this.sheetColor, this.sheetLayers].forEach(sheet => {
+    [this.sheetBrushes, this.sheetLasso, this.sheetColor, this.sheetLayers].forEach(sheet => {
       if (!sheet) return;
       const handleZone = sheet.querySelector('.sheet-drag-handle-zone');
       if (!handleZone) return;
@@ -12552,22 +12955,29 @@ class UIManager {
       this.saveLayout();
     });
 
-    // Size slider interaction dynamically clamped to brush minSize/maxSize (never 0)
+    // Size slider interaction dynamically clamped to brush or eraser minSize/maxSize (never 0)
     this.bindVerticalTrack(
       document.getElementById('track-wrap-size'),
       document.getElementById('thumb-size'),
       document.getElementById('track-fill-size'),
       document.getElementById('bubble-size'),
       document.getElementById('slider-col-size'),
-      () => Math.max(1, Math.round(this.vc.currentBrush?.minSize || 1)),
-      () => Math.max(Math.max(1, Math.round(this.vc.currentBrush?.minSize || 1)) + 1, Math.round(this.vc.currentBrush?.maxSize || 200)),
-      () => Math.max(1, Math.round(this.vc.currentBrush?.size || 8)),
+      () => this.activeTool === 'eraser' ? 1 : Math.max(1, Math.round(this.vc.currentBrush?.minSize || 1)),
+      () => this.activeTool === 'eraser' ? 500 : Math.max(Math.max(1, Math.round(this.vc.currentBrush?.minSize || 1)) + 1, Math.round(this.vc.currentBrush?.maxSize || 200)),
+      () => this.activeTool === 'eraser' ? Math.max(1, Math.round(this.vc.currentEraser?.size || 28)) : Math.max(1, Math.round(this.vc.currentBrush?.size || 8)),
       (val) => {
-        if (this.vc.currentBrush) {
+        if (this.activeTool === 'eraser') {
+          if (this.vc.currentEraser) {
+            this.vc.currentEraser.size = Math.max(1, Math.min(500, val));
+            this.vc.saveEraserState?.();
+            this.syncEraserMenuUI();
+          }
+        } else if (this.vc.currentBrush) {
           const min = Math.max(1, Math.round(this.vc.currentBrush.minSize || 1));
           const max = Math.max(min + 1, Math.round(this.vc.currentBrush.maxSize || 200));
           const clamped = Math.max(min, Math.min(max, val));
           this.vc.currentBrush.size = clamped;
+          this.brushPanel?.persistBrushSettings?.(this.vc.currentBrush);
         }
       },
       (val) => `${val} px`
@@ -12582,104 +12992,280 @@ class UIManager {
       document.getElementById('slider-col-opacity'),
       1, 100, 100,
       (val) => {
-        if (this.vc.currentBrush) {
+        if (this.activeTool === 'eraser') {
+          if (this.vc.currentEraser) {
+            this.vc.currentEraser.opacity = Math.max(0.01, Math.min(1.0, val / 100));
+            this.vc.saveEraserState?.();
+            this.syncEraserMenuUI();
+          }
+        } else if (this.vc.currentBrush) {
           this.vc.currentBrush.opacity = Math.max(0.01, Math.min(1.0, val / 100));
+          this.brushPanel?.persistBrushSettings?.(this.vc.currentBrush);
         }
       },
       (val) => `${val}%`
     );
   }
 
-  bindVerticalTrack(wrap, thumb, fill, bubble, colEl, min, max, initial, onChange, formatBubble) {
-    if (!wrap || !thumb) return;
+  bindVerticalTrack(trackWrap, thumb, fill, bubble, col, minOrGetter, maxOrGetter, valOrGetter, onChange, formatLabel) {
+    if (!trackWrap || !thumb || !fill) return;
 
-    const getMin = () => typeof min === 'function' ? min() : min;
-    const getMax = () => typeof max === 'function' ? max() : max;
+    let isDragging = false;
+    let fadeTimeout = null;
 
-    let currentValue = typeof initial === 'function' ? initial() : initial;
-    let fadeTimer = null;
-
-    const updateVisual = (val) => {
-      const curMin = getMin();
-      const curMax = getMax();
-      const pct = Math.max(0, Math.min(1, (val - curMin) / (curMax - curMin)));
-      const pctStr = `${Math.round(pct * 100)}%`;
-      thumb.style.bottom = pctStr;
-      if (fill) fill.style.height = pctStr;
-      if (bubble) bubble.textContent = formatBubble(val);
+    const showBubble = (text) => {
+      if (!bubble) return;
+      bubble.textContent = text;
+      bubble.classList.add('visible');
+      if (fadeTimeout) clearTimeout(fadeTimeout);
+      fadeTimeout = setTimeout(() => {
+        if (!isDragging) {
+          bubble.classList.remove('visible');
+        }
+      }, 900);
     };
 
-    const handlePointer = (e) => {
-      const rect = wrap.getBoundingClientRect();
-      const clampedY = Math.max(rect.top, Math.min(rect.bottom, e.clientY));
-      const normalized = 1.0 - (clampedY - rect.top) / rect.height;
-      const curMin = getMin();
-      const curMax = getMax();
-      currentValue = Math.max(curMin, Math.min(curMax, Math.round(curMin + normalized * (curMax - curMin))));
-      updateVisual(currentValue);
-      onChange(currentValue);
-    };
+    const updateFromPointer = (clientY) => {
+      const rect = trackWrap.getBoundingClientRect();
+      if (!rect || rect.height <= 0) return;
+      const pct = Math.max(0, Math.min(1, (rect.bottom - clientY) / rect.height));
+      const min = typeof minOrGetter === 'function' ? minOrGetter() : (typeof minOrGetter === 'number' ? minOrGetter : 1);
+      const max = typeof maxOrGetter === 'function' ? maxOrGetter() : (typeof maxOrGetter === 'number' ? maxOrGetter : 100);
+      const val = Math.round(min + pct * (max - min));
 
-    let isDown = false;
-    wrap.addEventListener('pointerdown', (e) => {
-      isDown = true;
-      colEl?.classList.add('dragging');
-      if (fadeTimer) clearTimeout(fadeTimer);
-      bubble?.classList.add('visible');
-      try { wrap.setPointerCapture(e.pointerId); } catch (_) {}
-      handlePointer(e);
-    });
+      thumb.style.bottom = `${Math.round(pct * 100)}%`;
+      fill.style.height = `${Math.round(pct * 100)}%`;
 
-    wrap.addEventListener('pointermove', (e) => {
-      if (isDown) {
-        if (fadeTimer) clearTimeout(fadeTimer);
-        bubble?.classList.add('visible');
-        handlePointer(e);
-      }
-    });
+      const label = formatLabel ? formatLabel(val) : `${val}`;
+      showBubble(label);
 
-    const onEnd = () => {
-      if (isDown) {
-        isDown = false;
-        colEl?.classList.remove('dragging');
-        if (fadeTimer) clearTimeout(fadeTimer);
-        fadeTimer = setTimeout(() => {
-          bubble?.classList.remove('visible');
-        }, 600);
+      if (typeof onChange === 'function') {
+        onChange(val);
       }
     };
 
-    wrap.addEventListener('pointerup', onEnd);
-    wrap.addEventListener('pointercancel', onEnd);
+    const onPointerDown = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      isDragging = true;
+      col?.classList.add('dragging');
+      if (trackWrap.setPointerCapture) {
+        try {
+          trackWrap.setPointerCapture(e.pointerId);
+        } catch (_) {}
+      }
+      updateFromPointer(e.clientY);
+    };
 
-    updateVisual(currentValue);
+    const onPointerMove = (e) => {
+      if (!isDragging) return;
+      e.preventDefault();
+      e.stopPropagation();
+      updateFromPointer(e.clientY);
+    };
+
+    const onPointerUp = (e) => {
+      if (!isDragging) return;
+      isDragging = false;
+      col?.classList.remove('dragging');
+      if (trackWrap.releasePointerCapture) {
+        try {
+          trackWrap.releasePointerCapture(e.pointerId);
+        } catch (_) {}
+      }
+      if (fadeTimeout) clearTimeout(fadeTimeout);
+      fadeTimeout = setTimeout(() => {
+        bubble?.classList.remove('visible');
+      }, 700);
+    };
+
+    trackWrap.addEventListener('pointerdown', onPointerDown);
+    trackWrap.addEventListener('pointermove', onPointerMove);
+    trackWrap.addEventListener('pointerup', onPointerUp);
+    trackWrap.addEventListener('pointercancel', onPointerUp);
+  }
+
+  setupEraserMenuEvents() {
+    const popover = document.getElementById('eraser-popover-menu');
+    if (!popover) return;
+
+    document.getElementById('eraser-popover-close')?.addEventListener('click', () => {
+      this.closeEraserMenu();
+    });
+
+    const sizeSlider = document.getElementById('eraser-size-slider');
+    const sizeVal = document.getElementById('eraser-size-val');
+    const opacitySlider = document.getElementById('eraser-opacity-slider');
+    const opacityVal = document.getElementById('eraser-opacity-val');
+    const hardnessSlider = document.getElementById('eraser-hardness-slider');
+    const hardnessVal = document.getElementById('eraser-hardness-val');
+    const spacingSlider = document.getElementById('eraser-spacing-slider');
+    const spacingVal = document.getElementById('eraser-spacing-val');
+
+    sizeSlider?.addEventListener('input', (e) => {
+      const v = parseInt(e.target.value, 10);
+      this.vc.currentEraser.size = v;
+      if (sizeVal) sizeVal.textContent = `${v}px`;
+      this.vc.saveEraserState?.();
+      this.updateEdgeSliders();
+    });
+
+    opacitySlider?.addEventListener('input', (e) => {
+      const v = parseInt(e.target.value, 10);
+      this.vc.currentEraser.opacity = v / 100;
+      if (opacityVal) opacityVal.textContent = `${v}%`;
+      this.vc.saveEraserState?.();
+      this.updateEdgeSliders();
+    });
+
+    hardnessSlider?.addEventListener('input', (e) => {
+      const v = parseInt(e.target.value, 10);
+      this.vc.currentEraser.hardness = v / 100;
+      if (hardnessVal) hardnessVal.textContent = `${v}%`;
+      this.vc.saveEraserState?.();
+    });
+
+    spacingSlider?.addEventListener('input', (e) => {
+      const v = parseInt(e.target.value, 10);
+      this.vc.currentEraser.spacing = v / 100;
+      if (spacingVal) spacingVal.textContent = `${v}%`;
+      this.vc.saveEraserState?.();
+    });
+
+    // Preset types: Hard, Airbrush, Soft
+    popover.querySelectorAll('.eraser-type-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        const type = chip.dataset.type;
+        popover.querySelectorAll('.eraser-type-chip').forEach(c => {
+          const isActive = c.dataset.type === type;
+          c.classList.toggle('active', isActive);
+          c.style.background = isActive ? 'var(--accent)' : 'var(--control)';
+          c.style.color = isActive ? '#ffffff' : 'var(--text)';
+        });
+
+        this.vc.currentEraser.type = type;
+        if (type === 'hard') {
+          this.vc.currentEraser.hardness = 1.0;
+          this.vc.currentEraser.spacing = 0.05;
+          this.vc.currentEraser.tipShape = 'round';
+        } else if (type === 'airbrush') {
+          this.vc.currentEraser.hardness = 0.1;
+          this.vc.currentEraser.spacing = 0.04;
+          this.vc.currentEraser.tipShape = 'soft';
+        } else if (type === 'soft') {
+          this.vc.currentEraser.hardness = 0.4;
+          this.vc.currentEraser.spacing = 0.06;
+          this.vc.currentEraser.tipShape = 'soft';
+        }
+        this.vc.saveEraserState?.();
+        this.syncEraserMenuUI();
+        this.updateEdgeSliders();
+      });
+    });
+
+    this.syncEraserMenuUI();
+  }
+
+  syncEraserMenuUI() {
+    const e = this.vc.currentEraser;
+    if (!e) return;
+    const popover = document.getElementById('eraser-popover-menu');
+    if (!popover) return;
+
+    popover.querySelectorAll('.eraser-type-chip').forEach(c => {
+      const isActive = c.dataset.type === (e.type || 'hard');
+      c.classList.toggle('active', isActive);
+      c.style.background = isActive ? 'var(--accent)' : 'var(--control)';
+      c.style.color = isActive ? '#ffffff' : 'var(--text)';
+    });
+
+    const sizeSlider = document.getElementById('eraser-size-slider');
+    const sizeVal = document.getElementById('eraser-size-val');
+    const opacitySlider = document.getElementById('eraser-opacity-slider');
+    const opacityVal = document.getElementById('eraser-opacity-val');
+    const hardnessSlider = document.getElementById('eraser-hardness-slider');
+    const hardnessVal = document.getElementById('eraser-hardness-val');
+    const spacingSlider = document.getElementById('eraser-spacing-slider');
+    const spacingVal = document.getElementById('eraser-spacing-val');
+
+    if (sizeSlider) sizeSlider.value = e.size || 28;
+    if (sizeVal) sizeVal.textContent = `${Math.round(e.size || 28)}px`;
+    if (opacitySlider) opacitySlider.value = Math.round((e.opacity ?? 1.0) * 100);
+    if (opacityVal) opacityVal.textContent = `${Math.round((e.opacity ?? 1.0) * 100)}%`;
+    if (hardnessSlider) hardnessSlider.value = Math.round((e.hardness ?? 1.0) * 100);
+    if (hardnessVal) hardnessVal.textContent = `${Math.round((e.hardness ?? 1.0) * 100)}%`;
+    if (spacingSlider) spacingSlider.value = Math.round((e.spacing ?? 0.05) * 100);
+    if (spacingVal) spacingVal.textContent = `${Math.round((e.spacing ?? 0.05) * 100)}%`;
+  }
+
+  toggleEraserMenu() {
+    const popover = document.getElementById('eraser-popover-menu');
+    if (popover) {
+      const isHidden = popover.classList.contains('hidden');
+      if (isHidden) {
+        this.syncEraserMenuUI();
+        popover.classList.remove('hidden');
+      } else {
+        popover.classList.add('hidden');
+      }
+    }
+  }
+
+  closeEraserMenu() {
+    document.getElementById('eraser-popover-menu')?.classList.add('hidden');
+  }
+
+  updateEdgeSliders() {
+    if (this.activeTool === 'eraser') {
+      const e = this.vc.currentEraser;
+      if (!e) return;
+      const minSize = 1;
+      const maxSize = 500;
+      const curSize = Math.max(1, Math.min(500, e.size || 28));
+
+      const thumbSize = document.getElementById('thumb-size');
+      const fillSize = document.getElementById('track-fill-size');
+      const bubbleSize = document.getElementById('bubble-size');
+      const pctSize = Math.max(0, Math.min(1, (curSize - minSize) / (maxSize - minSize)));
+      if (thumbSize) thumbSize.style.bottom = `${Math.round(pctSize * 100)}%`;
+      if (fillSize) fillSize.style.height = `${Math.round(pctSize * 100)}%`;
+      if (bubbleSize) bubbleSize.textContent = `${Math.round(curSize)} px`;
+
+      const opac = Math.round((e.opacity ?? 1.0) * 100);
+      const thumbOpac = document.getElementById('thumb-opacity');
+      const fillOpac = document.getElementById('track-fill-opacity');
+      const bubbleOpac = document.getElementById('bubble-opacity');
+      if (thumbOpac) thumbOpac.style.bottom = `${opac}%`;
+      if (fillOpac) fillOpac.style.height = `${opac}%`;
+      if (bubbleOpac) bubbleOpac.textContent = `${opac}%`;
+    } else {
+      const b = this.vc.currentBrush;
+      if (!b) return;
+
+      const minSize = Math.max(1, Math.round(b.minSize || 1));
+      const maxSize = Math.max(minSize + 1, Math.round(b.maxSize || 200));
+      b.size = Math.max(minSize, Math.min(maxSize, b.size || 8));
+
+      const thumbSize = document.getElementById('thumb-size');
+      const fillSize = document.getElementById('track-fill-size');
+      const bubbleSize = document.getElementById('bubble-size');
+      const pctSize = Math.max(0, Math.min(1, (b.size - minSize) / (maxSize - minSize)));
+      if (thumbSize) thumbSize.style.bottom = `${Math.round(pctSize * 100)}%`;
+      if (fillSize) fillSize.style.height = `${Math.round(pctSize * 100)}%`;
+      if (bubbleSize) bubbleSize.textContent = `${Math.round(b.size)} px`;
+
+      const opac = Math.round((b.opacity ?? 1.0) * 100);
+      const thumbOpac = document.getElementById('thumb-opacity');
+      const fillOpac = document.getElementById('track-fill-opacity');
+      const bubbleOpac = document.getElementById('bubble-opacity');
+      if (thumbOpac) thumbOpac.style.bottom = `${opac}%`;
+      if (fillOpac) fillOpac.style.height = `${opac}%`;
+      if (bubbleOpac) bubbleOpac.textContent = `${opac}%`;
+    }
   }
 
   updateEdgeSlidersFromBrush() {
-    const b = this.vc.currentBrush;
-    if (!b) return;
-
-    // Enforce and clamp size within brush minSize & maxSize
-    const minSize = Math.max(1, Math.round(b.minSize || 1));
-    const maxSize = Math.max(minSize + 1, Math.round(b.maxSize || 200));
-    b.size = Math.max(minSize, Math.min(maxSize, b.size || 8));
-
-    const thumbSize = document.getElementById('thumb-size');
-    const fillSize = document.getElementById('track-fill-size');
-    const bubbleSize = document.getElementById('bubble-size');
-    const pctSize = Math.max(0, Math.min(1, (b.size - minSize) / (maxSize - minSize)));
-    if (thumbSize) thumbSize.style.bottom = `${Math.round(pctSize * 100)}%`;
-    if (fillSize) fillSize.style.height = `${Math.round(pctSize * 100)}%`;
-    if (bubbleSize) bubbleSize.textContent = `${Math.round(b.size)} px`;
-
-    // Opacity
-    const opac = Math.round((b.opacity ?? 1.0) * 100);
-    const thumbOpac = document.getElementById('thumb-opacity');
-    const fillOpac = document.getElementById('track-fill-opacity');
-    const bubbleOpac = document.getElementById('bubble-opacity');
-    if (thumbOpac) thumbOpac.style.bottom = `${opac}%`;
-    if (fillOpac) fillOpac.style.height = `${opac}%`;
-    if (bubbleOpac) bubbleOpac.textContent = `${opac}%`;
+    this.updateEdgeSliders();
   }
 
   setupViewportFeedback() {
@@ -12867,7 +13453,20 @@ class VecturaApp {
     this.homeScreen = new HomeScreen(
       this.storage,
       (project) => this.loadProject(project),
-      (options) => this.createNewProject(options)
+      (options) => this.createNewProject(options),
+      async (id) => {
+        if (this.currentProject && this.currentProject.id === id) {
+          if (this.autosaveTimeout) {
+            clearTimeout(this.autosaveTimeout);
+            this.autosaveTimeout = null;
+          }
+          this.isDirty = false;
+          this.pendingSave = false;
+          this.currentProject = null;
+        }
+        await this.storage.deleteProject(id);
+      },
+      this
     );
 
     // 4. Bind History changes to UI & autosave
@@ -12895,11 +13494,11 @@ class VecturaApp {
     this.setupAutosave();
 
     try {
-      // 7. Load most recent project in background, and ALWAYS open on Project View (Artworks gallery)
-      await this.loadInitialProject();
+      // 7. ALWAYS open on Project View (Artworks gallery) by default
       if (this.homeScreen) {
         this.homeScreen.show();
       }
+      await this.loadInitialProject();
 
       // Android Lifecycle Hooks
       window.onAndroidPause = () => {
@@ -12932,16 +13531,18 @@ class VecturaApp {
       const all = await this.storage.getAllProjects();
       if (all && all.length > 0) {
         all.sort((a, b) => b.updatedAt - a.updatedAt);
-        await this.loadProject(all[0]);
-      } else {
-        await this.createNewProject({ width: 1080, height: 1080 });
+        await this.loadProject(all[0], false); // Keep gallery open on initial load
       }
-    } catch (_) {
-      await this.createNewProject({ width: 1080, height: 1080 });
+    } catch (err) {
+      console.warn('loadInitialProject error:', err);
     }
   }
 
-  async createNewProject(options = {}) {
+  async createNewProject(options = {}, hideGallery = true) {
+    if (this.isDirty && this.currentProject) {
+      await this.saveCurrentProject();
+    }
+
     const w = options.width || 1080;
     const h = options.height || 1080;
     const name = options.name || 'Untitled Artwork';
@@ -12951,6 +13552,7 @@ class VecturaApp {
       name: name,
       width: w,
       height: h,
+      folderId: options.folderId || null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
       layers: []
@@ -12967,13 +13569,18 @@ class VecturaApp {
       this.uiManager.closeSheets();
     }
 
-    this.homeScreen.hide();
+    if (hideGallery) {
+      this.homeScreen?.hide();
+    }
     this.vectorCanvas.viewport.fitToScreen();
     await this.saveCurrentProject();
   }
 
-  async loadProject(project) {
+  async loadProject(project, hideGallery = true) {
     if (!project) return;
+    if (this.isDirty && this.currentProject && this.currentProject.id !== project.id) {
+      await this.saveCurrentProject();
+    }
     this.currentProject = project;
 
     const w = project.width || 1080;
@@ -13052,7 +13659,9 @@ class VecturaApp {
       this.uiManager.closeSheets();
     }
 
-    this.homeScreen.hide();
+    if (hideGallery) {
+      this.homeScreen?.hide();
+    }
     this.vectorCanvas.viewport.fitToScreen();
   }
 
@@ -13088,7 +13697,16 @@ class VecturaApp {
         this.vectorCanvas.layerManager.layers.map(l => {
           return new Promise(resolve => {
             if (l.canvas && typeof l.canvas.toBlob === 'function') {
-              l.canvas.toBlob(blob => resolve(blob), 'image/png');
+              const timer = setTimeout(() => resolve(null), 1200);
+              try {
+                l.canvas.toBlob(blob => {
+                  clearTimeout(timer);
+                  resolve(blob);
+                }, 'image/png');
+              } catch (_) {
+                clearTimeout(timer);
+                resolve(null);
+              }
             } else {
               resolve(null);
             }
@@ -13131,6 +13749,7 @@ class VecturaApp {
         this.showToast('Failed to save project');
       } else {
         this.isDirty = false;
+        this.homeScreen?.refresh?.();
       }
     } catch (saveErr) {
       console.error('Failed to save project:', saveErr);
@@ -13212,9 +13831,17 @@ class VecturaApp {
     this.history.redo();
   }
 
-  openGallery() {
-    this.saveCurrentProject();
-    this.homeScreen.show();
+  async openGallery() {
+    if (this.homeScreen) {
+      this.homeScreen.show();
+    }
+    try {
+      if (this.isDirty && this.currentProject) {
+        await this.saveCurrentProject();
+      }
+    } catch (err) {
+      console.warn('saveCurrentProject error in openGallery:', err);
+    }
   }
 
   triggerHaptic() {
@@ -13267,8 +13894,20 @@ class VecturaApp {
   }
 }
 
-window.addEventListener('DOMContentLoaded', () => {
-  window.vecturaApp = new VecturaApp();
-});
+function bootVectura() {
+  if (!window.vecturaApp) {
+    try {
+      window.vecturaApp = new VecturaApp();
+    } catch (err) {
+      console.error('Critical Vectura startup error:', err);
+    }
+  }
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', bootVectura);
+} else {
+  bootVectura();
+}
 
 })();

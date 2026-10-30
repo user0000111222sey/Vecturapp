@@ -78,7 +78,7 @@ export class ToolPanel {
           gapBtn.classList.toggle('accent', fb.gapClose);
         }
       });
-    } else if (tool === 'select' || tool === 'selection' || tool === 'lasso-fill') {
+    } else if (tool === 'select' || tool === 'selection') {
       this.container.innerHTML = `
         <div class="strip-item" style="display: flex; align-items: center; gap: 6px; width: 100%;">
           <button id="strip-sel-add" class="btn-text accent" style="min-height: 28px; padding: 2px 8px; font-size: var(--text-secondary);">Add</button>
@@ -89,6 +89,38 @@ export class ToolPanel {
       `;
       this.container.querySelector('#strip-sel-inv')?.addEventListener('click', () => {
         tm.selectionTool?.invert();
+      });
+    } else if (tool === 'lasso-fill') {
+      const lf = tm.lassoFill;
+      const curPreset = lf?.presets?.find(p => p.id === lf.activePresetId);
+      const presetName = curPreset?.name || 'Precise';
+      const isPattern = lf?.fillMode === 'pattern';
+      this.container.innerHTML = `
+        <div class="strip-item" style="display: flex; align-items: center; gap: 8px; width: 100%; overflow-x: auto;">
+          <span style="font-weight: 600; font-size: var(--text-body); color: var(--text);">Lasso</span>
+          <button id="strip-lasso-brush-btn" class="btn-text accent" style="min-height: 28px; padding: 2px 10px; font-size: 11px; white-space: nowrap;">
+            ${presetName}
+          </button>
+          <button id="strip-lasso-mode-btn" class="btn-text" style="min-height: 28px; padding: 2px 8px; font-size: 11px; white-space: nowrap;">
+            ${isPattern ? 'Pattern: ' + (lf.pattern?.type || 'dots') : 'Solid Color'}
+          </button>
+          <button id="strip-lasso-studio-btn" class="btn-text" style="min-height: 28px; padding: 2px 8px; font-size: 11px; white-space: nowrap;">
+            Lasso Studio ⚙
+          </button>
+        </div>
+      `;
+      this.container.querySelector('#strip-lasso-brush-btn')?.addEventListener('click', () => {
+        this.app?.uiManager?.toggleSheet('lasso');
+      });
+      this.container.querySelector('#strip-lasso-mode-btn')?.addEventListener('click', () => {
+        if (lf) {
+          lf.fillMode = lf.fillMode === 'pattern' ? 'color' : 'pattern';
+          lf.persistActivePresetSettings();
+          this.update('lasso-fill');
+        }
+      });
+      this.container.querySelector('#strip-lasso-studio-btn')?.addEventListener('click', () => {
+        this.app?.uiManager?.toggleSheet('lasso');
       });
     } else if (tool === 'smudge') {
       const sm = tm.smudgeTool;
